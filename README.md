@@ -1,5 +1,21 @@
-`sudo apt-get install portaudio19-dev`
-`sudo apt install libspeexdsp-dev`
+# oi-speaker
+
+oi-speaker is a cutom build smart speaker and this is the software for it. I'm recroding progress on this project on [YouTube](https://www.youtube.com/watch?v=JSrJxNG3b2o), please check it out for more info!
+
+## Supported Platforms
+
+Currently under development, this has been tested on Raspberry Pi 5. But should work on any platform that supports Python.
+
+## Dependencies (Linux)
+
+`sudo apt-get install portaudio19-dev`  
+`sudo apt-get install libspeexdsp-dev`
+
+## Python Version
+
+Python version 3.11 is required, newer python versions (Python 3.13 that ships with Raspberry Pi) are not supported, on Pi to roll back you need to build and install Python 3.11.
+
+### Build Python 3.11
 
 ```
 # Install build dependencies
@@ -16,7 +32,21 @@ curl https://pyenv.run | bash
 source ~/.bashrc
 pyenv install 3.11
 pyenv local 3.11
-python -m venv ~/oi-speaker-env
-source ~/oi-speaker-env/bin/activate
-pip install oi-speaker
 ```
+
+## Python Dependencies
+
+Python deps are configured as part of the `pyproject.toml` setup your Python env and install as so:
+
+```
+python3 -m venv ~/oi-speaker-env
+source oi-speaker-env/bin/activate
+pip install -e .
+```
+
+## Running
+
+```
+speaker
+```
+
