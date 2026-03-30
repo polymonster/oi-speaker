@@ -44,6 +44,14 @@ source oi-speaker-env/bin/activate
 pip install -e .
 ```
 
+### Downloading Models
+
+Some of the dependencies require additional downloads
+
+```
+python -m piper.download --voice en_GB-northern_english_male-medium
+```
+
 ## Running
 
 ```

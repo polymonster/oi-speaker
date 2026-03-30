@@ -12,7 +12,9 @@ dependencies = [
     "speexdsp-ns",
     "openwakeword @ git+https://github.com/dscripka/openWakeWord.git",
     "faster-whisper",
-    "webrtcvad"
+    "webrtcvad",
+    "anthropic",
+    "piper-tts"
 ]
 
 [project.scripts]
