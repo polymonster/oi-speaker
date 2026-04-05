@@ -16,11 +16,9 @@ dependencies = [
     "anthropic",
     "piper-tts",
     "yt-dlp",
-    "python-mpv"
+    "python-mpv",
+    "speexdsp-ns; sys_platform == 'linux'"
 ]
-
-[project.optional-dependencies]
-pi = ["speexdsp-ns"]
 
 [project.scripts]
 speaker = "speaker:main"

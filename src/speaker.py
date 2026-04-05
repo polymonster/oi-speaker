@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import threading
 import mpv
 import openwakeword
@@ -283,7 +284,7 @@ def main():
         wakeword_models = ["hey_jarvis"],
         inference_framework="tflite",
         vad_threshold=0.5,
-        enable_speex_noise_suppression=False
+        enable_speex_noise_suppression=sys.platform != "darwin"
     )
 
     # init voice active detection
