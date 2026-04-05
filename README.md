@@ -20,7 +20,7 @@ Currently under development, this has been tested on Raspberry Pi 5. But should 
 
 Python version 3.11 is required, newer python versions (Python 3.13 that ships with Raspberry Pi) are not supported, on Pi to roll back you need to build and install Python 3.11.
 
-### Build Python 3.11 (Linux)
+### Python 3.11 (Linux)
 
 ```
 # Install build dependencies
@@ -39,12 +39,20 @@ pyenv install 3.11
 pyenv local 3.11
 ```
 
+### Python 3.11 (macOS)
+
+```
+brew install python@3.11
+python3.11 -m venv ~/oi-speaker-env
+```
+
+
 ## Python Dependencies
 
 Python deps are configured as part of the `pyproject.toml` setup your Python env and install as so:
 
 ```
-python3 -m venv ~/oi-speaker-env
+python3.11 -m venv ~/oi-speaker-env
 source ~/oi-speaker-env/bin/activate
 pip install -e .
 ```

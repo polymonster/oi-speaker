@@ -26,7 +26,7 @@
         },
         "play_music": {
             "description": "search for music, make decision, play url",
-            "rules": "only ever respond with 1 stage",
+            "rules": "only ever respond with 1 stage, never reposnd directly with play_music, you will respond with function: stage",
             "stages": [
                 "search_youtube",
                 "search_radio",

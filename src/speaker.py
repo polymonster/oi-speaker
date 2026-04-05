@@ -233,8 +233,9 @@ def search_web(query: str):
 
 def search_radio(query: str, config: dict):
     stations = json.dumps(config["radio"])
-    cmd = "make me a play_url request for " + query
-    cmd += "selected from these list of stations " + stations
+    request = "make me a play_url request for " + query
+    request += "selected from these list of stations " + stations
+    return request
 
 
 def parse_llm_json(text: str) -> dict:
@@ -293,7 +294,6 @@ def main():
     whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
     # llm client
-    # llm_client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
 
     # text to voice model
