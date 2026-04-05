@@ -8,14 +8,19 @@ Currently under development, this has been tested on Raspberry Pi 5. But should 
 
 ## Dependencies (Linux)
 
-`sudo apt-get install portaudio19-dev`  
+`sudo apt-get install portaudio19-dev`
 `sudo apt-get install libspeexdsp-dev`
+
+## Dependencies (macOS)
+
+`brew install portaudio`
+`brew install mpv`
 
 ## Python Version
 
 Python version 3.11 is required, newer python versions (Python 3.13 that ships with Raspberry Pi) are not supported, on Pi to roll back you need to build and install Python 3.11.
 
-### Build Python 3.11
+### Build Python 3.11 (Linux)
 
 ```
 # Install build dependencies
@@ -40,7 +45,7 @@ Python deps are configured as part of the `pyproject.toml` setup your Python env
 
 ```
 python3 -m venv ~/oi-speaker-env
-source oi-speaker-env/bin/activate
+source ~/oi-speaker-env/bin/activate
 pip install -e .
 ```
 
@@ -49,7 +54,12 @@ pip install -e .
 Some of the dependencies require additional downloads
 
 ```
+python -c "import openwakeword; openwakeword.utils.download_models()"
 python -m piper.download --voice en_GB-northern_english_male-medium
+
+or
+
+python -m piper.download_voices en_GB-northern_english_male-medium
 ```
 
 ## Running
@@ -57,4 +67,3 @@ python -m piper.download --voice en_GB-northern_english_male-medium
 ```
 speaker
 ```
-

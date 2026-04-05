@@ -1,3 +1,6 @@
+import subprocess
+import threading
+import mpv
 import openwakeword
 import sounddevice as dev
 import numpy as np
@@ -7,6 +10,9 @@ import math
 import faster_whisper
 import anthropic
 import re
+import tomllib
+import json
+import requests
 
 from piper.voice import PiperVoice
 from openwakeword.model import Model
@@ -19,6 +25,7 @@ VAD_CHUNK = 480 # 30ms at 16kHz
 
 
 class SpeakerState(Enum):
+    TEXT_CHAT = "text_chat"
     LISTEN_FOR_WAKE = "listen_for_wake"
     CHATTING = "chatting"
     RESET = "reset"
@@ -82,7 +89,7 @@ def record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1
             silent_duration = 0.0
         else:
             silent_duration += VAD_CHUNK / TARGET_SAMPLE_RATE
-        
+
     return np.concatenate(chunks)
 
 
@@ -90,22 +97,22 @@ def record_until_silence_snappy(vad, stream, sample_rate, silence_timeout=1.5) -
     chunks = []
     silent_duration = 0.0
     was_speaking = False
-    
+
     while silent_duration < silence_timeout:
         audio_flat = read_audio(stream, VAD_CHUNK, sample_rate)
         chunks.append(audio_flat)
         is_speech = vad.is_speech(audio_flat.tobytes(), TARGET_SAMPLE_RATE)
-                
+
         if is_speech:
             was_speaking = True
             silent_duration = 0.0
         else:
             silent_duration += VAD_CHUNK / TARGET_SAMPLE_RATE
-            
+
             # speech just ended - don't wait full timeout
             if was_speaking and silent_duration > 0.3:
                 break
-                
+
     return np.concatenate(chunks)
 
 
@@ -132,16 +139,11 @@ def flush_stream(stream):
     stream.start()
 
 
-def query_llm(llm_client, text: str) -> str:
-    SYSTEM_PROMPT = """You are Oi-Speaker!!, a smart speaker assistant, designed and built by Alex Dixon.
-    Respond in plain conversational text only.
-    No markdown, no bullet points, no headers.
-    Speak as if talking out loud, keep responses concise."""
-
+def query_llm(llm_client, system, text: str) -> str:
     message = llm_client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=[
             {"role": "user", "content": text}
         ]
@@ -170,9 +172,9 @@ def speak_debug(dev, dev_index, sample_rate, voice_model, text: str):
     for audio_chunk in voice_model.synthesize(text):
         int_data = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
         chunks.append(int_data)
-    
+
     print(f"chunks: {len(chunks)}")
-    
+
     if chunks:
         full_audio = np.concatenate(chunks)
         resampled = resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
@@ -189,8 +191,91 @@ def test_tone(dev, dev_index: int, sample_rate: int):
     dev.wait()
 
 
+_player: mpv.MPV | None = None
+def stop_playback():
+    global _player
+    if _player is not None:
+        _player.stop()
+        _player = None
+
+
+def play_url(url: str):
+    global _player
+    stop_playback()
+    _player = mpv.MPV(vid=False, terminal=False)
+    def _run():
+        _player.play(url)
+        _player.wait_for_playback()
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def search_youtube(query: str, max_results: int = 5) -> str:
+    result = subprocess.run(
+        ["yt-dlp", f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"],
+        capture_output=True, text=True
+    )
+    results = []
+    for line in result.stdout.strip().splitlines():
+        if line:
+            item = json.loads(line)
+            results.append({
+                "title": item.get("title"),
+                "url": item.get("url") or f"https://www.youtube.com/watch?v={item.get('id')}",
+                "duration": item.get("duration"),
+                "channel": item.get("channel") or item.get("uploader"),
+            })
+    return json.dumps(results)
+
+
+def search_web(query: str):
+    return requests.get("https://api.duckduckgo.com/", params={"q": query, "format": "json"})
+
+
+def search_radio(query: str, config: dict):
+    stations = json.dumps(config["radio"])
+    cmd = "make me a play_url request for " + query
+    cmd += "selected from these list of stations " + stations
+
+
+def parse_llm_json(text: str) -> dict:
+    text = re.sub(r"```(?:json)?\s*", "", text).strip()
+    return json.loads(text)
+
+
+def handle_llm(llm_client, system, config, response: str):
+    response = parse_llm_json(response)
+    print(json.dumps(response))
+    if "function" in response:
+        if response["function"] == "search_youtube":
+                results = search_youtube(response["payload"])
+                print(results)
+                response = query_llm(llm_client, system, results)
+                handle_llm(llm_client, system, config, response)
+        elif response["function"] == "search_radio":
+                results = search_radio(response["payload"], config)
+                response = query_llm(llm_client, system, results)
+                handle_llm(llm_client, system, config, response)
+        elif response["function"] == "play_url":
+            play_url(response["payload"])
+        elif response["function"] == "stop":
+            stop_playback()
+        elif response["function"] == "search_web":
+            results = search_web(response["payload"])
+            print(results.text)
+            response = query_llm(llm_client, system, results.text)
+            handle_llm(llm_client, system, config, response)
+
+
 def main():
     print("oi! oi!!")
+
+    # read user config
+    with open("config.toml", "rb") as f:
+        config = tomllib.load(f)
+
+    with open("system.json", "rb") as f:
+        system = json.load(f)
+        system = json.dumps(system)
 
     # init openwakeword model
     wake_model = Model(
@@ -204,17 +289,19 @@ def main():
     vad = webrtcvad.Vad(2) # aggressiveness 0-3
 
     # init whisper model
-    whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    # whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
     # llm client
-    llm_client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
+    # llm_client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
+    llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
 
     # text to voice model
     voice_model = PiperVoice.load("models/en_GB-northern_english_male-medium.onnx")
 
     # grab device, this should come from config
-    input_dev_info = get_audio_device_index("DualSense")
-    output_dev_info = get_audio_device_index("Scarlett 2i2 USB") 
+    input_dev_info = get_audio_device_index(config["audio"]["input_device"])
+    output_dev_info = get_audio_device_index(config["audio"]["output_device"])
     input_dev_index = int(input_dev_info['index'])
     input_sample_rate = int(input_dev_info['default_samplerate'])
     output_dev_index = int(output_dev_info['index'])
@@ -223,21 +310,26 @@ def main():
     # test_tone(dev, output_dev_index, output_sample_rate)
 
     # main loop
-    state = SpeakerState.LISTEN_FOR_WAKE
+    state = SpeakerState.TEXT_CHAT
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
         while True:
-            if state == SpeakerState.LISTEN_FOR_WAKE:
+            if state == SpeakerState.TEXT_CHAT:
+                text_request = input("Enter something: ")
+                llm_response = query_llm(llm_client, system, text_request)
+                handle_llm(llm_client, system, config, llm_response)
+            elif state == SpeakerState.LISTEN_FOR_WAKE:
                 if listen_for_wake(wake_model, stream, input_sample_rate):
                     state = SpeakerState.CHATTING
             elif state == SpeakerState.CHATTING:
                 audio_request = record_until_silence(vad, stream, input_sample_rate)
                 transcribed_request = transcribe_audio(whisper_model, audio_request)
-                llm_response = query_llm(llm_client, transcribed_request)
-                print(llm_response)
-                voice_response = strip_markdown(llm_response)
-                speak_debug(dev, output_dev_index, output_sample_rate, voice_model, voice_response)
-                if not llm_response.endswith("?"):
-                    state = SpeakerState.RESET
+                print(transcribed_request)
+                llm_response = query_llm(llm_client, system, transcribed_request)
+                handle_llm(llm_client, system, config, llm_response)
+                # todo
+                response = parse_llm_json(llm_response)
+                if response["function"] == "chat":
+                    speak_debug(dev, output_dev_index, output_sample_rate, voice_model, response["payload"])
             elif state == SpeakerState.RESET:
                 flush_stream(stream)
                 wake_model.reset()

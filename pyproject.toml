@@ -9,13 +9,18 @@ requires-python = ">= 3.11"
 dependencies = [
     "pyaudio",
     "sounddevice",
-    "speexdsp-ns",
     "openwakeword @ git+https://github.com/dscripka/openWakeWord.git",
     "faster-whisper",
     "webrtcvad",
+    "setuptools<71; sys_platform == 'darwin'",
     "anthropic",
-    "piper-tts"
+    "piper-tts",
+    "yt-dlp",
+    "python-mpv"
 ]
+
+[project.optional-dependencies]
+pi = ["speexdsp-ns"]
 
 [project.scripts]
 speaker = "speaker:main"
