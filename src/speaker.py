@@ -18,6 +18,7 @@ import requests
 from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
+from dataclasses import dataclass
 from enum import Enum
 
 TARGET_SAMPLE_RATE = 16000 # 16khz
@@ -30,6 +31,16 @@ class SpeakerState(Enum):
     LISTEN_FOR_WAKE = "listen_for_wake"
     CHATTING = "chatting"
     RESET = "reset"
+
+
+@dataclass
+class SpeakerContext:
+    llm_client: any
+    system: str
+    config: dict
+    voice_model: any
+    output_dev_index: int
+    output_sample_rate: int
 
 
 def strip_markdown(text: str) -> str:
@@ -200,6 +211,16 @@ def stop_playback():
         _player = None
 
 
+def pause_playback():
+    if _player is not None:
+        _player.pause = True
+
+
+def resume_playback():
+    if _player is not None:
+        _player.pause = False
+
+
 def play_url(url: str):
     global _player
     stop_playback()
@@ -244,28 +265,36 @@ def parse_llm_json(text: str) -> dict:
     return json.loads(text)
 
 
-def handle_llm(llm_client, system, config, response: str):
+def handle_llm(ctx: SpeakerContext, response: str) -> SpeakerState | None:
     response = parse_llm_json(response)
     print(json.dumps(response))
     if "function" in response:
         if response["function"] == "search_youtube":
-                results = search_youtube(response["payload"])
-                print(results)
-                response = query_llm(llm_client, system, results)
-                handle_llm(llm_client, system, config, response)
+            results = search_youtube(response["payload"])
+            print(results)
+            response = query_llm(ctx.llm_client, ctx.system, results)
+            return handle_llm(ctx, response)
         elif response["function"] == "search_radio":
-                results = search_radio(response["payload"], config)
-                response = query_llm(llm_client, system, results)
-                handle_llm(llm_client, system, config, response)
+            results = search_radio(response["payload"], ctx.config)
+            response = query_llm(ctx.llm_client, ctx.system, results)
+            return handle_llm(ctx, response)
         elif response["function"] == "play_url":
             play_url(response["payload"])
+            return SpeakerState.RESET
         elif response["function"] == "stop":
             stop_playback()
+            return SpeakerState.RESET
         elif response["function"] == "search_web":
             results = search_web(response["payload"])
             print(results.text)
-            response = query_llm(llm_client, system, results.text)
-            handle_llm(llm_client, system, config, response)
+            response = query_llm(ctx.llm_client, ctx.system, results.text)
+            return handle_llm(ctx, response)
+        elif response["function"] == "chat":
+            speak_debug(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, response["payload"])
+            if response.get("follow_on"):
+                return SpeakerState.CHATTING
+            return SpeakerState.RESET
+    return None
 
 
 def main():
@@ -308,29 +337,36 @@ def main():
     output_dev_index = int(output_dev_info['index'])
     output_sample_rate = int(output_dev_info['default_samplerate'])
 
-    # test_tone(dev, output_dev_index, output_sample_rate)
+    ctx = SpeakerContext(
+        llm_client=llm_client,
+        system=system,
+        config=config,
+        voice_model=voice_model,
+        output_dev_index=output_dev_index,
+        output_sample_rate=output_sample_rate,
+    )
 
     # main loop
-    state = SpeakerState.TEXT_CHAT
+    state = SpeakerState.LISTEN_FOR_WAKE
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
         while True:
             if state == SpeakerState.TEXT_CHAT:
-                text_request = input("Enter something: ")
-                llm_response = query_llm(llm_client, system, text_request)
-                handle_llm(llm_client, system, config, llm_response)
+                text_request = input("Text Chat: ")
+                llm_response = query_llm(ctx.llm_client, ctx.system, text_request)
+                handle_llm(ctx, llm_response)
             elif state == SpeakerState.LISTEN_FOR_WAKE:
                 if listen_for_wake(wake_model, stream, input_sample_rate):
                     state = SpeakerState.CHATTING
             elif state == SpeakerState.CHATTING:
+                pause_playback()
                 audio_request = record_until_silence(vad, stream, input_sample_rate)
+                resume_playback()
                 transcribed_request = transcribe_audio(whisper_model, audio_request)
                 print(transcribed_request)
-                llm_response = query_llm(llm_client, system, transcribed_request)
-                handle_llm(llm_client, system, config, llm_response)
-                # todo
-                response = parse_llm_json(llm_response)
-                if response["function"] == "chat":
-                    speak_debug(dev, output_dev_index, output_sample_rate, voice_model, response["payload"])
+                llm_response = query_llm(ctx.llm_client, ctx.system, transcribed_request)
+                next_state = handle_llm(ctx, llm_response)
+                if next_state is not None:
+                    state = next_state
             elif state == SpeakerState.RESET:
                 flush_stream(stream)
                 wake_model.reset()
