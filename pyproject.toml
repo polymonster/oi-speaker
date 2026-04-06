@@ -17,7 +17,9 @@ dependencies = [
     "piper-tts",
     "yt-dlp",
     "python-mpv",
-    "speexdsp-ns; sys_platform == 'linux'"
+    "speexdsp-ns; sys_platform == 'linux'",
+    "fastapi[standard]",
+    "tomli-w"
 ]
 
 [project.scripts]
@@ -27,4 +29,4 @@ speaker = "speaker:main"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/speaker.py"]
+packages = ["src/speaker.py", "src/web.py", "src/static"]

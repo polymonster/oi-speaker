@@ -14,6 +14,7 @@ import re
 import tomllib
 import json
 import requests
+import uvicorn
 
 from piper.voice import PiperVoice
 from openwakeword.model import Model
@@ -43,16 +44,6 @@ class SpeakerContext:
     output_sample_rate: int
 
 
-def strip_markdown(text: str) -> str:
-    text = re.sub(r'#{1,6}\s*', '', text) # headers
-    text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text) # bold/italic
-    text = re.sub(r'`{1,3}[^`]*`{1,3}', '', text) # code
-    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text) # links
-    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE) # list bullets
-    text = re.sub(r'\n+', ' ', text) # newlines to spaces
-    return text.strip()
-
-
 def get_audio_device_index(name: str):
     print(dev.query_devices())
     devices = str(dev.query_devices()).splitlines()
@@ -63,6 +54,20 @@ def get_audio_device_index(name: str):
             return dev.query_devices(index)
         index += 1
     return None
+
+
+def flush_stream(stream):
+    stream.stop()
+    stream.start()
+
+
+def test_tone(dev, dev_index: int, sample_rate: int):
+    # generate a simple 440hz test tone
+    duration = 2.0
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    tone = (np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
+    dev.play(tone, samplerate=sample_rate, device=dev_index)
+    dev.wait()
 
 
 def resample_audio(audio, orig_rate: int, target_rate: int):
@@ -105,29 +110,6 @@ def record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1
     return np.concatenate(chunks)
 
 
-def record_until_silence_snappy(vad, stream, sample_rate, silence_timeout=1.5) -> np.ndarray:
-    chunks = []
-    silent_duration = 0.0
-    was_speaking = False
-
-    while silent_duration < silence_timeout:
-        audio_flat = read_audio(stream, VAD_CHUNK, sample_rate)
-        chunks.append(audio_flat)
-        is_speech = vad.is_speech(audio_flat.tobytes(), TARGET_SAMPLE_RATE)
-
-        if is_speech:
-            was_speaking = True
-            silent_duration = 0.0
-        else:
-            silent_duration += VAD_CHUNK / TARGET_SAMPLE_RATE
-
-            # speech just ended - don't wait full timeout
-            if was_speaking and silent_duration > 0.3:
-                break
-
-    return np.concatenate(chunks)
-
-
 def listen_for_wake(wake_model, stream, sample_rate: int) -> bool:
     # read audio
     audio_flat = read_audio(stream, WAKE_CHUNK, sample_rate)
@@ -146,11 +128,6 @@ def transcribe_audio(whisper_model, audio: np.ndarray) -> str:
     return " ".join(segment.text for segment in segments)
 
 
-def flush_stream(stream):
-    stream.stop()
-    stream.start()
-
-
 def query_llm(llm_client, system, text: str) -> str:
     message = llm_client.messages.create(
         model="claude-sonnet-4-5",
@@ -163,23 +140,7 @@ def query_llm(llm_client, system, text: str) -> str:
     return message.content[0].text
 
 
-def speak(dev, dev_index, sample_rate, voice_model, text: str):
-    stream = dev.OutputStream(
-        samplerate=sample_rate,
-        channels=1,
-        dtype='int16',
-        device=dev_index
-    )
-    stream.start()
-    for audio_chunk in voice_model.synthesize(text):
-        int_data = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
-        resampled_audio = resample_audio(int_data, voice_model.config.sample_rate, sample_rate)
-        stream.write(resampled_audio)
-    stream.stop()
-    stream.close()
-
-
-def speak_debug(dev, dev_index, sample_rate, voice_model, text: str):
+def _speak(dev, dev_index, sample_rate, voice_model, text: str):
     chunks = []
     for audio_chunk in voice_model.synthesize(text):
         int_data = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
@@ -194,14 +155,8 @@ def speak_debug(dev, dev_index, sample_rate, voice_model, text: str):
         dev.wait()
 
 
-def test_tone(dev, dev_index: int, sample_rate: int):
-    # generate a simple 440hz test tone
-    duration = 2.0
-    t = np.linspace(0, duration, int(sample_rate * duration))
-    tone = (np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
-    dev.play(tone, samplerate=sample_rate, device=dev_index)
-    dev.wait()
-
+ctx: SpeakerContext | None = None
+speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
 
 _player: mpv.MPV | None = None
 def stop_playback():
@@ -260,24 +215,24 @@ def search_radio(query: str, config: dict):
     return request
 
 
-def parse_llm_json(text: str) -> dict:
+def _parse_llm_json(text: str) -> dict:
     text = re.sub(r"```(?:json)?\s*", "", text).strip()
     return json.loads(text)
 
 
-def handle_llm(ctx: SpeakerContext, response: str) -> SpeakerState | None:
-    response = parse_llm_json(response)
+def _handle_llm_function(ctx: SpeakerContext, response: str) -> SpeakerState | None:
+    response = _parse_llm_json(response)
     print(json.dumps(response))
     if "function" in response:
         if response["function"] == "search_youtube":
             results = search_youtube(response["payload"])
             print(results)
             response = query_llm(ctx.llm_client, ctx.system, results)
-            return handle_llm(ctx, response)
+            return _handle_llm_function(ctx, response)
         elif response["function"] == "search_radio":
             results = search_radio(response["payload"], ctx.config)
             response = query_llm(ctx.llm_client, ctx.system, results)
-            return handle_llm(ctx, response)
+            return _handle_llm_function(ctx, response)
         elif response["function"] == "play_url":
             play_url(response["payload"])
             return SpeakerState.RESET
@@ -288,19 +243,44 @@ def handle_llm(ctx: SpeakerContext, response: str) -> SpeakerState | None:
             results = search_web(response["payload"])
             print(results.text)
             response = query_llm(ctx.llm_client, ctx.system, results.text)
-            return handle_llm(ctx, response)
+            return _handle_llm_function(ctx, response)
         elif response["function"] == "chat":
-            speak_debug(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, response["payload"])
+            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, response["payload"])
             if response.get("follow_on"):
                 return SpeakerState.CHATTING
             return SpeakerState.RESET
     return None
 
 
-def main():
-    print("oi! oi!!")
+def _audio_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
+    global speaker_state
+    with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
+        while True:
+            if speaker_state == SpeakerState.LISTEN_FOR_WAKE:
+                if listen_for_wake(wake_model, stream, input_sample_rate):
+                    speaker_state = SpeakerState.CHATTING
+            elif speaker_state == SpeakerState.CHATTING:
+                pause_playback()
+                audio_request = record_until_silence(vad, stream, input_sample_rate)
+                resume_playback()
+                transcribed_request = transcribe_audio(whisper_model, audio_request)
+                print(transcribed_request)
+                llm_response = query_llm(ctx.llm_client, ctx.system, transcribed_request)
+                next_state = _handle_llm_function(ctx, llm_response)
+                if next_state is not None:
+                    speaker_state = next_state
+            elif speaker_state == SpeakerState.RESET:
+                flush_stream(stream)
+                wake_model.reset()
+                speaker_state = SpeakerState.LISTEN_FOR_WAKE
+                print("return to listen for wake")
 
-    # read user config
+
+def start():
+    global ctx
+    if ctx is not None:
+        return
+
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
 
@@ -308,28 +288,18 @@ def main():
         system = json.load(f)
         system = json.dumps(system)
 
-    # init openwakeword model
     wake_model = Model(
-        wakeword_models = ["hey_jarvis"],
+        wakeword_models=["hey_jarvis"],
         inference_framework="tflite",
         vad_threshold=0.5,
         enable_speex_noise_suppression=sys.platform != "darwin"
     )
 
-    # init voice active detection
-    vad = webrtcvad.Vad(2) # aggressiveness 0-3
-
-    # init whisper model
-    # whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    vad = webrtcvad.Vad(2)
     whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-
-    # llm client
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
-
-    # text to voice model
     voice_model = PiperVoice.load("models/en_GB-northern_english_male-medium.onnx")
 
-    # grab device, this should come from config
     input_dev_info = get_audio_device_index(config["audio"]["input_device"])
     output_dev_info = get_audio_device_index(config["audio"]["output_device"])
     input_dev_index = int(input_dev_info['index'])
@@ -346,32 +316,21 @@ def main():
         output_sample_rate=output_sample_rate,
     )
 
-    # main loop
-    state = SpeakerState.LISTEN_FOR_WAKE
-    with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
-        while True:
-            if state == SpeakerState.TEXT_CHAT:
-                text_request = input("Text Chat: ")
-                llm_response = query_llm(ctx.llm_client, ctx.system, text_request)
-                handle_llm(ctx, llm_response)
-            elif state == SpeakerState.LISTEN_FOR_WAKE:
-                if listen_for_wake(wake_model, stream, input_sample_rate):
-                    state = SpeakerState.CHATTING
-            elif state == SpeakerState.CHATTING:
-                pause_playback()
-                audio_request = record_until_silence(vad, stream, input_sample_rate)
-                resume_playback()
-                transcribed_request = transcribe_audio(whisper_model, audio_request)
-                print(transcribed_request)
-                llm_response = query_llm(ctx.llm_client, ctx.system, transcribed_request)
-                next_state = handle_llm(ctx, llm_response)
-                if next_state is not None:
-                    state = next_state
-            elif state == SpeakerState.RESET:
-                flush_stream(stream)
-                wake_model.reset()
-                state = SpeakerState.LISTEN_FOR_WAKE
-                print("return to listen for wake")
+    threading.Thread(
+        target=_audio_loop,
+        args=(wake_model, vad, whisper_model, input_dev_index, input_sample_rate),
+        daemon=True
+    ).start()
+
+
+def main():
+    import os
+    print("oi! oi!!")
+    sys.path.insert(0, str(__file__).replace("speaker.py", ""))
+    start()
+    from web import app
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    os._exit(0)
 
 
 if __name__ == "__main__":

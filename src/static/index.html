@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>oi-speaker</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: monospace; background: #111; color: #eee; max-width: 760px; margin: 40px auto; padding: 0 20px; }
+  h1 { color: #eee; font-size: 1.1em; margin-bottom: 4px; }
+  #host-ip { color: #333; font-size: 0.8em; margin-bottom: 20px; }
+  nav { display: flex; gap: 8px; margin-bottom: 24px; border-bottom: 1px solid #222; padding-bottom: 12px; }
+  nav button { background: none; border: none; color: #555; padding: 4px 12px; cursor: pointer; font-family: monospace; font-size: 0.95em; }
+  nav button.active { color: #eee; border-bottom: 2px solid #eee; }
+  section { display: none; }
+  section.active { display: block; }
+
+  /* chat */
+  #chat-log { height: 420px; overflow-y: auto; border: 1px solid #222; padding: 14px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { font-size: 0.9em; line-height: 1.5; }
+  .msg.user { color: #7af; }
+  .msg.bot { color: #afa; }
+  .msg.bot.action { color: #fa7; }
+  #chat-form { display: flex; gap: 8px; }
+  #chat-input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 12px; font-family: monospace; font-size: 0.95em; outline: none; }
+  #chat-input:focus { border-color: #555; }
+  .send-btn { background: #222; border: 1px solid #444; color: #eee; padding: 8px 16px; cursor: pointer; font-family: monospace; }
+  .send-btn:hover { background: #2a2a2a; }
+
+  /* settings */
+  .setting { margin-bottom: 14px; }
+  .setting label { display: block; color: #666; font-size: 0.8em; margin-bottom: 4px; }
+  .setting input { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 7px 10px; font-family: monospace; font-size: 0.9em; outline: none; }
+  .setting input:focus { border-color: #555; }
+  .section-header { color: #444; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.1em; margin: 20px 0 10px; border-bottom: 1px solid #1e1e1e; padding-bottom: 6px; }
+  .radio-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .radio-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 7px 10px; font-family: monospace; font-size: 0.9em; outline: none; }
+  .radio-row input:focus { border-color: #555; }
+  .radio-row .name-input { width: 160px; flex-shrink: 0; }
+  .radio-row .url-input { flex: 1; }
+  .rm-btn { background: none; border: 1px solid #333; color: #555; padding: 6px 10px; cursor: pointer; font-family: monospace; flex-shrink: 0; }
+  .rm-btn:hover { border-color: #a44; color: #f66; }
+  .add-btn { background: none; border: 1px solid #333; color: #555; padding: 6px 14px; cursor: pointer; font-family: monospace; margin-top: 4px; }
+  .add-btn:hover { border-color: #555; color: #eee; }
+  #save-btn { background: #222; border: 1px solid #444; color: #eee; padding: 8px 20px; cursor: pointer; font-family: monospace; margin-top: 16px; }
+  #save-btn:hover { background: #2a2a2a; }
+  #save-feedback { color: #afa; font-size: 0.85em; margin-left: 12px; opacity: 0; transition: opacity 0.3s; }
+
+  /* status */
+  #status-bar { position: fixed; bottom: 14px; right: 18px; color: #333; font-size: 0.75em; }
+</style>
+</head>
+<body>
+<h1 id="greeting">oi-speaker</h1>
+<div id="host-ip"></div>
+<nav>
+  <button class="active" onclick="show('chat', this)">chat</button>
+  <button onclick="show('settings', this)">settings</button>
+</nav>
+
+<section id="chat" class="active">
+  <div id="chat-log"></div>
+  <form id="chat-form">
+    <input id="chat-input" type="text" placeholder="say something..." autocomplete="off">
+    <button class="send-btn" type="submit">send</button>
+  </form>
+</section>
+
+<section id="settings">
+  <div id="settings-form"></div>
+  <div style="display:flex;align-items:center;">
+    <button id="save-btn" onclick="saveSettings()">save</button>
+    <span id="save-feedback">saved</span>
+  </div>
+</section>
+
+<div id="status-bar">...</div>
+
+<script>
+const GREETINGS = ['Oi! Oi!!', 'Hold Tight!', 'Yes, G!', "What's Happenin!?"];
+document.getElementById('greeting').textContent = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
+
+let settingsData = {};
+
+function show(id, btn) {
+  document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+  if (id === 'settings') loadSettings();
+}
+
+// chat
+document.getElementById('chat-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  addMsg('user', '> ' + text);
+  input.value = '';
+  input.disabled = true;
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+    const data = await res.json();
+    const isAction = data.response.startsWith('[');
+    addMsg('bot' + (isAction ? ' action' : ''), '< ' + data.response);
+  } catch {
+    addMsg('bot action', '< error');
+  } finally {
+    input.disabled = false;
+    input.focus();
+  }
+});
+
+function addMsg(cls, text) {
+  const log = document.getElementById('chat-log');
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+// settings
+async function loadSettings() {
+  const res = await fetch('/settings');
+  settingsData = await res.json();
+  const form = document.getElementById('settings-form');
+  form.innerHTML = '';
+  renderObj(form, settingsData, []);
+}
+
+function renderObj(container, obj, path) {
+  for (const [key, val] of Object.entries(obj)) {
+    if (key === 'radio' && Array.isArray(val)) {
+      const h = document.createElement('div');
+      h.className = 'section-header';
+      h.textContent = 'radio';
+      container.appendChild(h);
+      const radioContainer = document.createElement('div');
+      radioContainer.id = 'radio-container';
+      container.appendChild(radioContainer);
+      renderRadio(radioContainer, val);
+      const addBtn = document.createElement('button');
+      addBtn.className = 'add-btn';
+      addBtn.textContent = '+ add station';
+      addBtn.onclick = () => {
+        settingsData.radio.push({ name: '', url: '' });
+        renderRadio(radioContainer, settingsData.radio);
+      };
+      container.appendChild(addBtn);
+    } else if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
+      continue; // other arrays of objects — skip
+    } else if (typeof val === 'object' && !Array.isArray(val)) {
+      const h = document.createElement('div');
+      h.className = 'section-header';
+      h.textContent = key;
+      container.appendChild(h);
+      renderObj(container, val, [...path, key]);
+    } else {
+      const fullPath = [...path, key].join('.');
+      const div = document.createElement('div');
+      div.className = 'setting';
+      div.innerHTML = `<label>${fullPath}</label><input data-path="${fullPath}" value="${Array.isArray(val) ? val.join(', ') : val}">`;
+      container.appendChild(div);
+    }
+  }
+}
+
+function renderRadio(container, stations) {
+  container.innerHTML = '';
+  stations.forEach((station, i) => {
+    const row = document.createElement('div');
+    row.className = 'radio-row';
+    row.innerHTML = `
+      <input class="name-input" data-radio="${i}" data-field="name" value="${station.name}" placeholder="name">
+      <input class="url-input" data-radio="${i}" data-field="url" value="${station.url}" placeholder="url">
+      <button class="rm-btn" onclick="removeRadio(${i})">✕</button>
+    `;
+    container.appendChild(row);
+  });
+}
+
+function removeRadio(i) {
+  settingsData.radio.splice(i, 1);
+  renderRadio(document.getElementById('radio-container'), settingsData.radio);
+}
+
+async function saveSettings() {
+  // collect scalar/array settings
+  document.querySelectorAll('[data-path]').forEach(input => {
+    const keys = input.dataset.path.split('.');
+    let obj = settingsData;
+    for (let i = 0; i < keys.length - 1; i++) obj = obj[keys[i]];
+    const lastKey = keys[keys.length - 1];
+    const orig = obj[lastKey];
+    obj[lastKey] = Array.isArray(orig)
+      ? input.value.split(',').map(s => s.trim()).filter(Boolean)
+      : input.value;
+  });
+  // collect radio stations
+  document.querySelectorAll('[data-radio]').forEach(input => {
+    const i = parseInt(input.dataset.radio);
+    settingsData.radio[i][input.dataset.field] = input.value;
+  });
+  await fetch('/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settingsData)
+  });
+  const fb = document.getElementById('save-feedback');
+  fb.style.opacity = 1;
+  setTimeout(() => fb.style.opacity = 0, 2000);
+}
+
+// status polling
+async function updateStatus() {
+  try {
+    const res = await fetch('/status');
+    const data = await res.json();
+    document.getElementById('status-bar').textContent =
+      data.state + (data.playing ? ' · playing' : '');
+    if (data.ip && data.ip !== 'unknown') {
+      document.getElementById('host-ip').textContent = data.ip + ':8000';
+    }
+  } catch {}
+}
+setInterval(updateStatus, 2000);
+updateStatus();
+</script>
+</body>
+</html>

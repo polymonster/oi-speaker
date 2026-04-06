@@ -1,0 +1,84 @@
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+import socket
+import tomllib
+import tomli_w
+from fastapi import Body, FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+import speaker as spk
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+CONFIG_PATH = Path("config.toml")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    spk.start()
+    yield
+    spk.stop_playback()
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+class ChatRequest(BaseModel):
+    text: str
+
+
+@app.get("/")
+async def index():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    response = spk.query_llm(spk.ctx.llm_client, spk.ctx.system, req.text)
+    parsed = spk._parse_llm_json(response)
+    if parsed.get("function") == "chat":
+        return {"response": parsed["payload"]}
+    spk._handle_llm_function(spk.ctx, response)
+    return {"response": f"[{parsed.get('function')}]"}
+
+
+@app.get("/settings")
+async def get_settings():
+    with open(CONFIG_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
+@app.post("/settings")
+async def update_settings(settings: dict[str, Any] = Body(...)):
+    with open(CONFIG_PATH, "wb") as f:
+        f.write(tomli_w.dumps(settings).encode())
+    if spk.ctx:
+        spk.ctx.config = settings
+    return {"ok": True}
+
+
+def _local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "unknown"
+
+
+@app.get("/status")
+async def status():
+    return {
+        "state": spk.speaker_state.value,
+        "playing": spk._player is not None,
+        "ip": _local_ip(),
+    }
