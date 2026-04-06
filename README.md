@@ -50,6 +50,10 @@ brew install python@3.11
 python3.11 -m venv ~/oi-speaker-env
 ```
 
+### Python 3.11 (Windows)
+
+[Installer](https://www.python.org/ftp/python/3.11.0/python-3.11.0rc2-amd64.exe)
+
 ## Python Dependencies
 
 Python deps are configured as part of the `pyproject.toml` setup your Python env and install as so:

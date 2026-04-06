@@ -15,7 +15,9 @@ import tomllib
 import json
 import requests
 import uvicorn
-
+import os
+    
+from web import app
 from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
@@ -56,9 +58,18 @@ def get_audio_device_index(name: str):
     return None
 
 
-def flush_stream(stream):
+def flush_stream(stream, sample_rate: int):
     stream.stop()
     stream.start()
+    # drain buffered audio to avoid re-triggering on stale data (Windows WASAPI retains buffer on restart)
+    sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
+    chunk = WAKE_CHUNK * sample_ratio
+    discard_count = int(0.5 * sample_rate / chunk) + 1
+    for _ in range(discard_count):
+        try:
+            stream.read(chunk)
+        except Exception:
+            break
 
 
 def test_tone(dev, dev_index: int, sample_rate: int):
@@ -145,9 +156,6 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
     for audio_chunk in voice_model.synthesize(text):
         int_data = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
         chunks.append(int_data)
-
-    print(f"chunks: {len(chunks)}")
-
     if chunks:
         full_audio = np.concatenate(chunks)
         resampled = resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
@@ -159,6 +167,7 @@ ctx: SpeakerContext | None = None
 speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
 
 _player: mpv.MPV | None = None
+
 def stop_playback():
     global _player
     if _player is not None:
@@ -176,19 +185,54 @@ def resume_playback():
         _player.pause = False
 
 
+def _play_youtube_windows(url: str):
+    import tempfile, os
+    tmpdir = tempfile.mkdtemp()
+    output_template = os.path.join(tmpdir, "audio.%(ext)s")
+    print(f"downloading youtube audio...")
+    result = subprocess.run(
+        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", output_template,
+         "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"yt-dlp error: {result.stderr}")
+        return
+    files = os.listdir(tmpdir)
+    if not files:
+        print("yt-dlp: no output file found")
+        return
+    audio_file = os.path.join(tmpdir, files[0])
+    print(f"playing: {audio_file}")
+    global _player
+    _player = mpv.MPV(vid=False, terminal=False)
+    _player.play(audio_file)
+    _player.wait_for_playback()
+    try:
+        os.unlink(audio_file)
+        os.rmdir(tmpdir)
+    except Exception:
+        pass
+
+
 def play_url(url: str):
     global _player
     stop_playback()
-    _player = mpv.MPV(vid=False, terminal=False)
-    def _run():
-        _player.play(url)
-        _player.wait_for_playback()
-    threading.Thread(target=_run, daemon=True).start()
+    print(f"play_url: {url}")
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    if is_youtube and sys.platform == "win32":
+        threading.Thread(target=_play_youtube_windows, args=(url,), daemon=True).start()
+    else:
+        _player = mpv.MPV(vid=False, terminal=False)
+        def _run():
+            _player.play(url)
+            _player.wait_for_playback()
+        threading.Thread(target=_run, daemon=True).start()
 
 
 def search_youtube(query: str, max_results: int = 5) -> str:
     result = subprocess.run(
-        ["yt-dlp", f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"],
+        [sys.executable, "-m", "yt_dlp", f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"],
         capture_output=True, text=True
     )
     results = []
@@ -253,6 +297,7 @@ def _handle_llm_function(ctx: SpeakerContext, response: str) -> SpeakerState | N
 
 
 def _audio_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
+    print("audio! loop!!")
     global speaker_state
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
         while True:
@@ -260,17 +305,18 @@ def _audio_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 if listen_for_wake(wake_model, stream, input_sample_rate):
                     speaker_state = SpeakerState.CHATTING
             elif speaker_state == SpeakerState.CHATTING:
+                print("chatting")
                 pause_playback()
                 audio_request = record_until_silence(vad, stream, input_sample_rate)
-                resume_playback()
                 transcribed_request = transcribe_audio(whisper_model, audio_request)
                 print(transcribed_request)
                 llm_response = query_llm(ctx.llm_client, ctx.system, transcribed_request)
                 next_state = _handle_llm_function(ctx, llm_response)
                 if next_state is not None:
                     speaker_state = next_state
+                resume_playback()
             elif speaker_state == SpeakerState.RESET:
-                flush_stream(stream)
+                flush_stream(stream, input_sample_rate)
                 wake_model.reset()
                 speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 print("return to listen for wake")
@@ -292,11 +338,21 @@ def start():
         wakeword_models=["hey_jarvis"],
         inference_framework="tflite",
         vad_threshold=0.5,
-        enable_speex_noise_suppression=sys.platform != "darwin"
+        enable_speex_noise_suppression=False # TODO: Pi
     )
 
     vad = webrtcvad.Vad(2)
-    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+    inf = config.get("inference", {})
+    device = inf.get("device", "cpu")
+    try:
+        whisper_model = WhisperModel(
+            inf.get("whisper_model", "small"),
+            device=device,
+            compute_type=inf.get("whisper_compute", "int8")
+        )
+    except Exception as e:
+        print(f"whisper init failed on {device} ({e}), falling back to cpu")
+        whisper_model = WhisperModel(inf.get("whisper_model", "small"), device="cpu", compute_type="int8")
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
     voice_model = PiperVoice.load("models/en_GB-northern_english_male-medium.onnx")
 
@@ -324,11 +380,8 @@ def start():
 
 
 def main():
-    import os
     print("oi! oi!!")
     sys.path.insert(0, str(__file__).replace("speaker.py", ""))
-    start()
-    from web import app
     uvicorn.run(app, host="0.0.0.0", port=8000)
     os._exit(0)
 
