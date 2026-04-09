@@ -43,7 +43,7 @@ def download_librispeech_clips(output_dir, n_clips=2500, clip_duration_sec=1.0, 
         split="train.100",
         streaming=True,
         trust_remote_code=True
-    ).cast_column("audio", Audio(sampling_rate=sr, decode=True, mono=True))
+    ).cast_column("audio", Audio(sampling_rate=sr, decode=True))
 
     clip_count = 0
 
