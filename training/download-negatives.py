@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def download_librispeech_clips(output_dir, n_clips=2500, clip_duration_sec=1.0, sr=16000):
     """Download LibriSpeech data from HuggingFace and chop into fixed-length clips."""
-    from datasets import load_dataset
+    from datasets import load_dataset, Audio
 
     target_samples = int(clip_duration_sec * sr)
     os.makedirs(output_dir, exist_ok=True)
@@ -36,14 +36,14 @@ def download_librispeech_clips(output_dir, n_clips=2500, clip_duration_sec=1.0, 
     logger.info(f"Downloading LibriSpeech clean-100 from HuggingFace (streaming)...")
     logger.info(f"Target: {n_clips} clips of {clip_duration_sec}s at {sr}Hz")
 
-    # Stream the dataset so we don't download everything at once
+    # Stream the dataset, force soundfile backend to avoid torchcodec
     dataset = load_dataset(
         "librispeech_asr",
         "clean",
         split="train.100",
         streaming=True,
         trust_remote_code=True
-    )
+    ).cast_column("audio", Audio(sampling_rate=sr, decode=True, mono=True))
 
     clip_count = 0
 
@@ -55,21 +55,9 @@ def download_librispeech_clips(output_dir, n_clips=2500, clip_duration_sec=1.0, 
         audio_array = audio["array"]
         audio_sr = audio["sampling_rate"]
 
-        # Convert to int16
+        # Convert to int16 (HF returns float32 normalized to [-1, 1])
         if audio_array.dtype == np.float64 or audio_array.dtype == np.float32:
             audio_array = (audio_array * 32767).astype(np.int16)
-
-        # Resample if needed
-        if audio_sr != sr:
-            try:
-                import soxr
-                audio_array = audio_array.astype(np.float32) / 32767.0
-                audio_array = soxr.resample(audio_array, audio_sr, sr)
-                audio_array = (audio_array * 32767).astype(np.int16)
-            except ImportError:
-                from scipy.signal import resample
-                n_samples = int(len(audio_array) * sr / audio_sr)
-                audio_array = resample(audio_array.astype(np.float32), n_samples).astype(np.int16)
 
         # Chop into fixed-length clips
         for start in range(0, len(audio_array) - target_samples, target_samples):
