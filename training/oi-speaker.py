@@ -96,7 +96,8 @@ def compute_features(audio_clips, batch_size=32):
     # Check what methods are available
     if hasattr(F, 'embed_clips'):
         logger.info(f"Using embed_clips (batch_size={batch_size})")
-        return F.embed_clips(audio_clips, batch_size=batch_size)
+        audio_array = np.array(audio_clips)
+        return F.embed_clips(audio_array, batch_size=batch_size)
 
     # Fallback: process one at a time
     logger.info("Using single-clip embedding (embed_clips not available)")
