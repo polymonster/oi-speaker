@@ -80,3 +80,63 @@ python -m piper.download_voices en_GB-northern_english_male-medium
 ```bash
 speaker
 ```
+
+## Training
+
+Use Piper-TTS to generate random positive samples + add custom user generated ones.
+
+Generate negative samples:
+
+```
+python oi-speaker/training/download-negatives.py \
+    --output_dir oww-training/negative_samples \
+    --n_clips 3000 \
+    --clip_duration 1.0 \
+    --cache_dir ~/librispeech_cache
+```
+
+Train on WSL / Linux:
+
+Setup python env:
+
+```
+python3.10 -m venv venv_clean
+source venv_clean/bin/activate
+
+# Minimal deps — no tensorflow, no speechbrain, no piper
+pip install numpy scipy scikit-learn onnxruntime torch torchaudio onnx soxr
+```
+
+Setup openWakeWord
+
+```
+https://github.com/dscripka/openWakeWord
+cd openWakeWord
+# Install openwakeword itself (just the inference bits)
+pip install -e . --no-deps
+```
+
+Install onnx models in openWakeWord:
+
+```
+mkdir -p openWakeWord/openwakeword/resources/models
+
+wget -O openWakeWord/openwakeword/resources/models/melspectrogram.onnx \
+    https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx
+
+wget -O openWakeWord/openwakeword/resources/models/embedding_model.onnx \
+    https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx
+
+ls -la openWakeWord/openwakeword/resources/models/
+```
+
+Kick off training:
+
+```
+python oi-speaker/training/oi-speaker.py \
+    --positive_dir oww-training/positive_samples \
+    --negative_dir oww-training/negative_samples \
+    --model_name oi_speaker \
+    --clip_duration 1.0 \
+    --epochs 100
+```
