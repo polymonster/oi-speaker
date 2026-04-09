@@ -51,6 +51,12 @@ def download_and_extract(url, extract_dir):
     else:
         logger.info(f"Using cached download at {tar_path}")
 
+    # Skip extraction if already done
+    existing_flacs = glob.glob(os.path.join(extract_dir, '**', '*.flac'), recursive=True)
+    if existing_flacs:
+        logger.info(f"Already extracted ({len(existing_flacs)} FLAC files found), skipping.")
+        return
+
     logger.info("Extracting...")
     with tarfile.open(tar_path, 'r:gz') as tar:
         tar.extractall(path=extract_dir)
