@@ -354,8 +354,8 @@ def main():
 
     model.eval()
     with torch.no_grad():
-        pos_scores = model(torch.from_numpy(pos_windows[:5])).numpy().flatten()
-        neg_scores = model(torch.from_numpy(neg_windows[:5])).numpy().flatten()
+        pos_scores = model(torch.from_numpy(pos_windows[:5]).float()).numpy().flatten()
+        neg_scores = model(torch.from_numpy(neg_windows[:5]).float()).numpy().flatten()
         logger.info(f"Positive scores: {pos_scores}")
         logger.info(f"Negative scores: {neg_scores}")
 

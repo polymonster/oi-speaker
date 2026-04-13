@@ -3,3 +3,5 @@ models/
 .credentials
 config.toml
 ~/
+training/false_positives/
+training/positives/

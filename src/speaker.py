@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import threading
+from collections import deque
 import mpv
 import openwakeword
 import sounddevice as dev
@@ -14,10 +15,10 @@ import re
 import tomllib
 import json
 import requests
+import wave
 import uvicorn
 import os
     
-from web import app
 from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
@@ -131,6 +132,15 @@ def listen_for_wake(wake_model, stream, sample_rate: int) -> bool:
             print("ello mate!")
             return True
     return False
+
+
+def write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float = 4.0):
+    boosted = np.clip(audio.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
+    with wave.open(filepath, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # int16 = 2 bytes
+        wf.setframerate(sample_rate)
+        wf.writeframes(boosted.tobytes())
 
 
 def transcribe_audio(whisper_model, audio: np.ndarray) -> str:
@@ -335,8 +345,9 @@ def start():
         system = json.dumps(system)
 
     wake_model = Model(
-        wakeword_models=["hey_jarvis"],
-        inference_framework="tflite",
+        # wakeword_models=["hey_jarvis"],
+        # inference_framework="tflite",
+        wakeword_models=["models/oi_speaker.onnx"],
         vad_threshold=0.5,
         enable_speex_noise_suppression=False # TODO: Pi
     )
@@ -379,11 +390,62 @@ def start():
     ).start()
 
 
+def wake_word_capture(dir: str):
+    print("wake_word_capture")
+
+    with open("config.toml", "rb") as f:
+        config = tomllib.load(f)
+
+    wake_model = Model(
+        wakeword_models=["models/oi_speaker.onnx"],
+        vad_threshold=0.5,
+        enable_speex_noise_suppression=False
+    )
+
+    input_dev_info = get_audio_device_index(config["audio"]["input_device"])
+    input_dev_index = int(input_dev_info['index'])
+    input_sample_rate = int(input_dev_info['default_samplerate'])
+
+    # 2 seconds of rolling context at 80ms per chunk
+    buffer_chunks = int(2.0 / (WAKE_CHUNK / TARGET_SAMPLE_RATE))
+    rolling_buffer = deque(maxlen=buffer_chunks)
+
+    os.makedirs(dir, exist_ok=True)
+
+    sample_ratio = int(math.ceil(input_sample_rate / TARGET_SAMPLE_RATE))
+    raw_chunk = WAKE_CHUNK * sample_ratio
+
+    print("listening")
+    with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
+        while True:
+            raw, _ = stream.read(raw_chunk)
+            raw_flat = np.squeeze(raw)
+            rolling_buffer.append(raw_flat)
+
+            # resample only for the wake model
+            audio_flat = resample_audio(raw_flat, input_sample_rate, TARGET_SAMPLE_RATE)[:WAKE_CHUNK]
+            prediction = wake_model.predict(audio_flat)
+            for _, score in prediction.items():
+                if score > 0.5:
+                    print("triggered!")
+                    filepath = f"{dir}/{int(time.time() * 1000)}.wav"
+                    write_wav(np.concatenate(rolling_buffer), input_sample_rate, filepath)
+                    print(f"wrote: {filepath}")
+                    rolling_buffer.clear()
+                    wake_model.reset()
+
+
 def main():
     print("oi! oi!!")
-    sys.path.insert(0, str(__file__).replace("speaker.py", ""))
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-    os._exit(0)
+
+    if "-wake_word_capture" in sys.argv:
+        wake_word_capture(sys.argv[sys.argv.index("-wake_word_capture") + 1])
+    else:
+        # main speaker loop / app
+        sys.path.insert(0, str(__file__).replace("speaker.py", ""))
+        from web import app
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+        os._exit(0)
 
 
 if __name__ == "__main__":

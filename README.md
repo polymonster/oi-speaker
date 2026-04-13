@@ -130,6 +130,12 @@ wget -O openWakeWord/openwakeword/resources/models/embedding_model.onnx \
 ls -la openWakeWord/openwakeword/resources/models/
 ```
 
+Install additional deps:
+
+```
+pip install onnxscript
+```
+
 Kick off training:
 
 ```
