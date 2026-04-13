@@ -426,8 +426,8 @@ def wake_word_capture(dir: str):
             audio_flat = resample_audio(raw_flat, input_sample_rate, TARGET_SAMPLE_RATE)[:WAKE_CHUNK]
             prediction = wake_model.predict(audio_flat)
             for _, score in prediction.items():
-                if score > 0.5:
-                    print("triggered!")
+                if score > 0.75:
+                    print(f"triggered! {score}")
                     filepath = f"{dir}/{int(time.time() * 1000)}.wav"
                     write_wav(np.concatenate(rolling_buffer), input_sample_rate, filepath)
                     print(f"wrote: {filepath}")
