@@ -393,6 +393,10 @@ def start():
 def wake_word_capture(dir: str):
     print("wake_word_capture")
 
+    # make dir to write to
+    os.makedirs(dir, exist_ok=True)
+
+    # load config
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
 
@@ -402,36 +406,40 @@ def wake_word_capture(dir: str):
         enable_speex_noise_suppression=False
     )
 
+    # setup audio
     input_dev_info = get_audio_device_index(config["audio"]["input_device"])
     input_dev_index = int(input_dev_info['index'])
     input_sample_rate = int(input_dev_info['default_samplerate'])
 
     # 2 seconds of rolling context at 80ms per chunk
     buffer_chunks = int(2.0 / (WAKE_CHUNK / TARGET_SAMPLE_RATE))
-    rolling_buffer = deque(maxlen=buffer_chunks)
-
-    os.makedirs(dir, exist_ok=True)
-
-    sample_ratio = int(math.ceil(input_sample_rate / TARGET_SAMPLE_RATE))
     raw_chunk = WAKE_CHUNK * sample_ratio
+    rolling_buffer = deque(maxlen=buffer_chunks)
+    sample_ratio = int(math.ceil(input_sample_rate / TARGET_SAMPLE_RATE))
+    score_window = deque(maxlen=5)
 
+    # listening loop
     print("listening")
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
         while True:
             raw, _ = stream.read(raw_chunk)
             raw_flat = np.squeeze(raw)
             rolling_buffer.append(raw_flat)
-
             # resample only for the wake model
             audio_flat = resample_audio(raw_flat, input_sample_rate, TARGET_SAMPLE_RATE)[:WAKE_CHUNK]
             prediction = wake_model.predict(audio_flat)
             for _, score in prediction.items():
-                if score > 0.75:
-                    print(f"triggered! {score}")
+                score_window.append(score > 0.9)
+                hits = sum(score_window)
+                if score > 0.0:
+                    print(f"score: {score:.3f} ({hits}/5)")
+                if hits >= 3:
+                    print("triggered!")
                     filepath = f"{dir}/{int(time.time() * 1000)}.wav"
                     write_wav(np.concatenate(rolling_buffer), input_sample_rate, filepath)
                     print(f"wrote: {filepath}")
                     rolling_buffer.clear()
+                    score_window.clear()
                     wake_model.reset()
 
 
