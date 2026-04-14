@@ -41,12 +41,14 @@ async def index():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    response = spk.query_llm(spk.ctx.llm_client, spk.ctx.system, req.text)
-    parsed = spk._parse_llm_json(response)
-    if parsed.get("function") == "chat":
-        return {"response": parsed["payload"]}
-    spk._handle_llm_function(spk.ctx, response)
-    return {"response": f"[{parsed.get('function')}]"}
+    spk.chat_history.append({"role": "user", "text": req.text})
+    state = spk.query_llm(spk.ctx.llm_client, spk.ctx.system, req.text)
+    return {"response": f"[{state.value}]"}
+
+
+@app.get("/history")
+async def history():
+    return spk.chat_history
 
 
 @app.get("/settings")
@@ -59,8 +61,6 @@ async def get_settings():
 async def update_settings(settings: dict[str, Any] = Body(...)):
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(settings).encode())
-    if spk.ctx:
-        spk.ctx.config = settings
     return {"ok": True}
 
 

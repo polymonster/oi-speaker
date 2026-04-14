@@ -32,11 +32,12 @@
   .setting input { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 7px 10px; font-family: monospace; font-size: 0.9em; outline: none; }
   .setting input:focus { border-color: #555; }
   .section-header { color: #444; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.1em; margin: 20px 0 10px; border-bottom: 1px solid #1e1e1e; padding-bottom: 6px; }
-  .radio-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
-  .radio-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 7px 10px; font-family: monospace; font-size: 0.9em; outline: none; }
-  .radio-row input:focus { border-color: #555; }
-  .radio-row .name-input { width: 160px; flex-shrink: 0; }
-  .radio-row .url-input { flex: 1; }
+  .hint-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .hint-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 7px 10px; font-family: monospace; font-size: 0.9em; outline: none; }
+  .hint-row input:focus { border-color: #555; }
+  .hint-row .name-input { width: 130px; flex-shrink: 0; }
+  .hint-row .cat-input  { width: 90px; flex-shrink: 0; }
+  .hint-row .val-input  { flex: 1; }
   .rm-btn { background: none; border: 1px solid #333; color: #555; padding: 6px 10px; cursor: pointer; font-family: monospace; flex-shrink: 0; }
   .rm-btn:hover { border-color: #a44; color: #f66; }
   .add-btn { background: none; border: 1px solid #333; color: #555; padding: 6px 14px; cursor: pointer; font-family: monospace; margin-top: 4px; }
@@ -90,23 +91,22 @@ function show(id, btn) {
 }
 
 // chat
+let historyLen = 0;
+
 document.getElementById('chat-form').addEventListener('submit', async e => {
   e.preventDefault();
   const input = document.getElementById('chat-input');
   const text = input.value.trim();
   if (!text) return;
-  addMsg('user', '> ' + text);
   input.value = '';
   input.disabled = true;
   try {
-    const res = await fetch('/chat', {
+    await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text })
     });
-    const data = await res.json();
-    const isAction = data.response.startsWith('[');
-    addMsg('bot' + (isAction ? ' action' : ''), '< ' + data.response);
+    await syncHistory();
   } catch {
     addMsg('bot action', '< error');
   } finally {
@@ -124,34 +124,56 @@ function addMsg(cls, text) {
   log.scrollTop = log.scrollHeight;
 }
 
+async function syncHistory() {
+  try {
+    const res = await fetch('/history');
+    const entries = await res.json();
+    for (let i = historyLen; i < entries.length; i++) {
+      const e = entries[i];
+      if (e.role === 'user') addMsg('user', '> ' + e.text);
+      else addMsg('bot', '< ' + e.text);
+    }
+    historyLen = entries.length;
+  } catch {}
+}
+
 // settings
 async function loadSettings() {
-  const res = await fetch('/settings');
-  settingsData = await res.json();
+  try {
+    const res = await fetch('/settings');
+    settingsData = await res.json();
+  } catch(e) {
+    document.getElementById('settings-form').textContent = 'Error loading settings: ' + e;
+    return;
+  }
   const form = document.getElementById('settings-form');
   form.innerHTML = '';
   renderObj(form, settingsData, []);
+
+  // Hints — always rendered explicitly so it's never silently skipped
+  const hintsHeader = document.createElement('div');
+  hintsHeader.className = 'section-header';
+  hintsHeader.textContent = 'hints';
+  form.appendChild(hintsHeader);
+  const hintsContainer = document.createElement('div');
+  hintsContainer.id = 'hints-container';
+  form.appendChild(hintsContainer);
+  if (!settingsData.hints) settingsData.hints = [];
+  renderHints(hintsContainer, settingsData.hints);
+  const addBtn = document.createElement('button');
+  addBtn.className = 'add-btn';
+  addBtn.textContent = '+ add hint';
+  addBtn.onclick = () => {
+    settingsData.hints.push({ name: '', category: '', text: '' });
+    renderHints(hintsContainer, settingsData.hints);
+  };
+  form.appendChild(addBtn);
 }
 
 function renderObj(container, obj, path) {
   for (const [key, val] of Object.entries(obj)) {
-    if (key === 'radio' && Array.isArray(val)) {
-      const h = document.createElement('div');
-      h.className = 'section-header';
-      h.textContent = 'radio';
-      container.appendChild(h);
-      const radioContainer = document.createElement('div');
-      radioContainer.id = 'radio-container';
-      container.appendChild(radioContainer);
-      renderRadio(radioContainer, val);
-      const addBtn = document.createElement('button');
-      addBtn.className = 'add-btn';
-      addBtn.textContent = '+ add station';
-      addBtn.onclick = () => {
-        settingsData.radio.push({ name: '', url: '' });
-        renderRadio(radioContainer, settingsData.radio);
-      };
-      container.appendChild(addBtn);
+    if (key === 'hints') {
+      continue; // rendered explicitly in loadSettings
     } else if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
       continue; // other arrays of objects — skip
     } else if (typeof val === 'object' && !Array.isArray(val)) {
@@ -170,27 +192,29 @@ function renderObj(container, obj, path) {
   }
 }
 
-function renderRadio(container, stations) {
+function renderHints(container, hints) {
   container.innerHTML = '';
-  stations.forEach((station, i) => {
+  hints.forEach((hint, i) => {
+    const val = hint.url || hint.text || '';
     const row = document.createElement('div');
-    row.className = 'radio-row';
+    row.className = 'hint-row';
     row.innerHTML = `
-      <input class="name-input" data-radio="${i}" data-field="name" value="${station.name}" placeholder="name">
-      <input class="url-input" data-radio="${i}" data-field="url" value="${station.url}" placeholder="url">
-      <button class="rm-btn" onclick="removeRadio(${i})">✕</button>
+      <input class="name-input" data-hint="${i}" data-field="name" value="${hint.name}" placeholder="name">
+      <input class="cat-input"  data-hint="${i}" data-field="category" value="${hint.category}" placeholder="category">
+      <input class="val-input"  data-hint="${i}" data-field="value" value="${val}" placeholder="url or text">
+      <button class="rm-btn" onclick="removeHint(${i})">✕</button>
     `;
     container.appendChild(row);
   });
 }
 
-function removeRadio(i) {
-  settingsData.radio.splice(i, 1);
-  renderRadio(document.getElementById('radio-container'), settingsData.radio);
+function removeHint(i) {
+  settingsData.hints.splice(i, 1);
+  renderHints(document.getElementById('hints-container'), settingsData.hints);
 }
 
 async function saveSettings() {
-  // collect scalar/array settings
+  // collect scalar/array inputs
   document.querySelectorAll('[data-path]').forEach(input => {
     const keys = input.dataset.path.split('.');
     let obj = settingsData;
@@ -201,10 +225,22 @@ async function saveSettings() {
       ? input.value.split(',').map(s => s.trim()).filter(Boolean)
       : input.value;
   });
-  // collect radio stations
-  document.querySelectorAll('[data-radio]').forEach(input => {
-    const i = parseInt(input.dataset.radio);
-    settingsData.radio[i][input.dataset.field] = input.value;
+  // collect hints — value goes to url or text depending on content
+  document.querySelectorAll('[data-hint]').forEach(input => {
+    const i = parseInt(input.dataset.hint);
+    const field = input.dataset.field;
+    if (field === 'value') {
+      const v = input.value;
+      if (v.startsWith('http')) {
+        settingsData.hints[i].url = v;
+        delete settingsData.hints[i].text;
+      } else {
+        settingsData.hints[i].text = v;
+        delete settingsData.hints[i].url;
+      }
+    } else {
+      settingsData.hints[i][field] = input.value;
+    }
   });
   await fetch('/settings', {
     method: 'POST',
@@ -216,7 +252,7 @@ async function saveSettings() {
   setTimeout(() => fb.style.opacity = 0, 2000);
 }
 
-// status polling
+// status + history polling
 async function updateStatus() {
   try {
     const res = await fetch('/status');
@@ -227,6 +263,7 @@ async function updateStatus() {
       document.getElementById('host-ip').textContent = data.ip + ':8000';
     }
   } catch {}
+  await syncHistory();
 }
 setInterval(updateStatus, 2000);
 updateStatus();

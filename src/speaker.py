@@ -218,6 +218,7 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
         stop_playback()
         return "stopped", SpeakerState.RESET
     elif tool_name == "chat":
+        chat_history.append({"role": "assistant", "text": tool_input["text"]})
         _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, tool_input["text"])
         next_state = SpeakerState.CHATTING if tool_input.get("follow_on") else SpeakerState.RESET
         return "spoken", next_state
@@ -240,6 +241,7 @@ def query_llm(llm_client, system: str, text: str) -> SpeakerState:
         if response.stop_reason == "end_turn":
             for block in response.content:
                 if block.type == "text" and block.text.strip():
+                    chat_history.append({"role": "assistant", "text": block.text})
                     _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, block.text)
             return next_state
 
@@ -285,6 +287,7 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
 
 
 ctx: SpeakerContext | None = None
+chat_history: list[dict] = []  # {"role": "user"|"assistant", "text": str}
 speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
 
 _player: mpv.MPV | None = None
@@ -397,6 +400,7 @@ def _audio_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 audio_request = record_until_silence(vad, stream, input_sample_rate)
                 transcribed_request = transcribe_audio(whisper_model, audio_request)
                 print(transcribed_request)
+                chat_history.append({"role": "user", "text": transcribed_request})
                 speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request)
                 resume_playback()
             elif speaker_state == SpeakerState.RESET:
