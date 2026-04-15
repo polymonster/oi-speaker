@@ -2,52 +2,73 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>oi-speaker</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: monospace; background: #111; color: #eee; max-width: 760px; margin: 40px auto; padding: 0 20px; }
-  h1 { color: #eee; font-size: 1.1em; margin-bottom: 4px; }
-  #host-ip { color: #333; font-size: 0.8em; margin-bottom: 20px; }
-  nav { display: flex; gap: 8px; margin-bottom: 24px; border-bottom: 1px solid #222; padding-bottom: 12px; }
-  nav button { background: none; border: none; color: #555; padding: 4px 12px; cursor: pointer; font-family: monospace; font-size: 0.95em; }
+  html, body { height: 100%; overflow: hidden; }
+  body { font-family: monospace; background: #111; color: #eee; padding: 0 16px; display: flex; flex-direction: column; font-size: 18px; }
+  h1 { color: #eee; font-size: 1.2em; margin: 16px 0 2px; }
+  #host-ip { color: #333; font-size: 0.9em; margin-bottom: 12px; }
+  nav { display: flex; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid #222; padding-bottom: 10px; }
+  nav button { background: none; border: none; color: #555; padding: 4px 12px; cursor: pointer; font-family: monospace; font-size: 1em; }
   nav button.active { color: #eee; border-bottom: 2px solid #eee; }
   section { display: none; }
-  section.active { display: block; }
+  section.active { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
 
   /* chat */
-  #chat-log { height: 420px; overflow-y: auto; border: 1px solid #222; padding: 14px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 8px; }
-  .msg { font-size: 0.9em; line-height: 1.5; }
+  #chat-log { flex: 1; overflow-y: auto; border: 1px solid #222; padding: 14px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { font-size: 1em; line-height: 1.5; }
   .msg.user { color: #7af; }
   .msg.bot { color: #afa; }
   .msg.bot.action { color: #fa7; }
-  #chat-form { display: flex; gap: 8px; }
-  #chat-input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 12px; font-family: monospace; font-size: 0.95em; outline: none; }
+  #chat-form { display: flex; gap: 8px; padding-bottom: 16px; }
+  #chat-input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 10px 14px; font-family: monospace; font-size: 1em; outline: none; }
   #chat-input:focus { border-color: #555; }
-  .send-btn { background: #222; border: 1px solid #444; color: #eee; padding: 8px 16px; cursor: pointer; font-family: monospace; }
+  .send-btn { background: #222; border: 1px solid #444; color: #eee; padding: 10px 18px; cursor: pointer; font-family: monospace; font-size: 1em; }
   .send-btn:hover { background: #2a2a2a; }
 
   /* settings */
+  #settings { overflow-y: auto; overflow-x: auto; }
+  .hint-row { min-width: max-content; }
   .setting { margin-bottom: 14px; }
-  .setting label { display: block; color: #666; font-size: 0.8em; margin-bottom: 4px; }
-  .setting input { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 7px 10px; font-family: monospace; font-size: 0.9em; outline: none; }
-  .setting input:focus { border-color: #555; }
-  .section-header { color: #444; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.1em; margin: 20px 0 10px; border-bottom: 1px solid #1e1e1e; padding-bottom: 6px; }
-  .hint-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
-  .hint-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 7px 10px; font-family: monospace; font-size: 0.9em; outline: none; }
+  .setting label { display: block; color: #666; font-size: 0.85em; margin-bottom: 4px; }
+  .setting input, .setting select { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: monospace; font-size: 1em; outline: none; }
+  .setting input:focus, .setting select:focus { border-color: #555; }
+  .setting select { appearance: none; cursor: pointer; }
+  .section-header { color: #444; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.1em; margin: 20px 0 10px; border-bottom: 1px solid #1e1e1e; padding-bottom: 6px; }
+  .hint-block { margin-bottom: 8px; }
+  .hint-row { display: flex; gap: 8px; align-items: center; }
+  .hint-row + .hint-row { margin-top: 4px; }
+  .hint-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: monospace; font-size: 1em; outline: none; }
   .hint-row input:focus { border-color: #555; }
   .hint-row .name-input { width: 130px; flex-shrink: 0; }
   .hint-row .cat-input  { width: 90px; flex-shrink: 0; }
   .hint-row .val-input  { flex: 1; }
-  .rm-btn { background: none; border: 1px solid #333; color: #555; padding: 6px 10px; cursor: pointer; font-family: monospace; flex-shrink: 0; }
+  .hint-row .extra-input { flex: 1; color: #aaa; }
+  .rm-btn { background: none; border: 1px solid #333; color: #555; padding: 8px 10px; cursor: pointer; font-family: monospace; flex-shrink: 0; }
   .rm-btn:hover { border-color: #a44; color: #f66; }
-  .add-btn { background: none; border: 1px solid #333; color: #555; padding: 6px 14px; cursor: pointer; font-family: monospace; margin-top: 4px; }
+  .extra-btn { background: none; border: none; color: #444; padding: 8px 4px; cursor: pointer; font-family: monospace; font-size: 0.85em; flex-shrink: 0; white-space: nowrap; }
+  .extra-btn:hover { color: #888; }
+  .add-btn { background: none; border: 1px solid #333; color: #555; padding: 8px 14px; cursor: pointer; font-family: monospace; margin-top: 4px; }
   .add-btn:hover { border-color: #555; color: #eee; }
-  #save-btn { background: #222; border: 1px solid #444; color: #eee; padding: 8px 20px; cursor: pointer; font-family: monospace; margin-top: 16px; }
+  #save-btn { background: #222; border: 1px solid #444; color: #eee; padding: 10px 20px; cursor: pointer; font-family: monospace; margin-top: 16px; font-size: 1em; }
   #save-btn:hover { background: #2a2a2a; }
-  #save-feedback { color: #afa; font-size: 0.85em; margin-left: 12px; opacity: 0; transition: opacity 0.3s; }
+  #cancel-btn { display: none; background: none; border: 1px solid #444; color: #888; padding: 10px 20px; cursor: pointer; font-family: monospace; margin-top: 16px; font-size: 1em; margin-left: 8px; }
+  #cancel-btn:hover { color: #eee; border-color: #666; }
+  #save-feedback { color: #afa; font-size: 0.9em; margin-left: 12px; opacity: 0; transition: opacity 0.3s; }
 
   /* status */
-  #status-bar { position: fixed; bottom: 14px; right: 18px; color: #333; font-size: 0.75em; }
+
+  /* desktop overrides */
+  @media (min-width: 768px) {
+    html, body { height: auto; overflow: auto; }
+    body { max-width: 760px; margin: 40px auto; display: block; font-size: 16px; }
+    section.active { display: block; flex: none; overflow: visible; }
+    #settings { overflow-y: visible; }
+    #chat-log { flex: none; height: 420px; }
+    #chat-form { padding-bottom: 0; }
+  }
 </style>
 </head>
 <body>
@@ -70,14 +91,14 @@
   <div id="settings-form"></div>
   <div style="display:flex;align-items:center;">
     <button id="save-btn" onclick="saveSettings()">save</button>
+    <button id="cancel-btn" onclick="cancelSettings()">cancel</button>
     <span id="save-feedback">saved</span>
   </div>
 </section>
 
-<div id="status-bar">...</div>
 
 <script>
-const GREETINGS = ['Oi! Oi!!', 'Hold Tight!', 'Yes, G!', "What's Happenin!?"];
+const GREETINGS = ['Oi! Oi!!', 'Hold Tight!', 'Yes, Mate!', "'Av It!!"];
 document.getElementById('greeting').textContent = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
 
 let settingsData = {};
@@ -138,14 +159,28 @@ async function syncHistory() {
 }
 
 // settings
+let audioDevices = { inputs: [], outputs: [] };
+let originalData = {};
+
+function markDirty() {
+  document.getElementById('cancel-btn').style.display = '';
+}
+
+function clearDirty() {
+  document.getElementById('cancel-btn').style.display = 'none';
+}
+
 async function loadSettings() {
   try {
-    const res = await fetch('/settings');
-    settingsData = await res.json();
+    const [settingsRes, devicesRes] = await Promise.all([fetch('/settings'), fetch('/audio-devices')]);
+    settingsData = await settingsRes.json();
+    audioDevices = await devicesRes.json();
   } catch(e) {
     document.getElementById('settings-form').textContent = 'Error loading settings: ' + e;
     return;
   }
+  originalData = JSON.parse(JSON.stringify(settingsData));
+  clearDirty();
   const form = document.getElementById('settings-form');
   form.innerHTML = '';
   renderObj(form, settingsData, []);
@@ -166,8 +201,10 @@ async function loadSettings() {
   addBtn.onclick = () => {
     settingsData.hints.push({ name: '', category: '', text: '' });
     renderHints(hintsContainer, settingsData.hints);
+    markDirty();
   };
   form.appendChild(addBtn);
+  form.addEventListener('input', markDirty);
 }
 
 function renderObj(container, obj, path) {
@@ -186,7 +223,18 @@ function renderObj(container, obj, path) {
       const fullPath = [...path, key].join('.');
       const div = document.createElement('div');
       div.className = 'setting';
-      div.innerHTML = `<label>${fullPath}</label><input data-path="${fullPath}" value="${Array.isArray(val) ? val.join(', ') : val}">`;
+      const deviceOptions = fullPath === 'audio.input_device' ? audioDevices.inputs
+                          : fullPath === 'audio.output_device' ? audioDevices.outputs
+                          : null;
+      if (deviceOptions && deviceOptions.length > 0) {
+        const opts = deviceOptions.map(name => {
+          const selected = name === val ? ' selected' : '';
+          return `<option value="${name}"${selected}>${name}</option>`;
+        }).join('');
+        div.innerHTML = `<label>${fullPath}</label><select data-path="${fullPath}">${opts}</select>`;
+      } else {
+        div.innerHTML = `<label>${fullPath}</label><input data-path="${fullPath}" value="${Array.isArray(val) ? val.join(', ') : val}">`;
+      }
       container.appendChild(div);
     }
   }
@@ -196,21 +244,41 @@ function renderHints(container, hints) {
   container.innerHTML = '';
   hints.forEach((hint, i) => {
     const val = hint.url || hint.text || '';
-    const row = document.createElement('div');
-    row.className = 'hint-row';
-    row.innerHTML = `
-      <input class="name-input" data-hint="${i}" data-field="name" value="${hint.name}" placeholder="name">
-      <input class="cat-input"  data-hint="${i}" data-field="category" value="${hint.category}" placeholder="category">
-      <input class="val-input"  data-hint="${i}" data-field="value" value="${val}" placeholder="url or text">
-      <button class="rm-btn" onclick="removeHint(${i})">✕</button>
+    const hasExtra = 'extra_info' in hint;
+    const block = document.createElement('div');
+    block.className = 'hint-block';
+    block.innerHTML = `
+      <div class="hint-row">
+        <input class="name-input" data-hint="${i}" data-field="name"     value="${hint.name}"     placeholder="name">
+        <input class="cat-input"  data-hint="${i}" data-field="category" value="${hint.category}" placeholder="category">
+        <input class="val-input"  data-hint="${i}" data-field="value"    value="${val}"           placeholder="url or text">
+        <button class="rm-btn" onclick="removeHint(${i})">✕</button>
+        ${hasExtra ? `<button class="extra-btn" style="visibility:hidden">+ extra</button>` : `<button class="extra-btn" onclick="addExtraInfo(${i})">+ extra</button>`}
+      </div>
+      ${hasExtra ? `
+      <div class="hint-row">
+        <input class="extra-input" data-hint="${i}" data-field="extra_info" value="${hint.extra_info}" placeholder="extra info">
+      </div>` : ''}
     `;
-    container.appendChild(row);
+    container.appendChild(block);
   });
+}
+
+function addExtraInfo(i) {
+  settingsData.hints[i].extra_info = '';
+  renderHints(document.getElementById('hints-container'), settingsData.hints);
+  markDirty();
 }
 
 function removeHint(i) {
   settingsData.hints.splice(i, 1);
   renderHints(document.getElementById('hints-container'), settingsData.hints);
+  markDirty();
+}
+
+function cancelSettings() {
+  settingsData = JSON.parse(JSON.stringify(originalData));
+  loadSettings();
 }
 
 async function saveSettings() {
@@ -247,6 +315,8 @@ async function saveSettings() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(settingsData)
   });
+  originalData = JSON.parse(JSON.stringify(settingsData));
+  clearDirty();
   const fb = document.getElementById('save-feedback');
   fb.style.opacity = 1;
   setTimeout(() => fb.style.opacity = 0, 2000);
@@ -257,8 +327,6 @@ async function updateStatus() {
   try {
     const res = await fetch('/status');
     const data = await res.json();
-    document.getElementById('status-bar').textContent =
-      data.state + (data.playing ? ' · playing' : '');
     if (data.ip && data.ip !== 'unknown') {
       document.getElementById('host-ip').textContent = data.ip + ':8000';
     }

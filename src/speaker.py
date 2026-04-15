@@ -1,7 +1,10 @@
 import subprocess
 import sys
 import threading
+import queue
+import re
 from collections import deque
+import logging as _logging
 import mpv
 import openwakeword
 import sounddevice as dev
@@ -24,10 +27,15 @@ from faster_whisper import WhisperModel
 from dataclasses import dataclass
 from enum import Enum
 
+# TODO:
+# update function, check git and auto update
+# false_positive function, ask LLM to record it
+# positive function, ask LLM to record
+# mpv crash user after finish
+
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 480 # 30ms at 16kHz
-
 
 TOOLS = [
     {
@@ -47,7 +55,12 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "The URL to play"}
+                "url": {"type": "string", "description": "The URL to play"},
+                "headers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional HTTP headers to send with the request, e.g. [\"Origin: https://example.com\"]"
+                }
             },
             "required": ["url"]
         }
@@ -55,6 +68,16 @@ TOOLS = [
     {
         "name": "stop",
         "description": "Stop any in-progress audio playback.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "cache_positive",
+        "description": "User requested that the last used wake word should be cached, for wake model training (positive sample)",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "cache_negative",
+        "description": "User requested that the last used wake word should be cached, for wake model training (negative, false positive sample)",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
@@ -75,11 +98,14 @@ TOOLS = [
     }
 ]
 
+
 class SpeakerState(Enum):
     TEXT_CHAT = "text_chat"
     LISTEN_FOR_WAKE = "listen_for_wake"
     CHATTING = "chatting"
     RESET = "reset"
+    CACHE_POSITIVE_WAKE = "cache_positive"
+    CACHE_NEGATIVE_WAKE = "cache_negative"
 
 
 @dataclass
@@ -89,15 +115,36 @@ class SpeakerContext:
     voice_model: any
     output_dev_index: int
     output_sample_rate: int
+    wake_model: any
+    input_dev_index: int
+    input_sample_rate: int
+
+
+ctx: SpeakerContext | None = None
+chat_history: list[dict] = []  # {"role": "user"|"assistant", "text": str}
+speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
+_player_cmd_queue: queue.Queue = queue.Queue()
+_player_active: bool = False
+_interrupt: threading.Event = threading.Event()
+_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+
+
+def enumerate_audio_devices() -> dict:
+    devices = dev.query_devices()
+    inputs, outputs = [], []
+    for d in devices:
+        if d['max_input_channels'] > 0:
+            inputs.append(d['name'])
+        if d['max_output_channels'] > 0:
+            outputs.append(d['name'])
+    return {"inputs": inputs, "outputs": outputs}
 
 
 def get_audio_device_index(name: str):
-    print(dev.query_devices())
-    devices = str(dev.query_devices()).splitlines()
+    devices = dev.query_devices()
     index = 0
     for device in devices:
-        if device.find(name) != -1:
-            print(f"audio device index: {device}")
+        if device['name'].find(name) != -1:
             return dev.query_devices(index)
         index += 1
     return None
@@ -167,7 +214,7 @@ def record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1
 
 
 def listen_for_wake(wake_model, stream, sample_rate: int,
-                    threshold: float = 0.5, num_triggers: int = 1,
+                    threshold: float = 0.9, num_triggers: int = 3,
                     window_size: int = 5, buffer_duration: float = 0.0) -> np.ndarray:
     """Block until wake word is detected. Returns buffered pre-trigger audio (empty if buffer_duration=0)."""
     score_window = deque(maxlen=window_size)
@@ -212,11 +259,15 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     if tool_name == "search_youtube":
         return search_youtube(tool_input["query"]), None
     elif tool_name == "play_url":
-        play_url(tool_input["url"])
+        play_url(tool_input["url"], tool_input.get("headers"))
         return "playing", SpeakerState.RESET
     elif tool_name == "stop":
         stop_playback()
         return "stopped", SpeakerState.RESET
+    elif tool_name == "cache_positive":
+        return "cache_positive", SpeakerState.CACHE_POSITIVE_WAKE
+    elif tool_name == "cache_negative":
+        return "cache_negative", SpeakerState.CACHE_NEGATIVE_WAKE
     elif tool_name == "chat":
         chat_history.append({"role": "assistant", "text": tool_input["text"]})
         _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, tool_input["text"])
@@ -225,56 +276,107 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     return "unknown tool", None
 
 
-def query_llm(llm_client, system: str, text: str) -> SpeakerState:
-    messages = [{"role": "user", "content": text}]
-    next_state = SpeakerState.RESET
+def _split_sentences(text: str) -> tuple[list[str], str]:
+    parts = _SENTENCE_END.split(text)
+    if len(parts) <= 1:
+        return [], text
+    return parts[:-1], parts[-1]
 
-    while True:
-        response = llm_client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=1024,
-            system=system,
-            tools=TOOLS,
-            messages=messages
+
+def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
+    global _interrupt
+    _interrupt.clear()
+
+    stop_flag = threading.Event()
+    wake_thread = None
+    if mic_stream is not None:
+        wake_thread = threading.Thread(
+            target=_interrupt_wake_listen,
+            args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag),
+            daemon=True
         )
+        wake_thread.start()
+    try:
+        messages = [{"role": "user", "content": text}]
+        next_state = SpeakerState.RESET
 
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    chat_history.append({"role": "assistant", "text": block.text})
-                    _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, block.text)
-            return next_state
+        while True:
+            accumulated_text = ""
+            sentence_buffer = ""
 
-        if response.stop_reason == "pause_turn":
-            # server-side tool (web search) hit iteration limit — re-send to continue
-            messages.append({"role": "assistant", "content": response.content})
-            continue
+            with llm_client.messages.stream(
+                model="claude-sonnet-4-5",
+                max_tokens=1024,
+                system=system,
+                tools=TOOLS,
+                messages=messages
+            ) as stream:
+                for delta in stream.text_stream:
+                    if _interrupt.is_set():
+                        break
+                    sentence_buffer += delta
+                    accumulated_text += delta
+                    sentences, sentence_buffer = _split_sentences(sentence_buffer)
+                    for s in sentences:
+                        if s.strip():
+                            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, s)
+                    if _interrupt.is_set():
+                        return SpeakerState.RESET
 
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    print(f"tool: {block.name} {block.input}")
-                    result, state = _execute_tool(block.name, block.input)
-                    if state is not None:
-                        next_state = state
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
-            messages.append({"role": "user", "content": tool_results})
+                if _interrupt.is_set():
+                    return SpeakerState.RESET
 
-            # Terminal actions don't need another LLM round-trip
-            if next_state == SpeakerState.RESET and any(
-                block.type == "tool_use" and block.name in ("play_url", "stop")
-                for block in response.content
-            ):
+                if sentence_buffer.strip():
+                    _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, sentence_buffer)
+
+                if _interrupt.is_set():
+                    return SpeakerState.RESET
+
+                final_message = stream.get_final_message()
+
+            if final_message.stop_reason == "end_turn":
+                if accumulated_text.strip():
+                    chat_history.append({"role": "assistant", "text": accumulated_text})
                 return next_state
+
+            if final_message.stop_reason == "pause_turn":
+                # server-side tool (web search) hit iteration limit — re-send to continue
+                messages.append({"role": "assistant", "content": final_message.content})
+                continue
+
+            if final_message.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": final_message.content})
+                tool_results = []
+                for block in final_message.content:
+                    if block.type == "tool_use":
+                        print(f"tool: {block.name} {block.input}")
+                        result, state = _execute_tool(block.name, block.input)
+                        if state is not None:
+                            next_state = state
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
+                        })
+                messages.append({"role": "user", "content": tool_results})
+
+                # Terminal actions don't need another LLM round-trip
+                if next_state == SpeakerState.RESET and any(
+                    block.type == "tool_use" and block.name in ("play_url", "stop")
+                    for block in final_message.content
+                ):
+                    return next_state
+
+    finally:
+        stop_flag.set()
+        if wake_thread is not None:
+            wake_thread.join(timeout=0.5)
+        _interrupt.clear()
 
 
 def _speak(dev, dev_index, sample_rate, voice_model, text: str):
+    if _interrupt.is_set():
+        return
     chunks = []
     for audio_chunk in voice_model.synthesize(text):
         int_data = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
@@ -283,45 +385,126 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         full_audio = np.concatenate(chunks)
         resampled = resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
         dev.play(resampled, samplerate=sample_rate, device=dev_index)
-        dev.wait()
+        done = threading.Event()
+        threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
+        while not done.wait(timeout=0.05):
+            if _interrupt.is_set():
+                dev.stop()
+                return
 
 
-ctx: SpeakerContext | None = None
-chat_history: list[dict] = []  # {"role": "user"|"assistant", "text": str}
-speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
-
-_player: mpv.MPV | None = None
-
-def stop_playback():
-    global _player
-    if _player is not None:
-        _player.terminate()
-        _player = None
-
-
-def pause_playback():
-    if _player is not None:
-        _player.pause = True
+def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event):
+    score_window = deque(maxlen=5)
+    while not stop_flag.is_set():
+        audio_flat = read_audio(stream, WAKE_CHUNK, input_sample_rate)
+        prediction = wake_model.predict(audio_flat)
+        for _, score in prediction.items():
+            score_window.append(score > 0.9)
+            if sum(score_window) >= 3:
+                print("interrupt: wake word during TTS")
+                _interrupt.set()
+                return
 
 
-def resume_playback():
-    if _player is not None:
-        _player.pause = False
+def _player_loop():
+    print("oi!! player! loop!!")
+    player: mpv.MPV | None = None
+    cleanup_dir: str | None = None
+
+    def _stop():
+        global _player_active
+        nonlocal player, cleanup_dir
+        if player is not None:
+            try:
+                player.terminate()
+            except Exception:
+                pass
+            player = None
+        if cleanup_dir is not None:
+            try:
+                import shutil
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
+            except Exception:
+                pass
+            cleanup_dir = None
+        _player_active = False
+
+    while True:
+        try:
+            cmd, *args = _player_cmd_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if cmd == 'play':
+            global _player_active
+            _stop()
+            url, headers = args[0], args[1]
+            print(f"play_url: {url}")
+            player = mpv.MPV(vid=False, terminal=False,
+                             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                             log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
+                             loglevel="warn")
+            if headers:
+                for header in headers:
+                    player.command("change-list", "http-header-fields", "append", header)
+            player.play(url)
+            _player_active = True
+
+        elif cmd == 'play_file':
+            _stop()
+            path, cleanup_dir = args[0], args[1]
+            print(f"playing: {path}")
+            player = mpv.MPV(vid=False, terminal=False,
+                             log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
+                             loglevel="warn")
+            player.play(path)
+            _player_active = True
+
+        elif cmd == 'stop':
+            _stop()
+
+        elif cmd == 'pause':
+            if player is not None:
+                try:
+                    player.pause = True
+                except Exception:
+                    pass
+
+        elif cmd == 'resume':
+            if player is not None:
+                try:
+                    player.pause = False
+                except Exception:
+                    pass
+
+        elif cmd == 'quit':
+            _stop()
+            break
 
 
-def _play_oneshot_audio_file(path: str):
-    print(f"playing: {path}")
-    player = mpv.MPV(vid=False, terminal=False)
-    player.play(path)
-    player.wait_for_playback()
-    player.terminate()
+def _resolve_youtube_and_play(url: str):
+    print("resolving youtube stream url...")
+    result = subprocess.run(
+        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
+         "--get-url", "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"yt-dlp error: {result.stderr}")
+        return
+    stream_url = result.stdout.strip().splitlines()[0]
+    if not stream_url:
+        print("yt-dlp: no stream url found")
+        return
+    print(f"streaming: {stream_url[:80]}...")
+    _player_cmd_queue.put(('play', stream_url, None))
 
 
-def _play_youtube_windows(url: str):
+def _download_youtube_and_play(url: str):
     import tempfile
     tmpdir = tempfile.mkdtemp()
     output_template = os.path.join(tmpdir, "audio.%(ext)s")
-    print(f"downloading youtube audio...")
+    print("downloading youtube audio...")
     result = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", output_template,
          "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
@@ -335,34 +518,40 @@ def _play_youtube_windows(url: str):
         print("yt-dlp: no output file found")
         return
     audio_file = os.path.join(tmpdir, files[0])
-    print(f"playing: {audio_file}")
-    global _player
-    player = mpv.MPV(vid=False, terminal=False)
-    _player = player
-    player.play(audio_file)
-    player.wait_for_playback()
-    player.terminate()
-    try:
-        os.unlink(audio_file)
-        os.rmdir(tmpdir)
-    except Exception:
-        pass
+    _player_cmd_queue.put(('play_file', audio_file, tmpdir))
 
 
-def play_url(url: str):
-    global _player
-    stop_playback()
-    print(f"play_url: {url}")
+def _play_oneshot_audio_file(path: str):
+    def _run():
+        player = mpv.MPV(vid=False, terminal=False)
+        player.play(path)
+        player.wait_for_playback()
+        try:
+            player.terminate()
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def stop_playback():
+    _interrupt.set()
+    _player_cmd_queue.put(('stop',))
+
+
+def pause_playback():
+    _player_cmd_queue.put(('pause',))
+
+
+def resume_playback():
+    _player_cmd_queue.put(('resume',))
+
+
+def play_url(url: str, headers: list[str] | None = None):
     is_youtube = "youtube.com" in url or "youtu.be" in url
     if is_youtube and sys.platform == "win32":
-        threading.Thread(target=_play_youtube_windows, args=(url,), daemon=True).start()
+        threading.Thread(target=_resolve_youtube_and_play, args=(url,), daemon=True).start()
     else:
-        player = mpv.MPV(vid=False, terminal=False)
-        _player = player
-        def _run():
-            player.play(url)
-            player.wait_for_playback()
-        threading.Thread(target=_run, daemon=True).start()
+        _player_cmd_queue.put(('play', url, headers))
 
 
 def search_youtube(query: str, max_results: int = 5) -> str:
@@ -383,31 +572,39 @@ def search_youtube(query: str, max_results: int = 5) -> str:
     return json.dumps(results)
 
 
-
-def _audio_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
-    print("oi!! audio! loop!!")
+def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
+    print("oi!! speak! loop!!")
     _play_oneshot_audio_file("sounds/startup.m4a")
     global speaker_state
+    wake_audio = None
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
         while True:
             if speaker_state == SpeakerState.LISTEN_FOR_WAKE:
                 listen_for_wake(wake_model, stream, input_sample_rate)
+                _play_oneshot_audio_file("sounds/wake.wav")
                 speaker_state = SpeakerState.CHATTING
             elif speaker_state == SpeakerState.CHATTING:
-                _play_oneshot_audio_file("sounds/wake.wav")
                 print("chatting")
                 pause_playback()
                 audio_request = record_until_silence(vad, stream, input_sample_rate)
                 transcribed_request = transcribe_audio(whisper_model, audio_request)
                 print(transcribed_request)
                 chat_history.append({"role": "user", "text": transcribed_request})
-                speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request)
+                speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
                 resume_playback()
             elif speaker_state == SpeakerState.RESET:
                 flush_stream(stream, input_sample_rate)
                 wake_model.reset()
                 speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 print("return to listen for wake")
+            elif speaker_state == SpeakerState.CACHE_POSITIVE_WAKE:
+                dir = "training/false_positives"
+                filepath = f"{dir}/{int(time.time() * 1000)}.wav"
+                write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
+            elif speaker_state == SpeakerState.CACHE_NEGATIVE_WAKE:
+                dir = "training/positives"
+                filepath = f"{dir}/{int(time.time() * 1000)}.wav"
+                write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
 
 
 def start():
@@ -426,31 +623,32 @@ def start():
         system += "\n\n# Hints\n"
         for hint in hints:
             value = hint.get("url") or hint.get("text", "")
-            system += f"- [{hint['category']}] {hint['name']}: {value}\n"
+            extra = hint.get("extra_info", "")
+            suffix = f" ({extra})" if extra else ""
+            system += f"- [{hint['category']}] {hint['name']}: {value}{suffix}\n"
 
+    # wake
     wake_model = Model(
         wakeword_models=["models/oi_speaker.onnx"],
         vad_threshold=0.5,
         enable_speex_noise_suppression=False
     )
 
+    # vad
     vad = webrtcvad.Vad(2)
+
+    # whisper
     inf = config.get("inference", {})
     device = inf.get("device", "cpu")
     compute = "int8"
-    try:
-        if device == "cuda":
-            compute = "float16"
-        whisper_model = WhisperModel(
-            inf.get("whisper_model", "small"),
-            device=device,
-            compute_type=inf.get("whisper_compute", compute)
-        )
-        # force a dummy inference to trigger CUDA DLL loading at startup
-        list(whisper_model.transcribe(np.zeros(16000, dtype=np.float32), language="en", beam_size=1))
-    except Exception as e:
-        print(f"whisper init failed on {device} ({e}), falling back to cpu")
-        whisper_model = WhisperModel(inf.get("whisper_model", "small"), device="cpu", compute_type="int8")
+    if device == "cuda":
+        compute = "float16"
+    whisper_model = WhisperModel(
+        inf.get("whisper_model", "small"),
+        device=device,
+        compute_type=inf.get("whisper_compute", compute)
+    )
+    
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
     voice_model = PiperVoice.load("models/en_GB-northern_english_male-medium.onnx")
 
@@ -467,10 +665,18 @@ def start():
         voice_model=voice_model,
         output_dev_index=output_dev_index,
         output_sample_rate=output_sample_rate,
+        wake_model=wake_model,
+        input_dev_index=input_dev_index,
+        input_sample_rate=input_sample_rate,
     )
 
     threading.Thread(
-        target=_audio_loop,
+        target=_player_loop, 
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_speak_loop,
         args=(wake_model, vad, whisper_model, input_dev_index, input_sample_rate),
         daemon=True
     ).start()

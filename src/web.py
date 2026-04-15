@@ -51,6 +51,11 @@ async def history():
     return spk.chat_history
 
 
+@app.get("/audio-devices")
+async def audio_devices():
+    return spk.enumerate_audio_devices()
+
+
 @app.get("/settings")
 async def get_settings():
     with open(CONFIG_PATH, "rb") as f:
@@ -75,10 +80,16 @@ def _local_ip() -> str:
         return "unknown"
 
 
+@app.post("/stop")
+async def stop():
+    spk.stop_playback()
+    return {"ok": True}
+
+
 @app.get("/status")
 async def status():
     return {
         "state": spk.speaker_state.value,
-        "playing": spk._player is not None,
+        "playing": spk._player_active,
         "ip": _local_ip(),
     }
