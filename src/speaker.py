@@ -722,7 +722,7 @@ def start():
 
     # wake
     wake_model = Model(
-        wakeword_models=["models/oi_speaker.onnx"],
+        wakeword_models=["models/openwakeword/oi_speaker.onnx"],
         vad_threshold=0.5,
         enable_speex_noise_suppression=False
     )
@@ -743,7 +743,7 @@ def start():
     )
     
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
-    voice_model = PiperVoice.load("models/en_GB-northern_english_male-medium.onnx")
+    voice_model = PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx")
 
     input_dev_info = _get_audio_device_index(config["audio"]["input_device"])
     output_dev_info = _get_audio_device_index(config["audio"]["output_device"])
