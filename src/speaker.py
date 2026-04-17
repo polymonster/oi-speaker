@@ -37,6 +37,29 @@ TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 480 # 30ms at 16kHz
 
+
+class _Timer:
+    """Lap timer that prints interval and accumulated time at each named step."""
+    def __init__(self):
+        self._start: float | None = None
+        self._last: float | None = None
+
+    def start(self):
+        """Reset and start the timer (call on wake detection)."""
+        self._start = self._last = time.monotonic()
+
+    def lap(self, label: str, indent: str = ""):
+        """Print elapsed time since last lap and since start, then advance the lap mark."""
+        now = time.monotonic()
+        interval = now - self._last
+        total = now - self._start
+        print(f"{indent}[timing] {label}: +{interval:.2f}s  total={total:.2f}s")
+        self._last = now
+
+
+_timer = _Timer()
+
+
 TOOLS = [
     {
         "name": "search_youtube",
@@ -71,16 +94,6 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
-        "name": "cache_positive",
-        "description": "User requested that the last used wake word should be cached, for wake model training (positive sample)",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "cache_negative",
-        "description": "User requested that the last used wake word should be cached, for wake model training (negative, false positive sample)",
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
         "type": "web_search_20250305",
         "name": "web_search"
     },
@@ -101,11 +114,11 @@ TOOLS = [
 
 class SpeakerState(Enum):
     TEXT_CHAT = "text_chat"
-    LISTEN_FOR_WAKE = "listen_for_wake"
+    LISTEN_FOR_WAKE = "_listen_for_wake"
     CHATTING = "chatting"
     RESET = "reset"
-    CACHE_POSITIVE_WAKE = "cache_positive"
-    CACHE_NEGATIVE_WAKE = "cache_negative"
+    CACHE_WAKE = "cache_wake"
+    VAD_RECORD = "_vad_record"
 
 
 @dataclass
@@ -130,6 +143,7 @@ _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 
 def enumerate_audio_devices() -> dict:
+    """Return lists of available input and output device names."""
     devices = dev.query_devices()
     inputs, outputs = [], []
     for d in devices:
@@ -140,7 +154,8 @@ def enumerate_audio_devices() -> dict:
     return {"inputs": inputs, "outputs": outputs}
 
 
-def get_audio_device_index(name: str):
+def _get_audio_device_index(name: str):
+    """Find and return the sounddevice info dict for the first device whose name contains `name`."""
     devices = dev.query_devices()
     index = 0
     for device in devices:
@@ -150,7 +165,8 @@ def get_audio_device_index(name: str):
     return None
 
 
-def flush_stream(stream, sample_rate: int):
+def _flush_stream(stream, sample_rate: int):
+    """Restart the input stream and discard buffered audio to prevent stale data re-triggering the wake word."""
     stream.stop()
     stream.start()
     # drain buffered audio to avoid re-triggering on stale data (Windows WASAPI retains buffer on restart)
@@ -164,7 +180,8 @@ def flush_stream(stream, sample_rate: int):
             break
 
 
-def test_tone(dev, dev_index: int, sample_rate: int):
+def _test_tone(dev, dev_index: int, sample_rate: int):
+    """Play a 440 Hz test tone on the given output device."""
     # generate a simple 440hz test tone
     duration = 2.0
     t = np.linspace(0, duration, int(sample_rate * duration))
@@ -173,7 +190,8 @@ def test_tone(dev, dev_index: int, sample_rate: int):
     dev.wait()
 
 
-def resample_audio(audio, orig_rate: int, target_rate: int):
+def _resample_audio(audio, orig_rate: int, target_rate: int):
+    """Linearly interpolate `audio` from `orig_rate` to `target_rate`, returning int16."""
     ratio = target_rate / orig_rate
     new_length = int(len(audio) * ratio)
     return np.interp(
@@ -183,7 +201,8 @@ def resample_audio(audio, orig_rate: int, target_rate: int):
     ).astype(np.int16)
 
 
-def read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
+def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
+    """Read one chunk from `stream` at native `sample_rate` and resample to 16 kHz int16."""
     # read audio
     sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
     chunk = chunk_size16 * sample_ratio
@@ -191,29 +210,58 @@ def read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
     # resample to TARGET_SAMPLE_RATE and flatten
     if sample_ratio != 1:
         audio_flat = np.squeeze(audio)
-        audio_flat = resample_audio(audio_flat, sample_rate, TARGET_SAMPLE_RATE)
+        audio_flat = _resample_audio(audio_flat, sample_rate, TARGET_SAMPLE_RATE)
         audio_flat = audio_flat[:chunk_size16]
     else:
         audio_flat = np.squeeze(audio)
     return audio_flat
 
 
-def record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.5) -> np.ndarray:
-    chunks = []
+def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> np.ndarray:
+    """Record raw audio at native sample rate, using resampled audio only for VAD checks."""
+    sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
+    raw_chunk = VAD_CHUNK * sample_ratio
+    raw_chunks = []
+    # wait for speech onset
+    while True:
+        raw, _ = stream.read(raw_chunk)
+        raw_flat = np.squeeze(raw)
+        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE)[:VAD_CHUNK]
+        if vad.is_speech(audio_16k.tobytes(), TARGET_SAMPLE_RATE):
+            raw_chunks.append(raw_flat)
+            break
+    # record until silence
     silent_duration = 0.0
     while silent_duration < silence_timeout:
-        audio_flat = read_audio(stream, VAD_CHUNK, sample_rate)
+        raw, _ = stream.read(raw_chunk)
+        raw_flat = np.squeeze(raw)
+        raw_chunks.append(raw_flat)
+        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE)[:VAD_CHUNK]
+        silent_duration = 0.0 if vad.is_speech(audio_16k.tobytes(), TARGET_SAMPLE_RATE) else silent_duration + VAD_CHUNK / TARGET_SAMPLE_RATE
+    return np.concatenate(raw_chunks)
+
+
+def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=0.8) -> np.ndarray:
+    """Wait for speech onset then record until `silence_timeout` seconds of continuous silence."""
+    chunks = []
+    silent_duration = 0.0
+    speech_started = False
+    while True:
+        audio_flat = _read_audio(stream, VAD_CHUNK, sample_rate)
         chunks.append(audio_flat)
         is_speech = vad.is_speech(audio_flat.tobytes(), TARGET_SAMPLE_RATE)
         if is_speech:
+            speech_started = True
             silent_duration = 0.0
-        else:
+        elif speech_started:
             silent_duration += VAD_CHUNK / TARGET_SAMPLE_RATE
+            if silent_duration >= silence_timeout:
+                break
 
     return np.concatenate(chunks)
 
 
-def listen_for_wake(wake_model, stream, sample_rate: int,
+def _listen_for_wake(wake_model, stream, sample_rate: int,
                     threshold: float = 0.9, num_triggers: int = 3,
                     window_size: int = 5, buffer_duration: float = 0.0) -> np.ndarray:
     """Block until wake word is detected. Returns buffered pre-trigger audio (empty if buffer_duration=0)."""
@@ -224,7 +272,7 @@ def listen_for_wake(wake_model, stream, sample_rate: int,
         rolling_buffer = deque(maxlen=buffer_chunks)
 
     while True:
-        audio_flat = read_audio(stream, WAKE_CHUNK, sample_rate)
+        audio_flat = _read_audio(stream, WAKE_CHUNK, sample_rate)
         if rolling_buffer is not None:
             rolling_buffer.append(audio_flat)
         prediction = wake_model.predict(audio_flat)
@@ -240,7 +288,8 @@ def listen_for_wake(wake_model, stream, sample_rate: int,
                 return np.array([], dtype=np.int16)
 
 
-def write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float = 4.0):
+def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float = 4.0):
+    """Write int16 audio to a mono WAV file, applying an optional amplitude gain."""
     boosted = np.clip(audio.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
     with wave.open(filepath, 'wb') as wf:
         wf.setnchannels(1)
@@ -249,13 +298,15 @@ def write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float = 
         wf.writeframes(boosted.tobytes())
 
 
-def transcribe_audio(whisper_model, audio: np.ndarray) -> str:
+def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
+    """Transcribe int16 audio to English text using Whisper."""
     audio_float = audio.astype(np.float32) / 32768.0
     segments, _ = whisper_model.transcribe(audio_float, language="en", beam_size=1)
     return " ".join(segment.text for segment in segments)
 
 
 def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState | None]:
+    """Dispatch an LLM tool call and return its result string and optional next state."""
     if tool_name == "search_youtube":
         return search_youtube(tool_input["query"]), None
     elif tool_name == "play_url":
@@ -264,10 +315,6 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     elif tool_name == "stop":
         stop_playback()
         return "stopped", SpeakerState.RESET
-    elif tool_name == "cache_positive":
-        return "cache_positive", SpeakerState.CACHE_POSITIVE_WAKE
-    elif tool_name == "cache_negative":
-        return "cache_negative", SpeakerState.CACHE_NEGATIVE_WAKE
     elif tool_name == "chat":
         chat_history.append({"role": "assistant", "text": tool_input["text"]})
         _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, tool_input["text"])
@@ -277,13 +324,15 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
 
 
 def _split_sentences(text: str) -> tuple[list[str], str]:
+    """Split `text` on sentence boundaries, returning completed sentences and the trailing fragment."""
     parts = _SENTENCE_END.split(text)
     if len(parts) <= 1:
         return [], text
     return parts[:-1], parts[-1]
 
 
-def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
+def _query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
+    """Send `text` to the LLM, stream TTS as sentences arrive, handle tool calls, and return the next state."""
     global _interrupt
     _interrupt.clear()
 
@@ -349,7 +398,8 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 tool_results = []
                 for block in final_message.content:
                     if block.type == "tool_use":
-                        print(f"tool: {block.name} {block.input}")
+                        print(f"\ttool: {block.name} {block.input}")
+                        _timer.lap(block.name, indent="\t")
                         result, state = _execute_tool(block.name, block.input)
                         if state is not None:
                             next_state = state
@@ -375,6 +425,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
 
 
 def _speak(dev, dev_index, sample_rate, voice_model, text: str):
+    """Synthesise `text` to audio and play it, stopping early if `_interrupt` is set."""
     if _interrupt.is_set():
         return
     chunks = []
@@ -383,7 +434,7 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         chunks.append(int_data)
     if chunks:
         full_audio = np.concatenate(chunks)
-        resampled = resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
+        resampled = _resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
         dev.play(resampled, samplerate=sample_rate, device=dev_index)
         done = threading.Event()
         threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
@@ -394,9 +445,10 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
 
 
 def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event):
+    """Poll the wake model in a background thread and set `_interrupt` if the wake word is detected during TTS."""
     score_window = deque(maxlen=5)
     while not stop_flag.is_set():
-        audio_flat = read_audio(stream, WAKE_CHUNK, input_sample_rate)
+        audio_flat = _read_audio(stream, WAKE_CHUNK, input_sample_rate)
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
             score_window.append(score > 0.9)
@@ -407,6 +459,7 @@ def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag
 
 
 def _player_loop():
+    """Background thread: consume commands from `_player_cmd_queue` and drive the mpv player."""
     print("oi!! player! loop!!")
     player: mpv.MPV | None = None
     cleanup_dir: str | None = None
@@ -439,7 +492,7 @@ def _player_loop():
             global _player_active
             _stop()
             url, headers = args[0], args[1]
-            print(f"play_url: {url}")
+            print(f"play_url: {url[:80]}...")
             player = mpv.MPV(vid=False, terminal=False,
                              user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
@@ -483,6 +536,7 @@ def _player_loop():
 
 
 def _resolve_youtube_and_play(url: str):
+    """Resolve a YouTube URL to a direct stream URL via yt-dlp and enqueue it for playback."""
     print("resolving youtube stream url...")
     result = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
@@ -501,6 +555,7 @@ def _resolve_youtube_and_play(url: str):
 
 
 def _download_youtube_and_play(url: str):
+    """Download a YouTube video to a temp file via yt-dlp and enqueue it for playback."""
     import tempfile
     tmpdir = tempfile.mkdtemp()
     output_template = os.path.join(tmpdir, "audio.%(ext)s")
@@ -522,6 +577,7 @@ def _download_youtube_and_play(url: str):
 
 
 def _play_oneshot_audio_file(path: str):
+    """Play a local audio file once in a background thread without affecting the main player."""
     def _run():
         player = mpv.MPV(vid=False, terminal=False)
         player.play(path)
@@ -534,19 +590,23 @@ def _play_oneshot_audio_file(path: str):
 
 
 def stop_playback():
+    """Stop active playback and signal any in-progress TTS to interrupt."""
     _interrupt.set()
     _player_cmd_queue.put(('stop',))
 
 
 def pause_playback():
+    """Pause the current mpv player."""
     _player_cmd_queue.put(('pause',))
 
 
 def resume_playback():
+    """Resume a paused mpv player."""
     _player_cmd_queue.put(('resume',))
 
 
 def play_url(url: str, headers: list[str] | None = None):
+    """Stream audio from `url`, using yt-dlp resolution for YouTube URLs on Windows."""
     is_youtube = "youtube.com" in url or "youtu.be" in url
     if is_youtube and sys.platform == "win32":
         threading.Thread(target=_resolve_youtube_and_play, args=(url,), daemon=True).start()
@@ -555,6 +615,7 @@ def play_url(url: str, headers: list[str] | None = None):
 
 
 def search_youtube(query: str, max_results: int = 5) -> str:
+    """Search YouTube for `query` and return a JSON list of title/url/duration/channel results."""
     result = subprocess.run(
         [sys.executable, "-m", "yt_dlp", f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"],
         capture_output=True, text=True
@@ -573,41 +634,73 @@ def search_youtube(query: str, max_results: int = 5) -> str:
 
 
 def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
+    """Background thread: main state machine driving wake detection, recording, and LLM interaction."""
     print("oi!! speak! loop!!")
     _play_oneshot_audio_file("sounds/startup.m4a")
     global speaker_state
+    
+    # training data capture
     wake_audio = None
+    buffer_duration = 0.0
+    threshold = 0.9
+    triggers = 3
+    record_dir = None
+    if "-record-nagatives" in sys.argv:
+        print("recording negatives")
+        buffer_duration = 4.0
+        record_dir = "training/false_positives"
+    elif "-record-positives" in sys.argv:
+        print("recording positives")
+        record_dir = "training/positives"
+        speaker_state = SpeakerState.VAD_RECORD
+
+    # the loop
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
         while True:
             if speaker_state == SpeakerState.LISTEN_FOR_WAKE:
-                listen_for_wake(wake_model, stream, input_sample_rate)
-                _play_oneshot_audio_file("sounds/wake.wav")
-                speaker_state = SpeakerState.CHATTING
+                wake_audio = _listen_for_wake(
+                    wake_model, 
+                    stream, 
+                    input_sample_rate,
+                    threshold=threshold,
+                    num_triggers=triggers,
+                    buffer_duration=buffer_duration
+                )
+                _timer.start()
+                if record_dir:
+                    filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
+                    print(f"caching {filepath}")
+                    _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
+                    speaker_state = SpeakerState.LISTEN_FOR_WAKE
+                else:
+                    _play_oneshot_audio_file("sounds/wake.wav")
+                    speaker_state = SpeakerState.CHATTING
             elif speaker_state == SpeakerState.CHATTING:
                 print("chatting")
                 pause_playback()
-                audio_request = record_until_silence(vad, stream, input_sample_rate)
-                transcribed_request = transcribe_audio(whisper_model, audio_request)
+                audio_request = _record_until_silence(vad, stream, input_sample_rate)
+                _timer.lap("recorded")
+                transcribed_request = _transcribe_audio(whisper_model, audio_request)
+                _timer.lap("transcribed")
                 print(transcribed_request)
                 chat_history.append({"role": "user", "text": transcribed_request})
-                speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
+                speaker_state = _query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
+                _timer.lap("llm")
                 resume_playback()
             elif speaker_state == SpeakerState.RESET:
-                flush_stream(stream, input_sample_rate)
+                _flush_stream(stream, input_sample_rate)
                 wake_model.reset()
                 speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 print("return to listen for wake")
-            elif speaker_state == SpeakerState.CACHE_POSITIVE_WAKE:
-                dir = "training/false_positives"
-                filepath = f"{dir}/{int(time.time() * 1000)}.wav"
-                write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
-            elif speaker_state == SpeakerState.CACHE_NEGATIVE_WAKE:
-                dir = "training/positives"
-                filepath = f"{dir}/{int(time.time() * 1000)}.wav"
-                write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
+            elif speaker_state == SpeakerState.VAD_RECORD:
+                audio = _vad_record(vad, stream, input_sample_rate)
+                filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
+                print(f"caching {filepath}")
+                _write_wav(audio, input_sample_rate, filepath, gain=1.0)
 
 
 def start():
+    """Initialise all models and devices from config.toml and launch the background threads."""
     global ctx
     if ctx is not None:
         return
@@ -652,8 +745,8 @@ def start():
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
     voice_model = PiperVoice.load("models/en_GB-northern_english_male-medium.onnx")
 
-    input_dev_info = get_audio_device_index(config["audio"]["input_device"])
-    output_dev_info = get_audio_device_index(config["audio"]["output_device"])
+    input_dev_info = _get_audio_device_index(config["audio"]["input_device"])
+    output_dev_info = _get_audio_device_index(config["audio"]["output_device"])
     input_dev_index = int(input_dev_info['index'])
     input_sample_rate = int(input_dev_info['default_samplerate'])
     output_dev_index = int(output_dev_info['index'])
@@ -682,54 +775,16 @@ def start():
     ).start()
 
 
-def wake_word_capture():
-    print("wake_word_capture")
-
-    args = sys.argv[sys.argv.index("-wake_word_capture") + 1:]
-    dir = args[0]
-    threshold = float(args[1]) if len(args) > 1 else 0.9
-    num_triggers = int(args[2]) if len(args) > 2 else 3
-    window_size = int(args[3]) if len(args) > 3 else 5
-    buffer_duration = float(args[4]) if len(args) > 4 else 2.0
-
-    os.makedirs(dir, exist_ok=True)
-
-    with open("config.toml", "rb") as f:
-        config = tomllib.load(f)
-
-    wake_model = Model(
-        wakeword_models=["models/oi_speaker.onnx"],
-        vad_threshold=0.5,
-        enable_speex_noise_suppression=False
-    )
-
-    input_dev_info = get_audio_device_index(config["audio"]["input_device"])
-    input_dev_index = int(input_dev_info['index'])
-    input_sample_rate = int(input_dev_info['default_samplerate'])
-
-    print("listening")
-    with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
-        while True:
-            audio = listen_for_wake(wake_model, stream, input_sample_rate,
-                                    threshold=threshold, num_triggers=num_triggers,
-                                    window_size=window_size, buffer_duration=buffer_duration)
-            filepath = f"{dir}/{int(time.time() * 1000)}.wav"
-            write_wav(audio, TARGET_SAMPLE_RATE, filepath)
-            print(f"wrote: {filepath}")
-            wake_model.reset()
-
 
 def main():
+    """Entry point: start the speaker and serve the web UI via uvicorn."""
     print("oi! oi!!")
 
-    if "-wake_word_capture" in sys.argv:
-        wake_word_capture()
-    else:
-        # main speaker loop / app
-        sys.path.insert(0, str(__file__).replace("speaker.py", ""))
-        from web import app
-        uvicorn.run(app, host="0.0.0.0", port=8000)
-        os._exit(0)
+    # main speaker loop / app
+    sys.path.insert(0, str(__file__).replace("speaker.py", ""))
+    from web import app
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    os._exit(0)
 
 
 if __name__ == "__main__":
