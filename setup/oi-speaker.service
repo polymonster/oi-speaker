@@ -1,0 +1,16 @@
+[Unit]
+Description=Oi! Speaker!!
+After=network-online.target sound.target pulseaudio.service sys-devices-platform-soc.subsystem.device
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymonster
+WorkingDirectory=/home/polymonster/dev/oi-speaker
+ExecStartPre=/usr/bin/pulseaudio --start
+ExecStart=/home/polymonster/.pyenv/shims/python src/speaker.py --verbose
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

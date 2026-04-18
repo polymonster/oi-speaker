@@ -42,6 +42,7 @@ async def index():
 @app.post("/chat")
 async def chat(req: ChatRequest):
     spk.chat_history.append({"role": "user", "text": req.text})
+    spk.start_timer()
     state = spk.query_llm(spk.ctx.llm_client, spk.ctx.system, req.text)
     return {"response": f"[{state.value}]"}
 
