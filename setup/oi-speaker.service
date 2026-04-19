@@ -8,7 +8,10 @@ Type=simple
 User=polymonster
 WorkingDirectory=/home/polymonster/dev/oi-speaker
 ExecStartPre=/usr/bin/pulseaudio --start
-ExecStart=/home/polymonster/.pyenv/shims/python src/speaker.py --verbose
+ExecStart=/home/polymonster/.pyenv/shims/python -u src/speaker.py --verbose
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Restart=on-failure
 RestartSec=5
 

@@ -245,11 +245,14 @@ def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> 
     return np.concatenate(raw_chunks)
 
 
-def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.0) -> np.ndarray:
-    """Wait for speech onset then record until `silence_timeout` seconds of continuous silence."""
+def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.0, onset_timeout: float=8.0) -> np.ndarray | None:
+    """Wait for speech onset then record until `silence_timeout` seconds of continuous silence.
+    Returns None if no speech begins within `onset_timeout` seconds."""
     chunks = []
     silent_duration = 0.0
     speech_started = False
+    onset_elapsed = 0.0
+    chunk_duration = VAD_CHUNK / TARGET_SAMPLE_RATE
     while True:
         audio_flat = _read_audio(stream, VAD_CHUNK, sample_rate)
         chunks.append(audio_flat)
@@ -258,9 +261,14 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=
             speech_started = True
             silent_duration = 0.0
         elif speech_started:
-            silent_duration += VAD_CHUNK / TARGET_SAMPLE_RATE
+            silent_duration += chunk_duration
             if silent_duration >= silence_timeout:
                 break
+        else:
+            onset_elapsed += chunk_duration
+            if onset_elapsed >= onset_timeout:
+                print("no speech detected, returning to wake listen")
+                return None
 
     return np.concatenate(chunks)
 
@@ -274,11 +282,15 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
     if buffer_duration > 0.0:
         buffer_chunks = int(buffer_duration / (WAKE_CHUNK / TARGET_SAMPLE_RATE))
         rolling_buffer = deque(maxlen=buffer_chunks)
+    infer_toggle = False
 
     while True:
         audio_flat = _read_audio(stream, WAKE_CHUNK, sample_rate)
         if rolling_buffer is not None:
             rolling_buffer.append(audio_flat)
+        infer_toggle = not infer_toggle
+        if not infer_toggle:
+            continue
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
             score_window.append(score > threshold)
@@ -300,6 +312,13 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
         wf.setsampwidth(2)  # int16 = 2 bytes
         wf.setframerate(sample_rate)
         wf.writeframes(boosted.tobytes())
+
+
+def _audio_has_speech(audio: np.ndarray, rms_threshold: float = 300.0) -> bool:
+    """Return True if audio RMS energy is above threshold (filters silent/empty recordings)."""
+    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+    print(f"audio rms: {rms:.1f}")
+    return rms >= rms_threshold
 
 
 def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
@@ -683,10 +702,21 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
             elif speaker_state == SpeakerState.CHATTING:
                 print("chatting")
                 pause_playback()
+                _flush_stream(stream, input_sample_rate)
                 audio_request = _record_until_silence(vad, stream, input_sample_rate)
+                if audio_request is None or not _audio_has_speech(audio_request):
+                    print("no usable audio, returning to wake listen")
+                    resume_playback()
+                    speaker_state = SpeakerState.RESET
+                    continue
                 _timer.lap("recorded")
                 transcribed_request = _transcribe_audio(whisper_model, audio_request)
                 _timer.lap("transcribed")
+                if not transcribed_request.strip():
+                    print("empty transcription, returning to wake listen")
+                    resume_playback()
+                    speaker_state = SpeakerState.RESET
+                    continue
                 print(transcribed_request)
                 chat_history.append({"role": "user", "text": transcribed_request})
                 speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
@@ -706,6 +736,8 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
 
 def start():
     """Initialise all models and devices from config.toml and launch the background threads."""
+    print("oi! start!!")
+
     global ctx
     if ctx is not None:
         return
