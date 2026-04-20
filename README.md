@@ -11,6 +11,8 @@ Currently under development, this has been tested on Raspberry Pi 5 and macOS. B
 ```bash
 sudo apt-get install portaudio19-dev
 sudo apt-get install libspeexdsp-dev
+sudo apt-get install mpv
+sudo apt install libmpv-dev
 ```
 
 ## Dependencies (macOS)
