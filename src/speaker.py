@@ -669,14 +669,16 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     threshold = 0.9
     triggers = 3
     record_dir = None
-    if "-record-nagatives" in sys.argv:
+    if "--record-negatives" in sys.argv:
         print("recording negatives")
         buffer_duration = 4.0
         record_dir = "training/false_positives"
-    elif "-record-positives" in sys.argv:
+        os.makedirs(record_dir, exist_ok=True)
+    elif "--record-positives" in sys.argv:
         print("recording positives")
         record_dir = "training/positives"
         speaker_state = SpeakerState.VAD_RECORD
+        os.makedirs(record_dir, exist_ok=True)
 
     # the loop
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
@@ -693,7 +695,7 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 _timer.start()
                 if record_dir:
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
-                    print(f"caching {filepath}")
+                    print(f"caching {filepath}record_dir")
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
