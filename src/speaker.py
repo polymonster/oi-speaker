@@ -274,7 +274,7 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=
 
 
 def _listen_for_wake(wake_model, stream, sample_rate: int,
-                    threshold: float = 0.9, num_triggers: int = 3,
+                    threshold: float = 0.75, num_triggers: int = 5,
                     window_size: int = 5, buffer_duration: float = 0.0) -> np.ndarray:
     """Block until wake word is detected. Returns buffered pre-trigger audio (empty if buffer_duration=0)."""
     score_window = deque(maxlen=window_size)
@@ -313,12 +313,6 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
         wf.setframerate(sample_rate)
         wf.writeframes(boosted.tobytes())
 
-
-def _audio_has_speech(audio: np.ndarray, rms_threshold: float = 300.0) -> bool:
-    """Return True if audio RMS energy is above threshold (filters silent/empty recordings)."""
-    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
-    print(f"audio rms: {rms:.1f}")
-    return rms >= rms_threshold
 
 
 def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
@@ -666,8 +660,8 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     # training data capture
     wake_audio = None
     buffer_duration = 0.0
-    threshold = 0.9
-    triggers = 3
+    threshold = 0.8
+    triggers = 5
     record_dir = None
     if "--record-negatives" in sys.argv:
         print("recording negatives")
@@ -695,7 +689,7 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 _timer.start()
                 if record_dir:
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
-                    print(f"caching {filepath}record_dir")
+                    print(f"caching {filepath}")
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
@@ -706,8 +700,8 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 pause_playback()
                 _flush_stream(stream, input_sample_rate)
                 audio_request = _record_until_silence(vad, stream, input_sample_rate)
-                if audio_request is None or not _audio_has_speech(audio_request):
-                    print("no usable audio, returning to wake listen")
+                if audio_request is None:
+                    print("no speech detected, returning to wake listen")
                     resume_playback()
                     speaker_state = SpeakerState.RESET
                     continue
