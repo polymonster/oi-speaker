@@ -20,7 +20,7 @@ import requests
 import wave
 import uvicorn
 import os
-    
+
 from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
@@ -638,7 +638,7 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     print("oi!! speak! loop!!")
     _play_oneshot_audio_file("sounds/startup.m4a")
     global speaker_state
-    
+
     # training data capture
     wake_audio = None
     buffer_duration = 0.0
@@ -659,8 +659,8 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
         while True:
             if speaker_state == SpeakerState.LISTEN_FOR_WAKE:
                 wake_audio = _listen_for_wake(
-                    wake_model, 
-                    stream, 
+                    wake_model,
+                    stream,
                     input_sample_rate,
                     threshold=threshold,
                     num_triggers=triggers,
@@ -722,6 +722,7 @@ def start():
 
     # wake
     wake_model = Model(
+        inference_framework="onnx",
         wakeword_models=["models/openwakeword/oi_speaker.onnx"],
         vad_threshold=0.5,
         enable_speex_noise_suppression=False
@@ -741,7 +742,7 @@ def start():
         device=device,
         compute_type=inf.get("whisper_compute", compute)
     )
-    
+
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
     voice_model = PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx")
 
@@ -764,7 +765,7 @@ def start():
     )
 
     threading.Thread(
-        target=_player_loop, 
+        target=_player_loop,
         daemon=True
     ).start()
 
