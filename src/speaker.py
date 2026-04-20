@@ -57,7 +57,9 @@ class _Timer:
         self._last = now
 
 
-_timer = _Timer()
+def start_timer():
+    global _timer
+    _timer.start()
 
 
 TOOLS = [
@@ -139,19 +141,21 @@ speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
 _player_cmd_queue: queue.Queue = queue.Queue()
 _player_active: bool = False
 _interrupt: threading.Event = threading.Event()
+_timer = _Timer()
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 
 def enumerate_audio_devices() -> dict:
     """Return lists of available input and output device names."""
     devices = dev.query_devices()
-    inputs, outputs = [], []
+    inputs, outputs, all = [], [], []
     for d in devices:
         if d['max_input_channels'] > 0:
             inputs.append(d['name'])
         if d['max_output_channels'] > 0:
             outputs.append(d['name'])
-    return {"inputs": inputs, "outputs": outputs}
+        all.append(d['name'])
+    return {"inputs": inputs, "outputs": outputs, "all": all}
 
 
 def _get_audio_device_index(name: str):
@@ -241,11 +245,14 @@ def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> 
     return np.concatenate(raw_chunks)
 
 
-def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=0.8) -> np.ndarray:
-    """Wait for speech onset then record until `silence_timeout` seconds of continuous silence."""
+def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.0, onset_timeout: float=8.0) -> np.ndarray | None:
+    """Wait for speech onset then record until `silence_timeout` seconds of continuous silence.
+    Returns None if no speech begins within `onset_timeout` seconds."""
     chunks = []
     silent_duration = 0.0
     speech_started = False
+    onset_elapsed = 0.0
+    chunk_duration = VAD_CHUNK / TARGET_SAMPLE_RATE
     while True:
         audio_flat = _read_audio(stream, VAD_CHUNK, sample_rate)
         chunks.append(audio_flat)
@@ -254,9 +261,14 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=
             speech_started = True
             silent_duration = 0.0
         elif speech_started:
-            silent_duration += VAD_CHUNK / TARGET_SAMPLE_RATE
+            silent_duration += chunk_duration
             if silent_duration >= silence_timeout:
                 break
+        else:
+            onset_elapsed += chunk_duration
+            if onset_elapsed >= onset_timeout:
+                print("no speech detected, returning to wake listen")
+                return None
 
     return np.concatenate(chunks)
 
@@ -270,11 +282,15 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
     if buffer_duration > 0.0:
         buffer_chunks = int(buffer_duration / (WAKE_CHUNK / TARGET_SAMPLE_RATE))
         rolling_buffer = deque(maxlen=buffer_chunks)
+    infer_toggle = False
 
     while True:
         audio_flat = _read_audio(stream, WAKE_CHUNK, sample_rate)
         if rolling_buffer is not None:
             rolling_buffer.append(audio_flat)
+        infer_toggle = not infer_toggle
+        if not infer_toggle:
+            continue
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
             score_window.append(score > threshold)
@@ -296,6 +312,13 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
         wf.setsampwidth(2)  # int16 = 2 bytes
         wf.setframerate(sample_rate)
         wf.writeframes(boosted.tobytes())
+
+
+def _audio_has_speech(audio: np.ndarray, rms_threshold: float = 300.0) -> bool:
+    """Return True if audio RMS energy is above threshold (filters silent/empty recordings)."""
+    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+    print(f"audio rms: {rms:.1f}")
+    return rms >= rms_threshold
 
 
 def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
@@ -331,7 +354,7 @@ def _split_sentences(text: str) -> tuple[list[str], str]:
     return parts[:-1], parts[-1]
 
 
-def _query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
+def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
     """Send `text` to the LLM, stream TTS as sentences arrive, handle tool calls, and return the next state."""
     global _interrupt
     _interrupt.clear()
@@ -461,6 +484,7 @@ def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag
 def _player_loop():
     """Background thread: consume commands from `_player_cmd_queue` and drive the mpv player."""
     print("oi!! player! loop!!")
+
     player: mpv.MPV | None = None
     cleanup_dir: str | None = None
 
@@ -608,7 +632,7 @@ def resume_playback():
 def play_url(url: str, headers: list[str] | None = None):
     """Stream audio from `url`, using yt-dlp resolution for YouTube URLs on Windows."""
     is_youtube = "youtube.com" in url or "youtu.be" in url
-    if is_youtube and sys.platform == "win32":
+    if is_youtube:
         threading.Thread(target=_resolve_youtube_and_play, args=(url,), daemon=True).start()
     else:
         _player_cmd_queue.put(('play', url, headers))
@@ -645,14 +669,16 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     threshold = 0.9
     triggers = 3
     record_dir = None
-    if "-record-nagatives" in sys.argv:
+    if "--record-negatives" in sys.argv:
         print("recording negatives")
         buffer_duration = 4.0
         record_dir = "training/false_positives"
-    elif "-record-positives" in sys.argv:
+        os.makedirs(record_dir, exist_ok=True)
+    elif "--record-positives" in sys.argv:
         print("recording positives")
         record_dir = "training/positives"
         speaker_state = SpeakerState.VAD_RECORD
+        os.makedirs(record_dir, exist_ok=True)
 
     # the loop
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
@@ -669,7 +695,7 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 _timer.start()
                 if record_dir:
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
-                    print(f"caching {filepath}")
+                    print(f"caching {filepath}record_dir")
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
@@ -678,13 +704,24 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
             elif speaker_state == SpeakerState.CHATTING:
                 print("chatting")
                 pause_playback()
+                _flush_stream(stream, input_sample_rate)
                 audio_request = _record_until_silence(vad, stream, input_sample_rate)
+                if audio_request is None or not _audio_has_speech(audio_request):
+                    print("no usable audio, returning to wake listen")
+                    resume_playback()
+                    speaker_state = SpeakerState.RESET
+                    continue
                 _timer.lap("recorded")
                 transcribed_request = _transcribe_audio(whisper_model, audio_request)
                 _timer.lap("transcribed")
+                if not transcribed_request.strip():
+                    print("empty transcription, returning to wake listen")
+                    resume_playback()
+                    speaker_state = SpeakerState.RESET
+                    continue
                 print(transcribed_request)
                 chat_history.append({"role": "user", "text": transcribed_request})
-                speaker_state = _query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
+                speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
                 _timer.lap("llm")
                 resume_playback()
             elif speaker_state == SpeakerState.RESET:
@@ -701,15 +738,21 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
 
 def start():
     """Initialise all models and devices from config.toml and launch the background threads."""
+    print("oi! start!!")
+
     global ctx
     if ctx is not None:
         return
 
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
+        if "--verbose" in sys.argv:
+            print(json.dumps(config, indent=4))
 
     with open("system.json", "rb") as f:
         system = json.load(f)["system"]
+        if "--verbose" in sys.argv:
+            print(json.dumps(system, indent=4))
 
     hints = config.get("hints", [])
     if hints:
@@ -746,6 +789,8 @@ def start():
     llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
     voice_model = PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx")
 
+    if "--verbose" in sys.argv:
+        print(json.dumps(enumerate_audio_devices(), indent=4))
     input_dev_info = _get_audio_device_index(config["audio"]["input_device"])
     output_dev_info = _get_audio_device_index(config["audio"]["output_device"])
     input_dev_index = int(input_dev_info['index'])
@@ -780,6 +825,10 @@ def start():
 def main():
     """Entry point: start the speaker and serve the web UI via uvicorn."""
     print("oi! oi!!")
+
+    if "--enum-audio" in sys.argv:
+        print(json.dumps(enumerate_audio_devices(), indent=4))
+        return
 
     # main speaker loop / app
     sys.path.insert(0, str(__file__).replace("speaker.py", ""))
