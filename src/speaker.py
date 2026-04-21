@@ -282,15 +282,11 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
     if buffer_duration > 0.0:
         buffer_chunks = int(buffer_duration / (WAKE_CHUNK / TARGET_SAMPLE_RATE))
         rolling_buffer = deque(maxlen=buffer_chunks)
-    infer_toggle = False
 
     while True:
         audio_flat = _read_audio(stream, WAKE_CHUNK, sample_rate)
         if rolling_buffer is not None:
             rolling_buffer.append(audio_flat)
-        infer_toggle = not infer_toggle
-        if not infer_toggle:
-            continue
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
             score_window.append(score > threshold)
@@ -660,17 +656,17 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     # training data capture
     wake_audio = None
     buffer_duration = 0.0
-    threshold = 0.8
-    triggers = 5
+    threshold = 0.4
+    triggers = 1
     record_dir = None
     if "--record-negatives" in sys.argv:
         print("recording negatives")
         buffer_duration = 4.0
-        record_dir = "training/false_positives"
+        record_dir = "training/training_data/recordings/false_positives"
         os.makedirs(record_dir, exist_ok=True)
     elif "--record-positives" in sys.argv:
         print("recording positives")
-        record_dir = "training/positives"
+        record_dir = "training/training_data/recordings/positives"
         speaker_state = SpeakerState.VAD_RECORD
         os.makedirs(record_dir, exist_ok=True)
 

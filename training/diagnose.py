@@ -18,7 +18,7 @@ from openwakeword.model import Model
 
 WAKE_CHUNK = 1280  # 80ms at 16kHz
 TARGET_SR = 16000
-CACHE_DIR = "training/score_cache"
+CACHE_DIR = "training/scores/score_cache"
 
 
 def _cache_path(model_path: str, label: str) -> str:
@@ -27,15 +27,21 @@ def _cache_path(model_path: str, label: str) -> str:
     return os.path.join(CACHE_DIR, f"{name}_{label}.npy")
 
 
+def _scores_csv_path(model_path: str, label: str) -> str:
+    name = os.path.splitext(os.path.basename(model_path))[0]
+    return os.path.join(CACHE_DIR, f"{name}_{label}_scores.csv")
+
+
 def score_clips(model, model_path: str, wav_dir: str, label: str) -> np.ndarray:
     """Return peak score per clip, loading from cache if available."""
     cache = _cache_path(model_path, label)
+    csv_path = _scores_csv_path(model_path, label)
     if os.path.exists(cache):
         scores = np.load(cache)
         print(f"  loaded {len(scores)} cached scores from {cache}")
         return scores
 
-    files = glob.glob(os.path.join(wav_dir, "*.wav"))
+    files = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
     if not files:
         print(f"  no wav files found in {wav_dir}")
         return np.array([])
@@ -68,7 +74,12 @@ def score_clips(model, model_path: str, wav_dir: str, label: str) -> np.ndarray:
 
     arr = np.array(scores)
     np.save(cache, arr)
+    with open(csv_path, "w") as f:
+        f.write("filename,score\n")
+        for path, score in zip(files, arr):
+            f.write(f"{os.path.basename(path)},{score:.6f}\n")
     print(f"  cached to {cache}")
+    print(f"  scores written to {csv_path}")
     return arr
 
 
@@ -115,19 +126,24 @@ def plot(results: list[tuple[str, np.ndarray, np.ndarray, float]]):
         ax.legend()
 
     plt.tight_layout()
-    out = "training/score_distribution.png"
+    name = results[0][0] if len(results) == 1 else "comparison"
+    out = os.path.join(CACHE_DIR, f"{name}_distribution.png")
     plt.savefig(out, dpi=150)
     print(f"plot saved to {out}")
     plt.show()
 
 
-def load_model_and_score(model_path, pos_dir, neg_dir):
+def load_model_and_score(model_path, pos_dir, neg_dir, skip_pos=False, skip_neg=False):
     print(f"\nloading model: {model_path}")
     model = Model(wakeword_models=[model_path], vad_threshold=0.5, enable_speex_noise_suppression=False)
-    print(f"scoring positives: {pos_dir}")
-    pos = score_clips(model, model_path, pos_dir, "pos")
-    print(f"scoring negatives: {neg_dir}")
-    neg = score_clips(model, model_path, neg_dir, "neg")
+    pos = np.array([])
+    neg = np.array([])
+    if not skip_pos:
+        print(f"scoring positives: {pos_dir}")
+        pos = score_clips(model, model_path, pos_dir, "pos")
+    if not skip_neg:
+        print(f"scoring negatives: {neg_dir}")
+        neg = score_clips(model, model_path, neg_dir, "neg")
     return pos, neg
 
 
@@ -135,8 +151,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",   default="models/openwakeword/oi_speaker.onnx")
     parser.add_argument("--compare", default=None, help="second model to overlay")
-    parser.add_argument("--pos", default="training/positives")
-    parser.add_argument("--neg", default="training/false_positives")
+    parser.add_argument("--pos", default="training/training_data/positive_samples_processed")
+    parser.add_argument("--neg", default="training/training_data/negative_samples")
+    parser.add_argument("--pos-only", action="store_true", help="score positives only")
+    parser.add_argument("--neg-only", action="store_true", help="score negatives only")
     args = parser.parse_args()
 
     models = [args.model]
@@ -145,7 +163,7 @@ def main():
 
     results = []
     for m in models:
-        pos, neg = load_model_and_score(m, args.pos, args.neg)
+        pos, neg = load_model_and_score(m, args.pos, args.neg, skip_pos=args.neg_only, skip_neg=args.pos_only)
         name = os.path.splitext(os.path.basename(m))[0]
         print_stats(f"{name} positives", pos)
         print_stats(f"{name} negatives", neg)

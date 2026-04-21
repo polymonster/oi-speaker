@@ -1,17 +1,11 @@
-"""Sync training wav files — fetch from remote or push to WSL."""
+"""Fetch training wav files from a remote device running http.server."""
 import argparse
 import os
 import re
-import shutil
 
 import requests
 
-BASE_URL = "http://192.168.1.119:8080"
-DIRS = ["training/positives", "training/false_positives"]
-WSL_MAPPINGS = [
-    ("training/positives",      r"\\wsl$\Ubuntu\home\alex\oww-training\positive_samples"),
-    ("training/false_positives", r"\\wsl$\Ubuntu\home\alex\oww-training\negative_samples"),
-]
+DIRS = ["training/training_data/recordings/positives", "training/training_data/recordings/false_positives"]
 
 
 def fetch(ip: str):
@@ -19,7 +13,7 @@ def fetch(ip: str):
     for subdir in DIRS:
         url = f"{base_url}/{subdir}/"
         listing = requests.get(url).text
-        files = re.findall(r'href="(\d+\.wav)"', listing)
+        files = re.findall(r'href="(\d+(?:_\d+)?\.wav)"', listing)
         os.makedirs(subdir, exist_ok=True)
         for f in files:
             dest = os.path.join(subdir, f)
@@ -32,33 +26,8 @@ def fetch(ip: str):
         print(f"{subdir}: {len(files)} files found")
 
 
-def update_wsl():
-    for src_dir, dst_dir in WSL_MAPPINGS:
-        if not os.path.isdir(src_dir):
-            print(f"skipping {src_dir} (not found)")
-            continue
-        os.makedirs(dst_dir, exist_ok=True)
-        existing = set(os.listdir(dst_dir))
-        copied = 0
-        for f in os.listdir(src_dir):
-            if f.endswith(".wav") and f not in existing:
-                shutil.copy2(os.path.join(src_dir, f), os.path.join(dst_dir, f))
-                copied += 1
-        print(f"{src_dir} → {dst_dir}: {copied} new files")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_fetch = sub.add_parser("fetch", help="fetch wavs from remote http.server")
-    p_fetch.add_argument("ip", nargs="?", default=BASE_URL.split("//")[1].split(":")[0],
-                         help="IP address of the remote (default: %(default)s)")
-
-    sub.add_parser("update-wsl", help="copy new wavs into WSL training directories")
-
+    parser.add_argument("ip", help="IP address of the remote device")
     args = parser.parse_args()
-    if args.cmd == "fetch":
-        fetch(args.ip)
-    else:
-        update_wsl()
+    fetch(args.ip)

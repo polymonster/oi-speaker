@@ -3,6 +3,5 @@ models/piper/
 .credentials
 config.toml
 ~/
-training/false_positives/
-training/positives/
-training/test/
+training/training_data/
+training/scores/

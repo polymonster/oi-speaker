@@ -95,9 +95,9 @@ speaker
 
 Use Piper-TTS to generate random positive samples + add custom user generated ones.
 
-Generate negative samples:
+### Generate Negative Samples
 
-```
+```bash
 python oi-speaker/training/download-negatives.py \
     --output_dir oww-training/negative_samples \
     --n_clips 3000 \
@@ -105,30 +105,36 @@ python oi-speaker/training/download-negatives.py \
     --cache_dir ~/librispeech_cache
 ```
 
-Train on WSL / Linux:
+### Generate Positive Samples
 
-Setup python env:
-
+```bash
+python training/generate-positives.py --count 200 --model .\models\piper\en_GB-northern_english_male-medium.onnx
 ```
+
+### Train on WSL / Linux
+
+#### Setup python env:
+
+```bash
 python3.10 -m venv venv_clean
 source venv_clean/bin/activate
 
 # Minimal deps — no tensorflow, no speechbrain, no piper
-pip install numpy scipy scikit-learn onnxruntime torch torchaudio onnx soxr
+pip install numpy scipy scikit-learn onnxruntime torch torchaudio onnx soxr onnxscript
 ```
 
-Setup openWakeWord
+#### Setup openWakeWord
 
-```
+```bash
 https://github.com/dscripka/openWakeWord
 cd openWakeWord
 # Install openwakeword itself (just the inference bits)
 pip install -e . --no-deps
 ```
 
-Install onnx models in openWakeWord:
+#### Install onnx models in openWakeWord:
 
-```
+```bash
 mkdir -p openWakeWord/openwakeword/resources/models
 
 wget -O openWakeWord/openwakeword/resources/models/melspectrogram.onnx \
@@ -140,19 +146,19 @@ wget -O openWakeWord/openwakeword/resources/models/embedding_model.onnx \
 ls -la openWakeWord/openwakeword/resources/models/
 ```
 
-Install additional deps:
+#### Kick off training
 
-```
-pip install onnxscript
-```
-
-Kick off training:
-
-```
+```bash
 python oi-speaker/training/oi-speaker.py \
     --positive_dir oww-training/positive_samples \
     --negative_dir oww-training/negative_samples \
     --model_name oi_speaker \
-    --clip_duration 1.0 \
     --epochs 100
+```
+#### Diagnose
+
+Script can be run to diagnose model performance
+
+```bash
+python training/diagnose.py --pos training/training_data/positive_samples_processed --neg training/training_data/negative_samples
 ```
