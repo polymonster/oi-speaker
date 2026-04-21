@@ -68,9 +68,9 @@ def find_flac_files(search_dir):
     return sorted(glob.glob(os.path.join(search_dir, '**', '*.flac'), recursive=True))
 
 
-def chop_audio_to_clips(flac_files, output_dir, n_clips, clip_duration_sec, target_sr=16000):
-    """Read FLAC files with soundfile and chop into fixed-length WAV clips."""
-    target_samples = int(clip_duration_sec * target_sr)
+def chop_audio_to_clips(flac_files, output_dir, n_clips, min_duration_sec, max_duration_sec, target_sr=16000):
+    """Read FLAC files and chop into variable-length WAV clips with random start offsets."""
+    rng = np.random.default_rng()
     os.makedirs(output_dir, exist_ok=True)
     clip_count = 0
 
@@ -84,11 +84,9 @@ def chop_audio_to_clips(flac_files, output_dir, n_clips, clip_duration_sec, targ
             logger.warning(f"Failed to read {flac_path}: {e}")
             continue
 
-        # Convert to mono if needed
         if len(audio.shape) > 1:
             audio = audio.mean(axis=1)
 
-        # Resample if needed
         if sr != target_sr:
             try:
                 import soxr
@@ -98,19 +96,19 @@ def chop_audio_to_clips(flac_files, output_dir, n_clips, clip_duration_sec, targ
                 n_samples = int(len(audio) * target_sr / sr)
                 audio = sp_resample(audio, n_samples)
 
-        # Convert to int16
         audio_int16 = (audio * 32767).astype(np.int16)
 
-        # Chop into clips
-        for start in range(0, len(audio_int16) - target_samples, target_samples):
-            if clip_count >= n_clips:
+        pos = int(rng.integers(0, max(1, int(min_duration_sec * target_sr))))
+        while pos < len(audio_int16) and clip_count < n_clips:
+            duration = rng.uniform(min_duration_sec, max_duration_sec)
+            n_samples = int(duration * target_sr)
+            if pos + n_samples > len(audio_int16):
                 break
-
-            clip = audio_int16[start:start + target_samples]
+            clip = audio_int16[pos:pos + n_samples]
             out_path = os.path.join(output_dir, f"speech_{clip_count:05d}.wav")
             wavfile.write(out_path, target_sr, clip)
             clip_count += 1
-
+            pos += n_samples
             if clip_count % 500 == 0:
                 logger.info(f"  Generated {clip_count}/{n_clips} speech clips...")
 
@@ -118,29 +116,29 @@ def chop_audio_to_clips(flac_files, output_dir, n_clips, clip_duration_sec, targ
     return clip_count
 
 
-def generate_noise_clips(output_dir, n_clips=300, clip_duration_sec=1.0, sr=16000):
-    """Generate various noise/silence clips as additional negatives."""
-    target_samples = int(clip_duration_sec * sr)
+def generate_noise_clips(output_dir, n_clips=300, min_duration_sec=0.5, max_duration_sec=3.0, sr=16000):
+    """Generate various noise/silence clips of random lengths as additional negatives."""
+    rng = np.random.default_rng(42)
     os.makedirs(output_dir, exist_ok=True)
-    rng = np.random.RandomState(42)
 
     for i in range(n_clips):
+        n_samples = int(rng.uniform(min_duration_sec, max_duration_sec) * sr)
         noise_type = i % 4
 
         if noise_type == 0:
-            clip = (rng.randn(target_samples) * 50).astype(np.int16)
+            clip = (rng.standard_normal(n_samples) * 50).astype(np.int16)
         elif noise_type == 1:
-            clip = (rng.randn(target_samples) * 500).astype(np.int16)
+            clip = (rng.standard_normal(n_samples) * 500).astype(np.int16)
         elif noise_type == 2:
-            white = rng.randn(target_samples)
-            pink = np.zeros(target_samples)
+            white = rng.standard_normal(n_samples)
+            pink = np.zeros(n_samples)
             pink[0] = white[0]
-            for j in range(1, target_samples):
+            for j in range(1, n_samples):
                 pink[j] = 0.98 * pink[j-1] + white[j]
             pink = pink / (np.max(np.abs(pink)) + 1e-10) * 1000
             clip = pink.astype(np.int16)
         else:
-            clip = np.zeros(target_samples, dtype=np.int16)
+            clip = np.zeros(n_samples, dtype=np.int16)
 
         out_path = os.path.join(output_dir, f"noise_{i:05d}.wav")
         wavfile.write(out_path, sr, clip)
@@ -151,9 +149,10 @@ def generate_noise_clips(output_dir, n_clips=300, clip_duration_sec=1.0, sr=1600
 
 def main():
     parser = argparse.ArgumentParser(description='Download negative training data')
-    parser.add_argument('--output_dir', default='../oww-training/negative_samples')
+    parser.add_argument('--output_dir', default='training/synthetic_negative_samples')
     parser.add_argument('--n_clips', type=int, default=3000)
-    parser.add_argument('--clip_duration', type=float, default=1.0)
+    parser.add_argument('--min_clip_duration', type=float, default=2.0)
+    parser.add_argument('--max_clip_duration', type=float, default=5.0)
     parser.add_argument('--sr', type=int, default=16000)
     parser.add_argument('--cache_dir', default=None,
                         help='Directory to cache the LibriSpeech download (default: temp dir)')
@@ -164,7 +163,7 @@ def main():
 
     logger.info("=" * 60)
     logger.info(f"Target: {n_speech} speech clips + {n_noise} noise clips")
-    logger.info(f"Clip duration: {args.clip_duration}s @ {args.sr}Hz")
+    logger.info(f"Clip duration: {args.min_clip_duration}–{args.max_clip_duration}s @ {args.sr}Hz")
     logger.info(f"Output: {args.output_dir}")
     logger.info("=" * 60)
 
@@ -183,11 +182,11 @@ def main():
 
     # Chop into clips
     speech_count = chop_audio_to_clips(
-        flac_files, args.output_dir, n_speech, args.clip_duration, args.sr
+        flac_files, args.output_dir, n_speech, args.min_clip_duration, args.max_clip_duration, args.sr
     )
 
     noise_count = generate_noise_clips(
-        args.output_dir, n_noise, args.clip_duration, args.sr
+        args.output_dir, n_noise, args.min_clip_duration, args.max_clip_duration, args.sr
     )
 
     logger.info("=" * 60)

@@ -274,7 +274,7 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=
 
 
 def _listen_for_wake(wake_model, stream, sample_rate: int,
-                    threshold: float = 0.75, num_triggers: int = 5,
+                    threshold: float = 0.79, num_triggers: int = 2,
                     window_size: int = 5, buffer_duration: float = 0.0) -> np.ndarray:
     """Block until wake word is detected. Returns buffered pre-trigger audio (empty if buffer_duration=0)."""
     score_window = deque(maxlen=window_size)
