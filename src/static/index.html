@@ -70,6 +70,14 @@
 
   /* status */
 
+  /* speakers */
+  .peer-card { border: 1px solid #222; padding: 12px 16px; display: flex; align-items: center; gap: 16px; }
+  .peer-status { font-size: 0.8em; padding: 2px 8px; border: 1px solid; flex-shrink: 0; }
+  .peer-status.online { color: #afa; border-color: #afa; }
+  .peer-status.offline { color: #555; border-color: #333; }
+  .peer-open { background: none; border: 1px solid #444; color: #888; padding: 6px 14px; cursor: pointer; font-family: monospace; font-size: 0.9em; flex-shrink: 0; }
+  .peer-open:hover { border-color: #888; color: #eee; }
+
   /* desktop overrides */
   @media (min-width: 768px) {
     html, body { height: auto; overflow: auto; }
@@ -89,6 +97,7 @@
   <button class="active" onclick="show('chat', this)">chat</button>
   <button onclick="show('settings', this)">settings</button>
   <button onclick="show('console', this)">console</button>
+  <button onclick="show('speakers', this)">speakers</button>
 </nav>
 
 <section id="chat" class="active">
@@ -107,6 +116,10 @@
     </label>
   </div>
   <div id="console-log"></div>
+</section>
+
+<section id="speakers">
+  <div id="speakers-list" style="display:flex;flex-direction:column;gap:10px;margin-top:8px;"></div>
 </section>
 
 <section id="settings">
@@ -384,17 +397,39 @@ async function syncConsole() {
   } catch {}
 }
 
+// speakers tab
+async function syncSpeakers() {
+  try {
+    const peers = await fetch('/peers').then(r => r.json());
+    const el = document.getElementById('speakers-list');
+    el.innerHTML = '';
+    if (!peers.length) {
+      el.innerHTML = '<div style="color:#444;font-size:0.9em;">no peers discovered yet...</div>';
+      return;
+    }
+    for (const p of peers) {
+      const card = document.createElement('div');
+      card.className = 'peer-card';
+      const badge = `<span class="peer-status ${p.online ? 'online' : 'offline'}">${p.online ? 'online' : 'offline'}</span>`;
+      const btn = p.online ? `<button class="peer-open" onclick="window.open('http://${p.ip}:${p.port}/','_blank')">open</button>` : '';
+      card.innerHTML = `<div style="flex:1">${p.name}<br><span style="color:#444;font-size:0.8em;">${p.ip}:${p.port}</span></div>${badge}${btn}`;
+      el.appendChild(card);
+    }
+  } catch {}
+}
+
 // status + history polling
 async function updateStatus() {
   try {
     const res = await fetch('/status');
     const data = await res.json();
     if (data.ip && data.ip !== 'unknown') {
-      document.getElementById('host-ip').textContent = data.ip + ':8000';
+      document.getElementById('host-ip').textContent = data.ip + ':' + (data.port || 8000);
     }
   } catch {}
   await syncHistory();
   await syncConsole();
+  await syncSpeakers();
 }
 setInterval(updateStatus, 2000);
 updateStatus();

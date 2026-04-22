@@ -1,3 +1,7 @@
+[network]
+name = "living-room"
+port = 8000
+
 [inference]
 device = "cpu"
 whisper_model = "small"

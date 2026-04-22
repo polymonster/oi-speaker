@@ -19,7 +19,9 @@ dependencies = [
     "python-mpv",
     "speexdsp-ns; sys_platform == 'linux'",
     "fastapi[standard]",
-    "tomli-w"
+    "tomli-w",
+    "zeroconf>=0.131.0",
+    "httpx>=0.27.0",
 ]
 
 [project.scripts]

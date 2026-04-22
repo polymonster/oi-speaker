@@ -927,7 +927,10 @@ def main():
     # main speaker loop / app
     sys.path.insert(0, str(__file__).replace("speaker.py", ""))
     from web import app
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    with open("config.toml", "rb") as _f:
+        _cfg = tomllib.load(_f)
+    _port = int(_cfg.get("network", {}).get("port", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=_port)
     os._exit(0)
 
 
