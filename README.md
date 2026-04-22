@@ -91,6 +91,24 @@ python -m piper.download_voices en_GB-northern_english_male-medium
 speaker
 ```
 
+## Running as a Service (Linux)
+
+The service is an instantiated systemd template so it works for any user without editing the file.
+
+```bash
+bash install-service.sh
+```
+
+This copies `setup/oi-speaker@.service` to `/etc/systemd/system/`, enables and starts `oi-speaker@<your-username>`.
+
+Useful commands:
+
+```bash
+sudo systemctl status oi-speaker@$USER
+sudo systemctl stop oi-speaker@$USER
+journalctl -u oi-speaker@$USER -f
+```
+
 ## Training
 
 Use Piper-TTS to generate random positive samples + add custom user generated ones.

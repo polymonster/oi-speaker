@@ -7,54 +7,26 @@ device = "cpu"
 whisper_model = "small"
 
 [audio]
-input_device = "Scarlett 2i2 USB"
-output_device = "Scarlett 2i2 USB"
+input_device = "your-input-device"
+output_device = "your-output-device"
 
 [llm]
 anthropic_api_key = ""
 
-[[hints]]
-name = "location"
-category = "about"
-text = "UK, London based, Machester Born"
+# Add hints to give the assistant context about you and your preferences.
+# Hints appear in the system prompt. Add as many [[hints]] blocks as you like.
 
-[[hints]]
-name = "football"
-category = "sport"
-text = "Tottenham Hotspur, Premier League, Champions League, EFL"
+# [[hints]]
+# name = "location"
+# category = "about"
+# text = "Your city / country"
 
-[[hints]]
-name = "favourite genres"
-category = "music"
-text = "dub techno, tech house, electro, breaks, techno"
+# [[hints]]
+# name = "favourite genres"
+# category = "music"
+# text = "Your preferred music genres"
 
-[[hints]]
-name = "Do You World"
-category = "radio"
-url = "https://doyouworld.out.airtime.pro/doyouworld_a"
-
-[[hints]]
-name = "NTS"
-category = "radio"
-url = "https://stream-relay-geo.ntslive.net/stream"
-
-[[hints]]
-name = "NTS 2"
-category = "radio"
-url = "https://stream-relay-geo.ntslive.net/stream2"
-
-[[hints]]
-name = "BBC Radio 2"
-category = "radio"
-url = "https://a.files.bbci.co.uk/ms6/live/3441A116-B12E-4D2F-ACA8-C1984642FA4B/audio/simulcast/hls/uk/pc_hd_abr_v2/aks/bbc_radio_two.m3u8"
-
-[[hints]]
-name = "Rinse FM"
-category = "radio"
-url = "https://admin.stream.rinse.fm/proxy/rinse_uk/stream"
-extra_info = "headers = Origin: https://www.rinse.fm, Referer: https://www.rinse.fm/, Icy-MetaData: 1"
-
-[[hints]]
-name = "The Mudd Show"
-category = "YouTube"
-url = "https://www.youtube.com/@TheMUDDShow"
+# [[hints]]
+# name = "My Radio"
+# category = "radio"
+# url = "https://stream-url-here"
