@@ -13,6 +13,16 @@
   nav { display: flex; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid #222; padding-bottom: 10px; }
   nav button { background: none; border: none; color: #555; padding: 4px 12px; cursor: pointer; font-family: monospace; font-size: 1em; }
   nav button.active { color: #eee; border-bottom: 2px solid #eee; }
+
+  /* console */
+  #console-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  #console-toolbar button { background: none; border: 1px solid #333; color: #555; padding: 4px 10px; cursor: pointer; font-family: monospace; font-size: 0.85em; }
+  #console-toolbar button:hover { border-color: #555; color: #eee; }
+  #console-log { flex: 1; overflow-y: auto; border: 1px solid #222; padding: 10px 14px; font-size: 0.82em; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+  .log-line { color: #aaa; }
+  .log-line.warn { color: #fa7; }
+  .log-line.err  { color: #f66; }
+  .log-ts { color: #444; margin-right: 8px; user-select: none; }
   section { display: none; }
   section.active { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
 
@@ -68,6 +78,7 @@
     #settings { overflow-y: visible; }
     #chat-log { flex: none; height: 420px; }
     #chat-form { padding-bottom: 0; }
+    #console-log { height: 520px; flex: none; }
   }
 </style>
 </head>
@@ -77,6 +88,7 @@
 <nav>
   <button class="active" onclick="show('chat', this)">chat</button>
   <button onclick="show('settings', this)">settings</button>
+  <button onclick="show('console', this)">console</button>
 </nav>
 
 <section id="chat" class="active">
@@ -85,6 +97,16 @@
     <input id="chat-input" type="text" placeholder="say something..." autocomplete="off">
     <button class="send-btn" type="submit">send</button>
   </form>
+</section>
+
+<section id="console">
+  <div id="console-toolbar">
+    <button onclick="clearConsole()">clear</button>
+    <label style="color:#555;font-size:0.85em;cursor:pointer;">
+      <input type="checkbox" id="autoscroll" checked style="margin-right:4px;">auto-scroll
+    </label>
+  </div>
+  <div id="console-log"></div>
 </section>
 
 <section id="settings">
@@ -121,6 +143,11 @@ document.getElementById('chat-form').addEventListener('submit', async e => {
   if (!text) return;
   input.value = '';
   input.disabled = true;
+  // Show user message immediately without waiting for server
+  addMsg('user', '> ' + text);
+  historyLen++;
+  // Poll frequently while waiting for the response to arrive
+  const fastPoll = setInterval(syncHistory, 500);
   try {
     await fetch('/chat', {
       method: 'POST',
@@ -131,6 +158,7 @@ document.getElementById('chat-form').addEventListener('submit', async e => {
   } catch {
     addMsg('bot action', '< error');
   } finally {
+    clearInterval(fastPoll);
     input.disabled = false;
     input.focus();
   }
@@ -322,6 +350,40 @@ async function saveSettings() {
   setTimeout(() => fb.style.opacity = 0, 2000);
 }
 
+// console log
+let logSince = 0;
+
+function clearConsole() {
+  document.getElementById('console-log').innerHTML = '';
+  logSince = 0;
+}
+
+function _logClass(text) {
+  const t = text.toLowerCase();
+  if (t.includes('error') || t.includes('traceback') || t.includes('exception')) return 'err';
+  if (t.includes('warn') || t.includes('yt-dlp error')) return 'warn';
+  return '';
+}
+
+async function syncConsole() {
+  try {
+    const res = await fetch('/logs?since=' + logSince);
+    const data = await res.json();
+    if (!data.lines.length) return;
+    const el = document.getElementById('console-log');
+    const autoscroll = document.getElementById('autoscroll').checked;
+    for (const entry of data.lines) {
+      const d = document.createElement('div');
+      d.className = 'log-line ' + _logClass(entry.text);
+      const ts = new Date(entry.ts * 1000).toLocaleTimeString();
+      d.innerHTML = `<span class="log-ts">${ts}</span>${entry.text.replace(/</g, '&lt;')}`;
+      el.appendChild(d);
+      logSince = entry.index;
+    }
+    if (autoscroll) el.scrollTop = el.scrollHeight;
+  } catch {}
+}
+
 // status + history polling
 async function updateStatus() {
   try {
@@ -332,6 +394,7 @@ async function updateStatus() {
     }
   } catch {}
   await syncHistory();
+  await syncConsole();
 }
 setInterval(updateStatus, 2000);
 updateStatus();
