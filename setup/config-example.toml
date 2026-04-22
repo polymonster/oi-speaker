@@ -1,0 +1,28 @@
+[inference]
+device = "cpu"
+whisper_model = "small"
+
+[audio]
+input_device = "your-input-device"
+output_device = "your-output-device"
+
+[llm]
+anthropic_api_key = ""
+
+# Add hints to give the assistant context about you and your preferences.
+# Hints appear in the system prompt. Add as many [[hints]] blocks as you like.
+
+# [[hints]]
+# name = "location"
+# category = "about"
+# text = "Your city / country"
+
+# [[hints]]
+# name = "favourite genres"
+# category = "music"
+# text = "Your preferred music genres"
+
+# [[hints]]
+# name = "My Radio"
+# category = "radio"
+# url = "https://stream-url-here"
