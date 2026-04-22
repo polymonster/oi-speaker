@@ -483,7 +483,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
 
                 # Terminal actions don't need another LLM round-trip
                 if next_state == SpeakerState.RESET and any(
-                    block.type == "tool_use" and block.name in ("play_url", "stop")
+                    block.type == "tool_use" and block.name in ("play_url", "stop", "chat")
                     for block in final_message.content
                 ):
                     return next_state
