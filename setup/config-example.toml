@@ -35,7 +35,7 @@ category = "radio"
 url = "https://stream-relay-geo.ntslive.net/stream"
 
 [[hints]]
-name = "NTS 2"config.toml
+name = "NTS 2"
 category = "radio"
 url = "https://stream-relay-geo.ntslive.net/stream2"
 

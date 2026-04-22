@@ -25,7 +25,7 @@ from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, auto
 
 # TODO:
 # update function, check git and auto update
@@ -36,6 +36,26 @@ from enum import Enum
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 480 # 30ms at 16kHz
+
+_log_buffer: deque = deque(maxlen=2000)
+_log_counter: int = 0
+_log_lock = threading.Lock()
+
+
+def log(text: str):
+    """Print to stdout and append to the web-accessible log buffer."""
+    global _log_counter
+    print(text)
+    with _log_lock:
+        _log_buffer.append({"index": _log_counter, "text": text, "ts": time.time()})
+        _log_counter += 1
+
+
+def get_log_lines(since: int = 0) -> dict:
+    with _log_lock:
+        lines = [l for l in _log_buffer if l["index"] > since]
+        total = _log_counter
+    return {"lines": lines, "total": total}
 
 
 class _Timer:
@@ -53,7 +73,7 @@ class _Timer:
         now = time.monotonic()
         interval = now - self._last
         total = now - self._start
-        print(f"{indent}[timing] {label}: +{interval:.2f}s  total={total:.2f}s")
+        log(f"{indent}[timing] {label}: +{interval:.2f}s  total={total:.2f}s")
         self._last = now
 
 
@@ -115,12 +135,13 @@ TOOLS = [
 
 
 class SpeakerState(Enum):
-    TEXT_CHAT = "text_chat"
-    LISTEN_FOR_WAKE = "_listen_for_wake"
-    CHATTING = "chatting"
-    RESET = "reset"
-    CACHE_WAKE = "cache_wake"
-    VAD_RECORD = "_vad_record"
+    TEXT_CHAT = auto()
+    LISTEN_FOR_WAKE = auto()
+    RECORDING = auto()
+    LLM_AGENT = auto()
+    RESET = auto()
+    CACHE_WAKE = auto()
+    VAD_RECORD = auto()
 
 
 @dataclass
@@ -141,6 +162,7 @@ speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
 _player_cmd_queue: queue.Queue = queue.Queue()
 _player_active: bool = False
 _interrupt: threading.Event = threading.Event()
+_shutdown: threading.Event = threading.Event()
 _timer = _Timer()
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
@@ -182,6 +204,26 @@ def _flush_stream(stream, sample_rate: int):
             stream.read(chunk)
         except Exception:
             break
+
+
+def _wait_for_silence(stream, sample_rate: int, threshold: float = 800.0, settle: float = 0.6, timeout: float = 3.0):
+    """Read input audio until RMS stays below `threshold` for `settle` seconds (or `timeout` expires).
+    Called after pausing playback so speaker bleed dies down before VAD starts."""
+    sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
+    chunk = VAD_CHUNK * sample_ratio
+    chunk_duration = VAD_CHUNK / TARGET_SAMPLE_RATE
+    silent_duration = 0.0
+    elapsed = 0.0
+    while elapsed < timeout:
+        raw, _ = stream.read(chunk)
+        rms = float(np.sqrt(np.mean(np.square(np.squeeze(raw).astype(np.float32)))))
+        elapsed += chunk_duration
+        if rms < threshold:
+            silent_duration += chunk_duration
+            if silent_duration >= settle:
+                return
+        else:
+            silent_duration = 0.0
 
 
 def _test_tone(dev, dev_index: int, sample_rate: int):
@@ -245,14 +287,15 @@ def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> 
     return np.concatenate(raw_chunks)
 
 
-def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.0, onset_timeout: float=8.0) -> np.ndarray | None:
+def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.0, onset_timeout: float=8.0) -> tuple[np.ndarray | None, float]:
     """Wait for speech onset then record until `silence_timeout` seconds of continuous silence.
-    Returns None if no speech begins within `onset_timeout` seconds."""
+    Returns (audio, onset_elapsed). audio is None if no speech begins within `onset_timeout` seconds."""
     chunks = []
     silent_duration = 0.0
     speech_started = False
     onset_elapsed = 0.0
     chunk_duration = VAD_CHUNK / TARGET_SAMPLE_RATE
+    log_limiter = 0
     while True:
         audio_flat = _read_audio(stream, VAD_CHUNK, sample_rate)
         chunks.append(audio_flat)
@@ -265,12 +308,15 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=
             if silent_duration >= silence_timeout:
                 break
         else:
+            if int(onset_elapsed) > log_limiter:
+                log_limiter = int(onset_elapsed)
+                log(f"waiting for onset: {log_limiter}s")
             onset_elapsed += chunk_duration
             if onset_elapsed >= onset_timeout:
-                print("no speech detected, returning to wake listen")
-                return None
+                log("no speech detected, returning to wake listen")
+                return None, onset_elapsed
 
-    return np.concatenate(chunks)
+    return np.concatenate(chunks), onset_elapsed
 
 
 def _listen_for_wake(wake_model, stream, sample_rate: int,
@@ -292,9 +338,9 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
             score_window.append(score > threshold)
             hits = sum(score_window)
             if score > 0.0:
-                print(f"score: {score:.3f} ({hits}/{num_triggers})")
+                log(f"score: {score:.3f} ({hits}/{num_triggers})")
             if hits >= num_triggers:
-                print("ello mate!")
+                log("ello mate!")
                 if rolling_buffer is not None:
                     return np.concatenate(rolling_buffer)
                 return np.array([], dtype=np.int16)
@@ -331,7 +377,7 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     elif tool_name == "chat":
         chat_history.append({"role": "assistant", "text": tool_input["text"]})
         _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, tool_input["text"])
-        next_state = SpeakerState.CHATTING if tool_input.get("follow_on") else SpeakerState.RESET
+        next_state = SpeakerState.RECORDING if tool_input.get("follow_on") else SpeakerState.RESET
         return "spoken", next_state
     return "unknown tool", None
 
@@ -352,6 +398,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
     stop_flag = threading.Event()
     wake_thread = None
     if mic_stream is not None:
+        ctx.wake_model.reset()  # clear residual activation from the wake that triggered this session
         wake_thread = threading.Thread(
             target=_interrupt_wake_listen,
             args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag),
@@ -365,6 +412,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
         while True:
             accumulated_text = ""
             sentence_buffer = ""
+            _live_entry = None  # mutable chat_history entry updated live during streaming
 
             with llm_client.messages.stream(
                 model="claude-sonnet-4-5",
@@ -378,6 +426,12 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                         break
                     sentence_buffer += delta
                     accumulated_text += delta
+                    # Update chat_history live so web UI polls see the response during TTS
+                    if _live_entry is None:
+                        _live_entry = {"role": "assistant", "text": accumulated_text}
+                        chat_history.append(_live_entry)
+                    else:
+                        _live_entry["text"] = accumulated_text
                     sentences, sentence_buffer = _split_sentences(sentence_buffer)
                     for s in sentences:
                         if s.strip():
@@ -397,8 +451,9 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 final_message = stream.get_final_message()
 
             if final_message.stop_reason == "end_turn":
-                if accumulated_text.strip():
-                    chat_history.append({"role": "assistant", "text": accumulated_text})
+                # Remove live entry if nothing was streamed
+                if _live_entry is not None and not accumulated_text.strip():
+                    chat_history.remove(_live_entry)
                 return next_state
 
             if final_message.stop_reason == "pause_turn":
@@ -407,11 +462,14 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 continue
 
             if final_message.stop_reason == "tool_use":
+                # Remove live entry if nothing was streamed (chat tool will add its own entry)
+                if _live_entry is not None and not accumulated_text.strip():
+                    chat_history.remove(_live_entry)
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
                 for block in final_message.content:
                     if block.type == "tool_use":
-                        print(f"\ttool: {block.name} {block.input}")
+                        log(f"\ttool: {block.name} {block.input}")
                         _timer.lap(block.name, indent="\t")
                         result, state = _execute_tool(block.name, block.input)
                         if state is not None:
@@ -437,8 +495,31 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
         _interrupt.clear()
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove common markdown so TTS doesn't read out symbols."""
+    # headings
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # bold / italic
+    text = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)
+    text = re.sub(r'_{1,3}(.*?)_{1,3}', r'\1', text)
+    # inline code and code blocks
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # links and images
+    text = re.sub(r'!?\[([^\]]*)\]\([^)]*\)', r'\1', text)
+    # blockquotes and list markers
+    text = re.sub(r'^[>\-\*\+]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+    # horizontal rules
+    text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    return text.strip()
+
+
 def _speak(dev, dev_index, sample_rate, voice_model, text: str):
     """Synthesise `text` to audio and play it, stopping early if `_interrupt` is set."""
+    text = _strip_markdown(text)
+    if not text:
+        return
     if _interrupt.is_set():
         return
     chunks = []
@@ -466,14 +547,14 @@ def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag
         for _, score in prediction.items():
             score_window.append(score > 0.9)
             if sum(score_window) >= 3:
-                print("interrupt: wake word during TTS")
+                log("interrupt: wake word during TTS")
                 _interrupt.set()
                 return
 
 
 def _player_loop():
     """Background thread: consume commands from `_player_cmd_queue` and drive the mpv player."""
-    print("oi!! player! loop!!")
+    log("oi!! player! loop!!")
 
     player: mpv.MPV | None = None
     cleanup_dir: str | None = None
@@ -506,7 +587,7 @@ def _player_loop():
             global _player_active
             _stop()
             url, headers = args[0], args[1]
-            print(f"play_url: {url[:80]}...")
+            log(f"play_url: {url[:80]}...")
             player = mpv.MPV(vid=False, terminal=False,
                              user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
@@ -520,7 +601,7 @@ def _player_loop():
         elif cmd == 'play_file':
             _stop()
             path, cleanup_dir = args[0], args[1]
-            print(f"playing: {path}")
+            log(f"playing: {path}")
             player = mpv.MPV(vid=False, terminal=False,
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
@@ -551,20 +632,20 @@ def _player_loop():
 
 def _resolve_youtube_and_play(url: str):
     """Resolve a YouTube URL to a direct stream URL via yt-dlp and enqueue it for playback."""
-    print("resolving youtube stream url...")
+    log("resolving youtube stream url...")
     result = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
          "--get-url", "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
         capture_output=True, text=True
     )
     if result.returncode != 0:
-        print(f"yt-dlp error: {result.stderr}")
+        log(f"yt-dlp error: {result.stderr}")
         return
     stream_url = result.stdout.strip().splitlines()[0]
     if not stream_url:
-        print("yt-dlp: no stream url found")
+        log("yt-dlp: no stream url found")
         return
-    print(f"streaming: {stream_url[:80]}...")
+    log(f"streaming: {stream_url[:80]}...")
     _player_cmd_queue.put(('play', stream_url, None))
 
 
@@ -573,18 +654,18 @@ def _download_youtube_and_play(url: str):
     import tempfile
     tmpdir = tempfile.mkdtemp()
     output_template = os.path.join(tmpdir, "audio.%(ext)s")
-    print("downloading youtube audio...")
+    log("downloading youtube audio...")
     result = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", output_template,
          "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
         capture_output=True, text=True
     )
     if result.returncode != 0:
-        print(f"yt-dlp error: {result.stderr}")
+        log(f"yt-dlp error: {result.stderr}")
         return
     files = os.listdir(tmpdir)
     if not files:
-        print("yt-dlp: no output file found")
+        log("yt-dlp: no output file found")
         return
     audio_file = os.path.join(tmpdir, files[0])
     _player_cmd_queue.put(('play_file', audio_file, tmpdir))
@@ -607,6 +688,13 @@ def stop_playback():
     """Stop active playback and signal any in-progress TTS to interrupt."""
     _interrupt.set()
     _player_cmd_queue.put(('stop',))
+
+
+def shutdown():
+    """Signal all background threads to exit cleanly."""
+    _shutdown.set()
+    _interrupt.set()
+    _player_cmd_queue.put(('quit',))
 
 
 def pause_playback():
@@ -649,7 +737,7 @@ def search_youtube(query: str, max_results: int = 5) -> str:
 
 def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
     """Background thread: main state machine driving wake detection, recording, and LLM interaction."""
-    print("oi!! speak! loop!!")
+    log("oi!! speak! loop!!")
     _play_oneshot_audio_file("sounds/startup.m4a")
     global speaker_state
 
@@ -660,19 +748,23 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     triggers = 1
     record_dir = None
     if "--record-negatives" in sys.argv:
-        print("recording negatives")
+        log("recording negatives")
         buffer_duration = 4.0
         record_dir = "training/training_data/recordings/false_positives"
         os.makedirs(record_dir, exist_ok=True)
     elif "--record-positives" in sys.argv:
-        print("recording positives")
+        log("recording positives")
         record_dir = "training/training_data/recordings/positives"
         speaker_state = SpeakerState.VAD_RECORD
         os.makedirs(record_dir, exist_ok=True)
 
+    ONSET_TIMEOUT = 8.0
+
     # the loop
+    transcribed_request = ""
+    onset_remaining = ONSET_TIMEOUT
     with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
-        while True:
+        while not _shutdown.is_set():
             if speaker_state == SpeakerState.LISTEN_FOR_WAKE:
                 wake_audio = _listen_for_wake(
                     wake_model,
@@ -683,34 +775,46 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                     buffer_duration=buffer_duration
                 )
                 _timer.start()
+                onset_remaining = ONSET_TIMEOUT
                 if record_dir:
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
-                    print(f"caching {filepath}")
+                    log(f"caching {filepath}")
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
                     _play_oneshot_audio_file("sounds/wake.wav")
-                    speaker_state = SpeakerState.CHATTING
-            elif speaker_state == SpeakerState.CHATTING:
-                print("chatting")
+                    speaker_state = SpeakerState.RECORDING
+            elif speaker_state == SpeakerState.RECORDING:
+                log(f"recording (onset budget: {onset_remaining:.1f}s)")
                 pause_playback()
                 _flush_stream(stream, input_sample_rate)
-                audio_request = _record_until_silence(vad, stream, input_sample_rate)
+                _wait_for_silence(stream, input_sample_rate)
+                audio_request, onset_elapsed = _record_until_silence(vad, stream, input_sample_rate, onset_timeout=onset_remaining)
                 if audio_request is None:
-                    print("no speech detected, returning to wake listen")
+                    log("onset timeout, returning to wake listen")
                     resume_playback()
+                    onset_remaining = ONSET_TIMEOUT
                     speaker_state = SpeakerState.RESET
                     continue
                 _timer.lap("recorded")
                 transcribed_request = _transcribe_audio(whisper_model, audio_request)
                 _timer.lap("transcribed")
                 if not transcribed_request.strip():
-                    print("empty transcription, returning to wake listen")
-                    resume_playback()
-                    speaker_state = SpeakerState.RESET
+                    onset_remaining -= onset_elapsed
+                    log(f"empty transcription, onset budget remaining: {onset_remaining:.1f}s")
+                    if onset_remaining > 0.5:
+                        speaker_state = SpeakerState.RECORDING
+                    else:
+                        log("onset budget exhausted, returning to wake listen")
+                        resume_playback()
+                        onset_remaining = ONSET_TIMEOUT
+                        speaker_state = SpeakerState.RESET
                     continue
-                print(transcribed_request)
+                onset_remaining = ONSET_TIMEOUT
+                log(transcribed_request)
                 chat_history.append({"role": "user", "text": transcribed_request})
+                speaker_state = SpeakerState.LLM_AGENT
+            elif speaker_state == SpeakerState.LLM_AGENT:
                 speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
                 _timer.lap("llm")
                 resume_playback()
@@ -718,17 +822,17 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 _flush_stream(stream, input_sample_rate)
                 wake_model.reset()
                 speaker_state = SpeakerState.LISTEN_FOR_WAKE
-                print("return to listen for wake")
+                log("return to listen for wake")
             elif speaker_state == SpeakerState.VAD_RECORD:
                 audio = _vad_record(vad, stream, input_sample_rate)
                 filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
-                print(f"caching {filepath}")
+                log(f"caching {filepath}")
                 _write_wav(audio, input_sample_rate, filepath, gain=1.0)
 
 
 def start():
     """Initialise all models and devices from config.toml and launch the background threads."""
-    print("oi! start!!")
+    log("oi! start!!")
 
     global ctx
     if ctx is not None:
@@ -737,12 +841,12 @@ def start():
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
         if "--verbose" in sys.argv:
-            print(json.dumps(config, indent=4))
+            log(json.dumps(config, indent=4))
 
     with open("system.json", "rb") as f:
         system = json.load(f)["system"]
         if "--verbose" in sys.argv:
-            print(json.dumps(system, indent=4))
+            log(json.dumps(system, indent=4))
 
     hints = config.get("hints", [])
     if hints:
@@ -762,7 +866,7 @@ def start():
     )
 
     # vad
-    vad = webrtcvad.Vad(2)
+    vad = webrtcvad.Vad(3)
 
     # whisper
     inf = config.get("inference", {})
@@ -780,7 +884,7 @@ def start():
     voice_model = PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx")
 
     if "--verbose" in sys.argv:
-        print(json.dumps(enumerate_audio_devices(), indent=4))
+        log(json.dumps(enumerate_audio_devices(), indent=4))
     input_dev_info = _get_audio_device_index(config["audio"]["input_device"])
     output_dev_info = _get_audio_device_index(config["audio"]["output_device"])
     input_dev_index = int(input_dev_info['index'])
@@ -814,10 +918,10 @@ def start():
 
 def main():
     """Entry point: start the speaker and serve the web UI via uvicorn."""
-    print("oi! oi!!")
+    log("oi! oi!!")
 
     if "--enum-audio" in sys.argv:
-        print(json.dumps(enumerate_audio_devices(), indent=4))
+        log(json.dumps(enumerate_audio_devices(), indent=4))
         return
 
     # main speaker loop / app

@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,7 +24,7 @@ CONFIG_PATH = Path("config.toml")
 async def lifespan(app: FastAPI):
     spk.start()
     yield
-    spk.stop_playback()
+    spk.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -43,7 +44,8 @@ async def index():
 async def chat(req: ChatRequest):
     spk.chat_history.append({"role": "user", "text": req.text})
     spk.start_timer()
-    state = spk.query_llm(spk.ctx.llm_client, spk.ctx.system, req.text)
+    loop = asyncio.get_event_loop()
+    state = await loop.run_in_executor(None, spk.query_llm, spk.ctx.llm_client, spk.ctx.system, req.text)
     return {"response": f"[{state.value}]"}
 
 
@@ -85,6 +87,11 @@ def _local_ip() -> str:
 async def stop():
     spk.stop_playback()
     return {"ok": True}
+
+
+@app.get("/logs")
+async def logs(since: int = 0):
+    return spk.get_log_lines(since)
 
 
 @app.get("/status")
