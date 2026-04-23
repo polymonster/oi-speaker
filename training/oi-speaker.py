@@ -5,8 +5,8 @@ Skips all Piper/TTS synthetic generation — just uses your wav files directly.
 
 Usage:
     python train_oi_speaker.py \
-        --positive_dir ../oww-training/positive_samples \
-        --negative_dir ../oww-training/negative_samples \
+        --pos ../oww-training/positive_samples \
+        --neg ../oww-training/negative_samples \
         --model_name oi_speaker \
         --output_dir oi_speaker_model \
         --epochs 100 \
@@ -54,16 +54,26 @@ def load_wav_16k_mono(filepath):
     return data.astype(np.int16)
 
 
-def pad_or_trim(audio, target_length):
-    """Pad with zeros or trim audio to exact target length."""
-    if len(audio) >= target_length:
-        return audio[:target_length]
-    return np.pad(audio, (0, target_length - len(audio)), mode='constant')
+def slice_windows(audio, target_length, stride):
+    """Slice audio into overlapping windows of target_length with given stride.
+    The last window is always anchored at the end of the clip (the wake word endpoint)."""
+    if len(audio) <= target_length:
+        yield np.pad(audio, (target_length - len(audio), 0), mode='constant')
+        return
+    start = 0
+    while start + target_length <= len(audio):
+        yield audio[start:start + target_length]
+        start += stride
+    # always include the final window ending at the clip end
+    final_start = len(audio) - target_length
+    if final_start > start - stride:
+        yield audio[final_start:]
 
 
-def load_clips_from_dir(directory, clip_duration_sec=3.0, sr=16000):
-    """Load all wav files from a directory, pad/trim to fixed length."""
+def load_clips_from_dir(directory, clip_duration_sec=1.28, sr=16000, stride_sec=0.64):
+    """Load all wav files, generating sliding windows for clips longer than clip_duration_sec."""
     target_length = int(clip_duration_sec * sr)
+    stride = int(stride_sec * sr)
     clips = []
     files = sorted(glob.glob(os.path.join(directory, '*.wav')))
     if not files:
@@ -74,11 +84,12 @@ def load_clips_from_dir(directory, clip_duration_sec=3.0, sr=16000):
     for f in files:
         try:
             audio = load_wav_16k_mono(f)
-            audio = pad_or_trim(audio, target_length)
-            clips.append(audio)
+            for window in slice_windows(audio, target_length, stride):
+                clips.append(window)
         except Exception as e:
             logger.warning(f"Failed to load {f}: {e}")
 
+    logger.info(f"  -> {len(clips)} windows from {len(files)} files")
     return clips, files
 
 
@@ -181,15 +192,15 @@ def export_to_onnx(model, n_features, feature_dim, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Train custom openwakeword model')
-    parser.add_argument('--positive_dir', required=True)
-    parser.add_argument('--negative_dir', required=True)
+    parser.add_argument('--pos', required=True)
+    parser.add_argument('--neg', required=True)
+    parser.add_argument('--clip_duration', type=float, default=1.28)
     parser.add_argument('--model_name', default='oi_speaker')
     parser.add_argument('--output_dir', default='oi_speaker_model')
-    parser.add_argument('--clip_duration', type=float, default=1.0)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--augment_ratio', type=int, default=3)
+    parser.add_argument('--augment_ratio', type=int, default=0)
     parser.add_argument('--val_split', type=float, default=0.15)
     args = parser.parse_args()
 
@@ -200,14 +211,14 @@ def main():
     logger.info("Step 1: Loading audio clips")
     logger.info("=" * 60)
 
-    positive_clips, _ = load_clips_from_dir(args.positive_dir, args.clip_duration)
-    negative_clips, _ = load_clips_from_dir(args.negative_dir, args.clip_duration)
+    positive_clips, _ = load_clips_from_dir(args.pos, args.clip_duration)
+    negative_clips, _ = load_clips_from_dir(args.neg, args.clip_duration, stride_sec=args.clip_duration)
 
     if not positive_clips:
-        logger.error(f"No positive clips found in {args.positive_dir}")
+        logger.error(f"No positive clips found in {args.pos}")
         sys.exit(1)
     if not negative_clips:
-        logger.error(f"No negative clips found in {args.negative_dir}")
+        logger.error(f"No negative clips found in {args.neg}")
         sys.exit(1)
 
     logger.info(f"Loaded {len(positive_clips)} positive, {len(negative_clips)} negative")

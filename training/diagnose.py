@@ -151,7 +151,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",   default="models/openwakeword/oi_speaker.onnx")
     parser.add_argument("--compare", default=None, help="second model to overlay")
-    parser.add_argument("--pos", default="training/training_data/positive_samples_processed")
+    parser.add_argument("--pos", default="training/training_data/positive_samples")
     parser.add_argument("--neg", default="training/training_data/negative_samples")
     parser.add_argument("--pos-only", action="store_true", help="score positives only")
     parser.add_argument("--neg-only", action="store_true", help="score negatives only")

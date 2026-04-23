@@ -24,6 +24,23 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.optional-dependencies]
+training = [
+    "scipy",
+    "scikit-learn",
+    "torch",
+    "torchaudio",
+    "onnx",
+    "onnxscript",
+    "soxr",
+    "matplotlib",
+]
+cuda = [
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cuda-runtime-cu12",
+]
+
 [project.scripts]
 speaker = "speaker:main"
 

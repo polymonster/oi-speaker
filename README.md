@@ -11,8 +11,7 @@ Currently under development, this has been tested on Raspberry Pi 5 and macOS. B
 ```bash
 sudo apt-get install portaudio19-dev
 sudo apt-get install libspeexdsp-dev
-sudo apt-get install mpv
-sudo apt install libmpv-dev
+sudo apt-get install libmpv-dev
 ```
 
 ## Dependencies (macOS)
@@ -21,6 +20,11 @@ sudo apt install libmpv-dev
 brew install portaudio
 brew install mpv
 ```
+
+### CUDA (GPU inference)
+
+Install the [Cuda 12 Toolkit](https://developer.nvidia.com/cuda-12-0-0-download-archive) then:
+
 
 ## Python Version
 
@@ -56,6 +60,11 @@ python3.11 -m venv ~/oi-speaker-env
 
 [Installer](https://www.python.org/ftp/python/3.11.0/python-3.11.0rc2-amd64.exe)
 
+```bash
+# use versions elector
+py -3.11 -m pip
+```
+
 ## Python Dependencies
 
 Python deps are configured as part of the `pyproject.toml` setup your Python env and install as so:
@@ -64,17 +73,11 @@ Python deps are configured as part of the `pyproject.toml` setup your Python env
 python3.11 -m venv ~/oi-speaker-env
 source ~/oi-speaker-env/bin/activate
 pip install -e .
+# optional cuda
+pip install -e ".[cuda]"
 ```
 
-## Cuda Dependencies
-
-(Cuda 12 Toolkit)[https://developer.nvidia.com/cuda-12-0-0-download-archive]
-
-```
-pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-runtime-cu12
-```
-
-### Downloading Models
+## Downloading Models
 
 Some of the dependencies require additional downloads
 
@@ -111,6 +114,17 @@ journalctl -u oi-speaker@$USER -f
 
 ## Training
 
+Training of custom wake word is all located in this repo since the official training was fiddly to get working with dependendencies. 
+
+### Additional Dependencies
+```bash
+pip install -e ".[training]"
+```
+
+```bash
+pip install -e ".[training,cuda]"
+```
+
 Use Piper-TTS to generate random positive samples + add custom user generated ones.
 
 ### Generate Negative Samples
@@ -129,19 +143,15 @@ python oi-speaker/training/download-negatives.py \
 python training/generate-positives.py --count 200 --model .\models\piper\en_GB-northern_english_male-medium.onnx
 ```
 
-### Train on WSL / Linux
-
-#### Setup python env:
+### Setup python env:
 
 ```bash
 python3.10 -m venv venv_clean
 source venv_clean/bin/activate
-
-# Minimal deps — no tensorflow, no speechbrain, no piper
-pip install numpy scipy scikit-learn onnxruntime torch torchaudio onnx soxr onnxscript
+pip install -e ".[training]"
 ```
 
-#### Setup openWakeWord
+### Setup openWakeWord
 
 ```bash
 https://github.com/dscripka/openWakeWord
@@ -150,7 +160,7 @@ cd openWakeWord
 pip install -e . --no-deps
 ```
 
-#### Install onnx models in openWakeWord:
+### Install onnx models in openWakeWord:
 
 ```bash
 mkdir -p openWakeWord/openwakeword/resources/models
@@ -168,11 +178,12 @@ ls -la openWakeWord/openwakeword/resources/models/
 
 ```bash
 python oi-speaker/training/oi-speaker.py \
-    --positive_dir oww-training/positive_samples \
-    --negative_dir oww-training/negative_samples \
+    --positive_dir training/training_data/positive_samples \
+    --negative_dir training/training_data/negative_samples \
     --model_name oi_speaker \
     --epochs 100
 ```
+
 #### Diagnose
 
 Script can be run to diagnose model performance
