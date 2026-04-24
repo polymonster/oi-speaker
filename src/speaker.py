@@ -29,58 +29,10 @@ from enum import Enum, auto
 
 # TODO:
 # update function, check git and auto update
-# false_positive function, ask LLM to record it
-# positive function, ask LLM to record
-# mpv crash user after finish
 
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 480 # 30ms at 16kHz
-
-_log_buffer: deque = deque(maxlen=2000)
-_log_counter: int = 0
-_log_lock = threading.Lock()
-
-
-def log(text: str):
-    """Print to stdout and append to the web-accessible log buffer."""
-    global _log_counter
-    print(text)
-    with _log_lock:
-        _log_buffer.append({"index": _log_counter, "text": text, "ts": time.time()})
-        _log_counter += 1
-
-
-def get_log_lines(since: int = 0) -> dict:
-    with _log_lock:
-        lines = [l for l in _log_buffer if l["index"] > since]
-        total = _log_counter
-    return {"lines": lines, "total": total}
-
-
-class _Timer:
-    """Lap timer that prints interval and accumulated time at each named step."""
-    def __init__(self):
-        self._start: float | None = None
-        self._last: float | None = None
-
-    def start(self):
-        """Reset and start the timer (call on wake detection)."""
-        self._start = self._last = time.monotonic()
-
-    def lap(self, label: str, indent: str = ""):
-        """Print elapsed time since last lap and since start, then advance the lap mark."""
-        now = time.monotonic()
-        interval = now - self._last
-        total = now - self._start
-        log(f"{indent}[timing] {label}: +{interval:.2f}s  total={total:.2f}s")
-        self._last = now
-
-
-def start_timer():
-    global _timer
-    _timer.start()
-
 
 TOOLS = [
     {
@@ -132,6 +84,50 @@ TOOLS = [
         }
     }
 ]
+
+_log_buffer: deque = deque(maxlen=2000)
+_log_counter: int = 0
+_log_lock = threading.Lock()
+
+
+def log(text: str):
+    """Print to stdout and append to the web-accessible log buffer."""
+    global _log_counter
+    print(text)
+    with _log_lock:
+        _log_buffer.append({"index": _log_counter, "text": text, "ts": time.time()})
+        _log_counter += 1
+
+
+def get_log_lines(since: int = 0) -> dict:
+    with _log_lock:
+        lines = [l for l in _log_buffer if l["index"] > since]
+        total = _log_counter
+    return {"lines": lines, "total": total}
+
+
+class _Timer:
+    """Lap timer that prints interval and accumulated time at each named step."""
+    def __init__(self):
+        self._start: float | None = None
+        self._last: float | None = None
+
+    def start(self):
+        """Reset and start the timer (call on wake detection)."""
+        self._start = self._last = time.monotonic()
+
+    def lap(self, label: str, indent: str = ""):
+        """Print elapsed time since last lap and since start, then advance the lap mark."""
+        now = time.monotonic()
+        interval = now - self._last
+        total = now - self._start
+        log(f"{indent}[timing] {label}: +{interval:.2f}s  total={total:.2f}s")
+        self._last = now
+
+
+def start_timer():
+    global _timer
+    _timer.start()
 
 
 class SpeakerState(Enum):
