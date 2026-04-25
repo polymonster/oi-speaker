@@ -21,6 +21,7 @@ import wave
 import uvicorn
 import os
 
+from pathlib import Path
 from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
@@ -33,6 +34,14 @@ from enum import Enum, auto
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 480 # 30ms at 16kHz
+
+HISTORY_DIR = Path(".history") 
+CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
+PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
+PLAY_POSITIONS_PATH = HISTORY_DIR / "positions.json"
+HISTORY_LOAD_LIMIT = 30  # messages loaded into context on startup
+
+_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 TOOLS = [
     {
@@ -48,11 +57,12 @@ TOOLS = [
     },
     {
         "name": "play_url",
-        "description": "Stream audio from a URL via mpv.",
+        "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "The URL to play"},
+                "start_time": {"type": "number", "description": "Seconds from start to begin playback. Use the saved position from play history to resume where you left off."},
                 "headers": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -72,6 +82,68 @@ TOOLS = [
         "name": "web_search"
     },
     {
+        "name": "set_volume",
+        "description": "Set the system output volume. Use 0 to mute, 1-100 for a percentage level.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "integer", "description": "Volume level 0 (mute) to 100"}
+            },
+            "required": ["level"]
+        }
+    },
+    {
+        "name": "set_timer",
+        "description": "Set a named countdown timer. When it fires it plays an alarm and announces the name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "A short name for the timer, e.g. 'pasta'"},
+                "seconds": {"type": "integer", "description": "Duration in seconds"}
+            },
+            "required": ["name", "seconds"]
+        }
+    },
+    {
+        "name": "cancel_timer",
+        "description": "Cancel a named timer before it fires.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the timer to cancel"}
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "list_timers",
+        "description": "List all active timers and their remaining time.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "get_history",
+        "description": "Read recent chat or play history. Use type='chat' to recall past conversations, type='plays' to see recently played tracks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["chat", "plays"], "description": "Which history to read"},
+                "limit": {"type": "integer", "description": "Number of recent entries to return (default 20)"}
+            },
+            "required": ["type"]
+        }
+    },
+    {
+        "name": "update",
+        "description": "Update the speaker software from git and restart. Target can be 'latest' for the newest release tag, a tag name like 'v1.2', or a branch name like 'dev'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "'latest', a version tag, or a branch name"}
+            },
+            "required": ["target"]
+        }
+    },
+    {
         "name": "chat",
         "description": "Speak a plain-text response aloud via text-to-speech.",
         "input_schema": {
@@ -85,6 +157,63 @@ TOOLS = [
     }
 ]
 
+
+class _PerfTimer:
+    """Lap timer that prints interval and accumulated time at each named step."""
+    def __init__(self):
+        self._start: float | None = None
+        self._last: float | None = None
+
+    def start(self):
+        """Reset and start the timer (call on wake detection)."""
+        self._start = self._last = time.monotonic()
+
+    def lap(self, label: str, indent: str = ""):
+        """Print elapsed time since last lap and since start, then advance the lap mark."""
+        now = time.monotonic()
+        interval = now - self._last
+        total = now - self._start
+        log(f"{indent}[timing] {label}: +{interval:.2f}s  total={total:.2f}s")
+        self._last = now
+
+
+class SpeakerState(Enum):
+    TEXT_CHAT = auto()
+    LISTEN_FOR_WAKE = auto()
+    RECORDING = auto()
+    LLM_AGENT = auto()
+    RESET = auto()
+    CACHE_WAKE = auto()
+    VAD_RECORD = auto()
+
+
+@dataclass
+class SpeakerContext:
+    llm_client: any
+    system: str
+    voice_model: any
+    whisper_model: any
+    output_dev_index: int
+    output_sample_rate: int
+    wake_model: any
+    input_dev_index: int
+    input_sample_rate: int
+
+
+ctx: SpeakerContext | None = None
+chat_history: list[dict] = []  # {"role": "user"|"assistant", "text": str}
+speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
+_player_cmd_queue: queue.Queue = queue.Queue()
+_player_active: bool = False
+_current_play_url: str | None = None
+_play_positions: dict[str, float] = {}  # original url -> last position (seconds)
+_worker_mode: bool = False   # this instance serves RPC only, no local audio
+_worker_url: str | None = None  # delegate transcription/TTS to this worker base URL
+_interrupt: threading.Event = threading.Event()
+_shutdown: threading.Event = threading.Event()
+_perf_timer = _PerfTimer()
+_timers: dict[str, tuple[threading.Timer, float]] = {}  # name -> (timer, end_time)
+_timers_lock = threading.Lock()
 _log_buffer: deque = deque(maxlen=2000)
 _log_counter: int = 0
 _log_lock = threading.Lock()
@@ -106,61 +235,9 @@ def get_log_lines(since: int = 0) -> dict:
     return {"lines": lines, "total": total}
 
 
-class _Timer:
-    """Lap timer that prints interval and accumulated time at each named step."""
-    def __init__(self):
-        self._start: float | None = None
-        self._last: float | None = None
-
-    def start(self):
-        """Reset and start the timer (call on wake detection)."""
-        self._start = self._last = time.monotonic()
-
-    def lap(self, label: str, indent: str = ""):
-        """Print elapsed time since last lap and since start, then advance the lap mark."""
-        now = time.monotonic()
-        interval = now - self._last
-        total = now - self._start
-        log(f"{indent}[timing] {label}: +{interval:.2f}s  total={total:.2f}s")
-        self._last = now
-
-
-def start_timer():
-    global _timer
-    _timer.start()
-
-
-class SpeakerState(Enum):
-    TEXT_CHAT = auto()
-    LISTEN_FOR_WAKE = auto()
-    RECORDING = auto()
-    LLM_AGENT = auto()
-    RESET = auto()
-    CACHE_WAKE = auto()
-    VAD_RECORD = auto()
-
-
-@dataclass
-class SpeakerContext:
-    llm_client: any
-    system: str
-    voice_model: any
-    output_dev_index: int
-    output_sample_rate: int
-    wake_model: any
-    input_dev_index: int
-    input_sample_rate: int
-
-
-ctx: SpeakerContext | None = None
-chat_history: list[dict] = []  # {"role": "user"|"assistant", "text": str}
-speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
-_player_cmd_queue: queue.Queue = queue.Queue()
-_player_active: bool = False
-_interrupt: threading.Event = threading.Event()
-_shutdown: threading.Event = threading.Event()
-_timer = _Timer()
-_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+def start_perf_timer():
+    global _perf_timer
+    _perf_timer.start()
 
 
 def enumerate_audio_devices() -> dict:
@@ -354,7 +431,27 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
 
 
 def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
-    """Transcribe int16 audio to English text using Whisper."""
+    """Transcribe int16 audio to English text using Whisper, or delegate to worker."""
+    global _worker_url
+    if _worker_url:
+        import io as _io
+        buf = _io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(audio.tobytes())
+        try:
+            resp = requests.post(
+                f"{_worker_url}/rpc/transcribe",
+                files={"audio": ("audio.wav", buf.getvalue(), "audio/wav")},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json().get("text", "")
+        except Exception as e:
+            log(f"worker transcribe error: {e}")
+            return ""
     audio_float = audio.astype(np.float32) / 32768.0
     segments, _ = whisper_model.transcribe(audio_float, language="en", beam_size=1)
     return " ".join(segment.text for segment in segments)
@@ -365,7 +462,7 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     if tool_name == "search_youtube":
         return search_youtube(tool_input["query"]), None
     elif tool_name == "play_url":
-        play_url(tool_input["url"], tool_input.get("headers"))
+        play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0))
         return "playing", SpeakerState.RESET
     elif tool_name == "stop":
         stop_playback()
@@ -375,6 +472,18 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
         _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, tool_input["text"])
         next_state = SpeakerState.RECORDING if tool_input.get("follow_on") else SpeakerState.RESET
         return "spoken", next_state
+    elif tool_name == "set_volume":
+        return set_volume(tool_input["level"]), None
+    elif tool_name == "set_timer":
+        return set_timer(tool_input["name"], tool_input["seconds"]), None
+    elif tool_name == "cancel_timer":
+        return cancel_timer(tool_input["name"]), None
+    elif tool_name == "list_timers":
+        return list_timers(), None
+    elif tool_name == "get_history":
+        return get_history(tool_input["type"], tool_input.get("limit", 20)), None
+    elif tool_name == "update":
+        return update(tool_input["target"]), SpeakerState.RESET
     return "unknown tool", None
 
 
@@ -391,6 +500,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
     global _interrupt
     _interrupt.clear()
 
+    _history_start = len(chat_history)
     stop_flag = threading.Event()
     wake_thread = None
     if mic_stream is not None:
@@ -466,7 +576,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 for block in final_message.content:
                     if block.type == "tool_use":
                         log(f"\ttool: {block.name} {block.input}")
-                        _timer.lap(block.name, indent="\t")
+                        _perf_timer.lap(block.name, indent="\t")
                         result, state = _execute_tool(block.name, block.input)
                         if state is not None:
                             next_state = state
@@ -489,6 +599,8 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
         if wake_thread is not None:
             wake_thread.join(timeout=0.5)
         _interrupt.clear()
+        for entry in chat_history[_history_start:]:
+            _save_history(CHAT_HISTORY_PATH, entry)
 
 
 def _strip_markdown(text: str) -> str:
@@ -517,6 +629,32 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
     if not text:
         return
     if _interrupt.is_set():
+        return
+    if _worker_url:
+        import io as _io
+        try:
+            resp = requests.post(
+                f"{_worker_url}/rpc/speak",
+                json={"text": text},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            buf = _io.BytesIO(resp.content)
+            with wave.open(buf, 'rb') as wf:
+                sr = wf.getframerate()
+                raw = wf.readframes(wf.getnframes())
+            audio_int16 = np.frombuffer(raw, dtype=np.int16)
+        except Exception as e:
+            log(f"worker speak error: {e}")
+            return
+        resampled = _resample_audio(audio_int16, sr, sample_rate)
+        dev.play(resampled, samplerate=sample_rate, device=dev_index)
+        done = threading.Event()
+        threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
+        while not done.wait(timeout=0.05):
+            if _interrupt.is_set():
+                dev.stop()
+                return
         return
     chunks = []
     for audio_chunk in voice_model.synthesize(text):
@@ -556,14 +694,22 @@ def _player_loop():
     cleanup_dir: str | None = None
 
     def _stop():
-        global _player_active
+        global _player_active, _current_play_url
         nonlocal player, cleanup_dir
         if player is not None:
+            try:
+                pos = player.time_pos
+                if pos is not None and _current_play_url:
+                    _play_positions[_current_play_url] = pos
+                    _save_positions()
+            except Exception:
+                pass
             try:
                 player.terminate()
             except Exception:
                 pass
             player = None
+            _current_play_url = None
         if cleanup_dir is not None:
             try:
                 import shutil
@@ -580,18 +726,21 @@ def _player_loop():
             continue
 
         if cmd == 'play':
-            global _player_active
+            global _player_active, _current_play_url
             _stop()
-            url, headers = args[0], args[1]
+            url, headers, start_time, original_url = args[0], args[1], args[2], args[3]
             log(f"play_url: {url[:80]}...")
             player = mpv.MPV(vid=False, terminal=False,
                              user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
+            if start_time:
+                player['start'] = f'+{int(start_time)}'
             if headers:
                 for header in headers:
                     player.command("change-list", "http-header-fields", "append", header)
             player.play(url)
+            _current_play_url = original_url
             _player_active = True
 
         elif cmd == 'play_file':
@@ -626,7 +775,7 @@ def _player_loop():
             break
 
 
-def _resolve_youtube_and_play(url: str):
+def _resolve_youtube_and_play(url: str, start_time: float = 0.0):
     """Resolve a YouTube URL to a direct stream URL via yt-dlp and enqueue it for playback."""
     log("resolving youtube stream url...")
     result = subprocess.run(
@@ -642,7 +791,7 @@ def _resolve_youtube_and_play(url: str):
         log("yt-dlp: no stream url found")
         return
     log(f"streaming: {stream_url[:80]}...")
-    _player_cmd_queue.put(('play', stream_url, None))
+    _player_cmd_queue.put(('play', stream_url, None, start_time, url))
 
 
 def _download_youtube_and_play(url: str):
@@ -703,13 +852,31 @@ def resume_playback():
     _player_cmd_queue.put(('resume',))
 
 
-def play_url(url: str, headers: list[str] | None = None):
+def resolve_url(url: str) -> str:
+    """Resolve a URL to a direct streamable URL. For YouTube, uses yt-dlp. Other URLs pass through."""
+    if "youtube.com" not in url and "youtu.be" not in url:
+        return url
+    result = subprocess.run(
+        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
+         "--get-url", "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    stream_url = result.stdout.strip().splitlines()[0]
+    if not stream_url:
+        raise RuntimeError("yt-dlp returned no URL")
+    return stream_url
+
+
+def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0):
     """Stream audio from `url`, using yt-dlp resolution for YouTube URLs on Windows."""
+    _save_history(PLAY_HISTORY_PATH, {"url": url, "start_time": start_time})
     is_youtube = "youtube.com" in url or "youtu.be" in url
     if is_youtube:
-        threading.Thread(target=_resolve_youtube_and_play, args=(url,), daemon=True).start()
+        threading.Thread(target=_resolve_youtube_and_play, args=(url, start_time), daemon=True).start()
     else:
-        _player_cmd_queue.put(('play', url, headers))
+        _player_cmd_queue.put(('play', url, headers, start_time, url))
 
 
 def search_youtube(query: str, max_results: int = 5) -> str:
@@ -729,6 +896,174 @@ def search_youtube(query: str, max_results: int = 5) -> str:
                 "channel": item.get("channel") or item.get("uploader"),
             })
     return json.dumps(results)
+
+
+def set_volume(level: int) -> str:
+    level = max(0, min(100, level))
+    try:
+        if sys.platform == "linux":
+            if level == 0:
+                subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"], check=True)
+            else:
+                subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], check=True)
+                subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{level}%"], check=True)
+        elif sys.platform == "darwin":
+            subprocess.run(["osascript", "-e", f"set volume output volume {level}"], check=True)
+        elif sys.platform == "win32":
+            # Use nircmd if available, otherwise ctypes
+            result = subprocess.run(["nircmd", "setsysvolume", str(int(level / 100 * 65535))],
+                                    capture_output=True)
+            if result.returncode != 0:
+                import ctypes
+                from ctypes import POINTER, cast
+                from comtypes import CLSCTX_ALL
+                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                volume = cast(interface, POINTER(IAudioEndpointVolume))
+                if level == 0:
+                    volume.SetMute(1, None)
+                else:
+                    volume.SetMute(0, None)
+                    volume.SetMasterVolumeLevelScalar(level / 100, None)
+        return f"volume set to {level}"
+    except Exception as e:
+        log(f"set_volume error: {e}")
+        return f"error setting volume: {e}"
+
+
+def set_timer(name: str, seconds: int) -> str:
+    def _fire(timer_name: str):
+        log(f"timer fired: {timer_name}")
+        _play_oneshot_audio_file("sounds/midnight.wav")
+        if ctx is not None:
+            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
+                   f"{timer_name} timer done")
+        with _timers_lock:
+            _timers.pop(timer_name, None)
+
+    with _timers_lock:
+        existing = _timers.pop(name, None)
+        if existing:
+            existing[0].cancel()
+        end_time = time.time() + seconds
+        t = threading.Timer(seconds, _fire, args=(name,))
+        t.daemon = True
+        _timers[name] = (t, end_time)
+        t.start()
+
+    mins, secs = divmod(seconds, 60)
+    duration = f"{mins}m {secs}s" if mins else f"{secs}s"
+    return f"{name} timer set for {duration}"
+
+
+def cancel_timer(name: str) -> str:
+    with _timers_lock:
+        entry = _timers.pop(name, None)
+    if entry:
+        entry[0].cancel()
+        return f"{name} timer cancelled"
+    active = list(_timers.keys())
+    if active:
+        return f"no timer named '{name}'. Active timers: {', '.join(active)}"
+    return f"no timer named '{name}'"
+
+
+def list_timers() -> str:
+    with _timers_lock:
+        if not _timers:
+            return "no active timers"
+        now = time.time()
+        parts = []
+        for name, (_, end_time) in _timers.items():
+            remaining = max(0, int(end_time - now))
+            mins, secs = divmod(remaining, 60)
+            parts.append(f"{name}: {f'{mins}m {secs}s' if mins else f'{secs}s'} remaining")
+        return ", ".join(parts)
+
+
+def _save_history(path: Path, entry: dict):
+    path.parent.mkdir(exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps({**entry, "ts": time.time()}) + "\n")
+
+
+def _save_positions():
+    PLAY_POSITIONS_PATH.parent.mkdir(exist_ok=True)
+    PLAY_POSITIONS_PATH.write_text(json.dumps(_play_positions), encoding="utf-8")
+
+
+def _load_history(path: Path, limit: int) -> list[dict]:
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    entries = []
+    for line in lines[-limit:]:
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return entries
+
+
+def get_history(type: str, limit: int = 20) -> str:
+    path = CHAT_HISTORY_PATH if type == "chat" else PLAY_HISTORY_PATH
+    entries = _load_history(path, limit)
+    if not entries:
+        return f"no {type} history found"
+    if type == "plays":
+        for entry in entries:
+            pos = _play_positions.get(entry.get("url", ""))
+            if pos is not None:
+                entry["saved_position"] = round(pos)
+    return json.dumps(entries)
+
+
+def update(target: str) -> str:
+    try:
+        log(f"update: fetching tags...")
+        subprocess.run(["git", "fetch", "--tags"], check=True, capture_output=True)
+
+        if target == "latest":
+            result = subprocess.run(
+                ["git", "describe", "--tags", "--abbrev=0"],
+                capture_output=True, text=True, check=True
+            )
+            target = result.stdout.strip()
+            log(f"update: latest tag is {target}")
+
+        log(f"update: checking out {target}")
+        subprocess.run(["git", "checkout", target], check=True, capture_output=True)
+
+        # pull if on a branch
+        is_branch = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "HEAD"],
+            capture_output=True
+        ).returncode == 0
+        if is_branch:
+            subprocess.run(["git", "pull"], check=True, capture_output=True)
+
+        log("update: installing dependencies...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-e", ".", "-q"],
+                       check=True, capture_output=True)
+
+        log(f"update: done, restarting...")
+        if ctx is not None:
+            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
+                   f"Updated to {target}. Restarting now.")
+
+        if sys.platform == "linux":
+            import getpass
+            subprocess.Popen(["systemctl", "restart", f"oi-speaker@{getpass.getuser()}"])
+        else:
+            # on non-Linux, exit and let the user restart
+            threading.Timer(1.0, lambda: os._exit(0)).start()
+
+        return f"updated to {target}"
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode() if e.stderr else str(e)
+        log(f"update error: {err}")
+        return f"update failed: {err}"
 
 
 def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
@@ -770,7 +1105,7 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                     num_triggers=triggers,
                     buffer_duration=buffer_duration
                 )
-                _timer.start()
+                _perf_timer.start()
                 onset_remaining = ONSET_TIMEOUT
                 if record_dir:
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
@@ -792,9 +1127,9 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                     onset_remaining = ONSET_TIMEOUT
                     speaker_state = SpeakerState.RESET
                     continue
-                _timer.lap("recorded")
+                _perf_timer.lap("recorded")
                 transcribed_request = _transcribe_audio(whisper_model, audio_request)
-                _timer.lap("transcribed")
+                _perf_timer.lap("transcribed")
                 if not transcribed_request.strip():
                     onset_remaining -= onset_elapsed
                     log(f"empty transcription, onset budget remaining: {onset_remaining:.1f}s")
@@ -809,10 +1144,11 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 onset_remaining = ONSET_TIMEOUT
                 log(transcribed_request)
                 chat_history.append({"role": "user", "text": transcribed_request})
+                _save_history(CHAT_HISTORY_PATH, {"role": "user", "text": transcribed_request})
                 speaker_state = SpeakerState.LLM_AGENT
             elif speaker_state == SpeakerState.LLM_AGENT:
                 speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
-                _timer.lap("llm")
+                _perf_timer.lap("llm")
                 resume_playback()
             elif speaker_state == SpeakerState.RESET:
                 _flush_stream(stream, input_sample_rate)
@@ -826,13 +1162,62 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                 _write_wav(audio, input_sample_rate, filepath, gain=1.0)
 
 
-def start():
-    """Initialise all models and devices from config.toml and launch the background threads."""
-    log("oi! start!!")
-
+def _start_worker():
+    """Initialise only the inference models and serve RPC — no audio I/O, no background threads."""
     global ctx
     if ctx is not None:
         return
+    log("oi! worker mode!!")
+    with open("config.toml", "rb") as f:
+        config = tomllib.load(f)
+    inf = config.get("inference", {})
+    device = inf.get("device", "cpu")
+    compute = "float16" if device == "cuda" else "int8"
+    whisper_model = WhisperModel(
+        inf.get("whisper_model", "small"),
+        device=device,
+        compute_type=inf.get("whisper_compute", compute),
+    )
+    piper_model = config.get("voice", {}).get("model", "models/piper/en_GB-northern_english_male-medium.onnx")
+    voice_model = PiperVoice.load(piper_model)
+    ctx = SpeakerContext(
+        llm_client=None,
+        system="",
+        voice_model=voice_model,
+        whisper_model=whisper_model,
+        output_dev_index=0,
+        output_sample_rate=voice_model.config.sample_rate,
+        wake_model=None,
+        input_dev_index=0,
+        input_sample_rate=16000,
+    )
+    log("worker ready")
+
+
+def start():
+    """Initialise all models and devices from config.toml and launch the background threads."""
+    global ctx, _worker_mode, _worker_url
+
+    # Derive from sys.argv directly — immune to the double-import problem where
+    # python src/speaker.py runs as __main__ but web.py imports a second speaker instance.
+    _worker_mode = "--worker" in sys.argv
+    if "--worker-ip" in sys.argv:
+        idx = sys.argv.index("--worker-ip")
+        ip_arg = sys.argv[idx + 1]
+        _worker_url = f"http://{ip_arg}" if ":" in ip_arg else f"http://{ip_arg}:8000"
+
+    if _worker_mode:
+        _start_worker()
+        return
+
+    log("oi! start!!")
+
+    if ctx is not None:
+        return
+
+    chat_history.extend(_load_history(CHAT_HISTORY_PATH, HISTORY_LOAD_LIMIT))
+    if PLAY_POSITIONS_PATH.exists():
+        _play_positions.update(json.loads(PLAY_POSITIONS_PATH.read_text(encoding="utf-8")))
 
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
@@ -892,6 +1277,7 @@ def start():
         llm_client=llm_client,
         system=system,
         voice_model=voice_model,
+        whisper_model=whisper_model,
         output_dev_index=output_dev_index,
         output_sample_rate=output_sample_rate,
         wake_model=wake_model,
@@ -914,13 +1300,27 @@ def start():
 
 def main():
     """Entry point: start the speaker and serve the web UI via uvicorn."""
+    global _worker_mode, _worker_url
     log("oi! oi!!")
 
     if "--enum-audio" in sys.argv:
         log(json.dumps(enumerate_audio_devices(), indent=4))
         return
 
-    # main speaker loop / app
+    if "--worker" in sys.argv:
+        print("oi! worker!!")
+        _worker_mode = True
+
+    if "--worker-ip" in sys.argv:
+        idx = sys.argv.index("--worker-ip")
+        _worker_url = f"http://{sys.argv[idx + 1]}"
+        # append default port if none given
+        if ":" not in sys.argv[idx + 1]:
+            with open("config.toml", "rb") as _f:
+                _port_cfg = tomllib.load(_f)
+            _worker_url += f":{int(_port_cfg.get('network', {}).get('port', 8000))}"
+        log(f"using worker: {_worker_url}")
+
     sys.path.insert(0, str(__file__).replace("speaker.py", ""))
     from web import app
     with open("config.toml", "rb") as _f:

@@ -5,3 +5,4 @@ config.toml
 ~/
 training/training_data/
 training/scores/
+.history/

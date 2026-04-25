@@ -1,4 +1,6 @@
 import asyncio
+import io
+import struct
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -11,8 +13,10 @@ import socket
 import tomllib
 import tomli_w
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+import numpy as np
+import scipy.io.wavfile as wavfile
+from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from zeroconf import ServiceInfo
@@ -24,6 +28,16 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONFIG_PATH = Path("config.toml")
 
 _MDNS_TYPE = "_oi-speaker._tcp.local."
+
+
+class SpeakRequest(BaseModel):
+    text: str
+
+
+class ResolveRequest(BaseModel):
+    url: str
+
+
 _peers_lock = threading.Lock()
 _peers: dict[str, dict] = {}  # keyed by room name
 _zeroconf: AsyncZeroconf | None = None
@@ -88,7 +102,7 @@ async def lifespan(app: FastAPI):
         _svc_name,
         addresses=[socket.inet_aton(my_ip)],
         port=my_port,
-        properties={"name": my_name},
+        properties={"name": my_name, "role": "worker" if spk._worker_mode else "speaker"},
     )
     await _zeroconf.async_register_service(info)
     _browser = AsyncServiceBrowser(_zeroconf.zeroconf, _MDNS_TYPE, _PeerListener())
@@ -117,8 +131,10 @@ async def index():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    spk.chat_history.append({"role": "user", "text": req.text})
-    spk.start_timer()
+    entry = {"role": "user", "text": req.text}
+    spk.chat_history.append(entry)
+    spk._save_history(spk.CHAT_HISTORY_PATH, entry)
+    spk.start_perf_timer()
     loop = asyncio.get_event_loop()
     state = await loop.run_in_executor(None, spk.query_llm, spk.ctx.llm_client, spk.ctx.system, req.text)
     return {"response": f"[{state.value}]"}
@@ -198,3 +214,70 @@ async def proxy(peer_name: str, path: str, request: Request):
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "application/json"),
     )
+
+
+# ── RPC endpoints ────────────────────────────────────────────────────────────
+
+
+def _wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    # Streaming WAV header — data size set to max so clients don't need to seek.
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 0xFFFFFFFF, b"WAVE",
+        b"fmt ", 16, 1, num_channels,
+        sample_rate, byte_rate, block_align, bits_per_sample,
+        b"data", 0xFFFFFFFF,
+    )
+
+
+@app.post("/rpc/transcribe")
+async def rpc_transcribe(audio: UploadFile = File(...)):
+    """Accept a WAV file and return the transcribed text."""
+    if spk.ctx is None:
+        raise HTTPException(status_code=503, detail="speaker not ready")
+    data = await audio.read()
+    buf = io.BytesIO(data)
+    sr, audio_array = wavfile.read(buf)
+    if audio_array.ndim > 1:
+        audio_array = audio_array.mean(axis=1)
+    if audio_array.dtype in (np.float32, np.float64):
+        audio_array = (audio_array * 32767).astype(np.int16)
+    else:
+        audio_array = audio_array.astype(np.int16)
+    if sr != 16000:
+        import soxr
+        audio_array = (soxr.resample(audio_array.astype(np.float32) / 32767.0, sr, 16000) * 32767).astype(np.int16)
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(None, spk._transcribe_audio, spk.ctx.whisper_model, audio_array)
+    return {"text": text.strip()}
+
+
+@app.post("/rpc/speak")
+async def rpc_speak(req: SpeakRequest):
+    """Accept text and stream back a WAV audio response."""
+    if spk.ctx is None:
+        raise HTTPException(status_code=503, detail="speaker not ready")
+    voice_model = spk.ctx.voice_model
+    text = spk._strip_markdown(req.text)
+
+    def generate():
+        yield _wav_header(voice_model.config.sample_rate)
+        for chunk in voice_model.synthesize(text):
+            yield chunk.audio_int16_bytes
+
+    return StreamingResponse(generate(), media_type="audio/wav")
+
+
+@app.post("/rpc/resolve")
+async def rpc_resolve(req: ResolveRequest):
+    """Resolve a URL to a direct streamable URL (YouTube via yt-dlp, others pass through)."""
+    loop = asyncio.get_event_loop()
+    try:
+        resolved = await loop.run_in_executor(None, spk.resolve_url, req.url)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"url": resolved}
+
+
