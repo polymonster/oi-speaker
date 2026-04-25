@@ -251,7 +251,7 @@ async def rpc_transcribe(audio: UploadFile = File(...)):
         import soxr
         audio_array = (soxr.resample(audio_array.astype(np.float32) / 32767.0, sr, 16000) * 32767).astype(np.int16)
     loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, spk._transcribe_audio, spk.ctx.whisper_model, audio_array)
+    text = await loop.run_in_executor(None, spk._transcribe_audio, spk.ctx.whisper_model, audio_array, spk.ctx.worker_url)
     return {"text": text.strip()}
 
 
