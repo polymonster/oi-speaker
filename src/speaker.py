@@ -33,7 +33,7 @@ TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 480 # 30ms at 16kHz
 
-HISTORY_DIR = Path(".history") 
+HISTORY_DIR = Path(".history")
 CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
 PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
 HISTORY_LOAD_LIMIT = 30  # messages loaded into context on startup
@@ -473,10 +473,10 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
 
 
 
-def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
+def _transcribe_audio(whisper_model, audio: np.ndarray, worker_url: str | None = None) -> str:
     """Transcribe int16 audio to English text using Whisper, or delegate to worker."""
-    worker_url = ctx.worker_url if ctx else None
     if worker_url:
+        log(f"rpc transcribe to: {worker_url}")
         import io as _io
         buf = _io.BytesIO()
         with wave.open(buf, 'wb') as wf:
@@ -674,6 +674,7 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         return
     worker_url = ctx.worker_url if ctx else None
     if worker_url:
+        log(f"rpc speak to: {worker_url}")
         import io as _io
         try:
             resp = requests.post(
@@ -1147,7 +1148,7 @@ def _speak_loop(ctx):
             elif ctx.speaker_state == SpeakerState.RECORDING:
                 log(f"recording (onset budget: {onset_remaining:.1f}s)")
                 pause_playback()
-                _flush_stream(stream, ctx.input_sample_rate)
+                # _flush_stream(stream, ctx.input_sample_rate)
                 _wait_for_silence(stream, ctx.input_sample_rate)
                 audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
                 if audio_request is None:
@@ -1157,7 +1158,7 @@ def _speak_loop(ctx):
                     ctx.speaker_state = SpeakerState.RESET
                     continue
                 _perf_timer.lap("recorded")
-                transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request)
+                transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
                 _perf_timer.lap("transcribed")
                 if not transcribed_request.strip():
                     onset_remaining -= onset_elapsed
@@ -1234,6 +1235,7 @@ def start():
     worker_mode = "--worker" in sys.argv
     worker_url: str | None = None
     if "--worker-ip" in sys.argv:
+        log("oi! starting with help from worker")
         idx = sys.argv.index("--worker-ip")
         ip_arg = sys.argv[idx + 1]
         worker_url = f"http://{ip_arg}" if ":" in ip_arg else f"http://{ip_arg}:8000"
