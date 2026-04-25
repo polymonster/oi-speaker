@@ -237,6 +237,7 @@ async def rpc_transcribe(audio: UploadFile = File(...)):
     """Accept a WAV file and return the transcribed text."""
     if spk.ctx is None:
         raise HTTPException(status_code=503, detail="speaker not ready")
+    spk.log("rpc: transcribing for remote caller")
     data = await audio.read()
     buf = io.BytesIO(data)
     sr, audio_array = wavfile.read(buf)
@@ -259,6 +260,7 @@ async def rpc_speak(req: SpeakRequest):
     """Accept text and stream back a WAV audio response."""
     if spk.ctx is None:
         raise HTTPException(status_code=503, detail="speaker not ready")
+    spk.log(f"rpc: speaking for remote caller: {req.text[:60]}")
     voice_model = spk.ctx.voice_model
     text = spk._strip_markdown(req.text)
 

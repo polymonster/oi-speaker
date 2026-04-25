@@ -477,6 +477,7 @@ def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
     """Transcribe int16 audio to English text using Whisper, or delegate to worker."""
     worker_url = ctx.worker_url if ctx else None
     if worker_url:
+        log(f"delegating transcribe to worker: {worker_url}")
         import io as _io
         buf = _io.BytesIO()
         with wave.open(buf, 'wb') as wf:
@@ -674,6 +675,7 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         return
     worker_url = ctx.worker_url if ctx else None
     if worker_url:
+        log(f"delegating speak to worker: {worker_url} — {text[:60]}")
         import io as _io
         try:
             resp = requests.post(
@@ -772,12 +774,18 @@ def _player_loop():
                              demuxer_max_bytes="50MiB",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
-            if start_time:
-                player['start'] = f'+{int(start_time)}'
             if headers:
                 for header in headers:
                     player.command("change-list", "http-header-fields", "append", header)
             player.play(url)
+            if start_time:
+                def _seek(p=player, t=start_time):
+                    try:
+                        p.wait_until_playing(timeout=15)
+                        p.seek(t, 'absolute')
+                    except Exception as e:
+                        log(f"seek error: {e}")
+                threading.Thread(target=_seek, daemon=True).start()
             _player.current_url = original_url
             _player.active = True
 
