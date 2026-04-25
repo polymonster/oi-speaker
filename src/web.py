@@ -102,7 +102,7 @@ async def lifespan(app: FastAPI):
         _svc_name,
         addresses=[socket.inet_aton(my_ip)],
         port=my_port,
-        properties={"name": my_name, "role": "worker" if spk._worker_mode else "speaker"},
+        properties={"name": my_name, "role": "worker" if "--worker" in sys.argv else "speaker"},
     )
     await _zeroconf.async_register_service(info)
     _browser = AsyncServiceBrowser(_zeroconf.zeroconf, _MDNS_TYPE, _PeerListener())
@@ -180,8 +180,8 @@ async def status():
         _cfg = tomllib.load(f)
     port = int(_cfg.get("network", {}).get("port", 8000))
     return {
-        "state": spk.speaker_state.value,
-        "playing": spk._player_active,
+        "state": spk.ctx.speaker_state.value if spk.ctx else spk.SpeakerState.LISTEN_FOR_WAKE.value,
+        "playing": spk._player.active,
         "ip": _local_ip(),
         "port": port,
     }

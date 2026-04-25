@@ -25,11 +25,9 @@ from pathlib import Path
 from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
-# TODO:
-# update function, check git and auto update
 
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
@@ -38,7 +36,6 @@ VAD_CHUNK = 480 # 30ms at 16kHz
 HISTORY_DIR = Path(".history") 
 CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
 PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
-PLAY_POSITIONS_PATH = HISTORY_DIR / "positions.json"
 HISTORY_LOAD_LIMIT = 30  # messages loaded into context on startup
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
@@ -193,46 +190,92 @@ class SpeakerContext:
     system: str
     voice_model: any
     whisper_model: any
+    vad: any
     output_dev_index: int
     output_sample_rate: int
     wake_model: any
     input_dev_index: int
     input_sample_rate: int
+    worker_mode: bool = False
+    worker_url: str | None = None
+    speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
+    interrupt: threading.Event = field(default_factory=threading.Event)
+    shutdown: threading.Event = field(default_factory=threading.Event)
+
+
+class _Player:
+    def __init__(self):
+        self.cmd_queue: queue.Queue = queue.Queue()
+        self.active: bool = False
+        self.current_url: str | None = None
+
+
+class _Timers:
+    def __init__(self):
+        self._store: dict[str, tuple[threading.Timer, float]] = {}
+        self._lock = threading.Lock()
+
+    def set(self, name: str, timer: threading.Timer, end_time: float):
+        with self._lock:
+            existing = self._store.pop(name, None)
+            if existing:
+                existing[0].cancel()
+            self._store[name] = (timer, end_time)
+
+    def pop(self, name: str):
+        with self._lock:
+            return self._store.pop(name, None)
+
+    def remove(self, name: str):
+        with self._lock:
+            self._store.pop(name, None)
+
+    def keys(self):
+        with self._lock:
+            return list(self._store.keys())
+
+    def items(self):
+        with self._lock:
+            return list(self._store.items())
+
+    def __bool__(self):
+        with self._lock:
+            return bool(self._store)
+
+
+class _Log:
+    def __init__(self):
+        self._buffer: deque = deque(maxlen=2000)
+        self._counter: int = 0
+        self._lock = threading.Lock()
+
+    def append(self, text: str):
+        with self._lock:
+            self._buffer.append({"index": self._counter, "text": text, "ts": time.time()})
+            self._counter += 1
+
+    def get_since(self, since: int) -> dict:
+        with self._lock:
+            lines = [l for l in self._buffer if l["index"] > since]
+            total = self._counter
+        return {"lines": lines, "total": total}
 
 
 ctx: SpeakerContext | None = None
-chat_history: list[dict] = []  # {"role": "user"|"assistant", "text": str}
-speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
-_player_cmd_queue: queue.Queue = queue.Queue()
-_player_active: bool = False
-_current_play_url: str | None = None
-_play_positions: dict[str, float] = {}  # original url -> last position (seconds)
-_worker_mode: bool = False   # this instance serves RPC only, no local audio
-_worker_url: str | None = None  # delegate transcription/TTS to this worker base URL
-_interrupt: threading.Event = threading.Event()
-_shutdown: threading.Event = threading.Event()
+chat_history: list[dict] = []
+_player = _Player()
 _perf_timer = _PerfTimer()
-_timers: dict[str, tuple[threading.Timer, float]] = {}  # name -> (timer, end_time)
-_timers_lock = threading.Lock()
-_log_buffer: deque = deque(maxlen=2000)
-_log_counter: int = 0
-_log_lock = threading.Lock()
+_timers = _Timers()
+_log = _Log()
 
 
 def log(text: str):
-    """Print to stdout and append to the web-accessible log buffer."""
-    global _log_counter
     print(text)
-    with _log_lock:
-        _log_buffer.append({"index": _log_counter, "text": text, "ts": time.time()})
-        _log_counter += 1
+    _log.append(text)
 
 
 def get_log_lines(since: int = 0) -> dict:
-    with _log_lock:
-        lines = [l for l in _log_buffer if l["index"] > since]
-        total = _log_counter
-    return {"lines": lines, "total": total}
+    return _log.get_since(since)
 
 
 def start_perf_timer():
@@ -432,8 +475,8 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
 
 def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
     """Transcribe int16 audio to English text using Whisper, or delegate to worker."""
-    global _worker_url
-    if _worker_url:
+    worker_url = ctx.worker_url if ctx else None
+    if worker_url:
         import io as _io
         buf = _io.BytesIO()
         with wave.open(buf, 'wb') as wf:
@@ -443,7 +486,7 @@ def _transcribe_audio(whisper_model, audio: np.ndarray) -> str:
             wf.writeframes(audio.tobytes())
         try:
             resp = requests.post(
-                f"{_worker_url}/rpc/transcribe",
+                f"{worker_url}/rpc/transcribe",
                 files={"audio": ("audio.wav", buf.getvalue(), "audio/wav")},
                 timeout=30,
             )
@@ -497,8 +540,7 @@ def _split_sentences(text: str) -> tuple[list[str], str]:
 
 def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
     """Send `text` to the LLM, stream TTS as sentences arrive, handle tool calls, and return the next state."""
-    global _interrupt
-    _interrupt.clear()
+    ctx.interrupt.clear()
 
     _history_start = len(chat_history)
     stop_flag = threading.Event()
@@ -507,7 +549,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
         ctx.wake_model.reset()  # clear residual activation from the wake that triggered this session
         wake_thread = threading.Thread(
             target=_interrupt_wake_listen,
-            args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag),
+            args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag, ctx.interrupt),
             daemon=True
         )
         wake_thread.start()
@@ -528,7 +570,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 messages=messages
             ) as stream:
                 for delta in stream.text_stream:
-                    if _interrupt.is_set():
+                    if ctx.interrupt.is_set():
                         break
                     sentence_buffer += delta
                     accumulated_text += delta
@@ -542,16 +584,16 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                     for s in sentences:
                         if s.strip():
                             _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, s)
-                    if _interrupt.is_set():
+                    if ctx.interrupt.is_set():
                         return SpeakerState.RESET
 
-                if _interrupt.is_set():
+                if ctx.interrupt.is_set():
                     return SpeakerState.RESET
 
                 if sentence_buffer.strip():
                     _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, sentence_buffer)
 
-                if _interrupt.is_set():
+                if ctx.interrupt.is_set():
                     return SpeakerState.RESET
 
                 final_message = stream.get_final_message()
@@ -598,7 +640,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
         stop_flag.set()
         if wake_thread is not None:
             wake_thread.join(timeout=0.5)
-        _interrupt.clear()
+        ctx.interrupt.clear()
         for entry in chat_history[_history_start:]:
             _save_history(CHAT_HISTORY_PATH, entry)
 
@@ -624,17 +666,18 @@ def _strip_markdown(text: str) -> str:
 
 
 def _speak(dev, dev_index, sample_rate, voice_model, text: str):
-    """Synthesise `text` to audio and play it, stopping early if `_interrupt` is set."""
+    """Synthesise `text` to audio and play it, stopping early if interrupted."""
     text = _strip_markdown(text)
     if not text:
         return
-    if _interrupt.is_set():
+    if ctx is not None and ctx.interrupt.is_set():
         return
-    if _worker_url:
+    worker_url = ctx.worker_url if ctx else None
+    if worker_url:
         import io as _io
         try:
             resp = requests.post(
-                f"{_worker_url}/rpc/speak",
+                f"{worker_url}/rpc/speak",
                 json={"text": text},
                 timeout=30,
             )
@@ -652,7 +695,7 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         done = threading.Event()
         threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
         while not done.wait(timeout=0.05):
-            if _interrupt.is_set():
+            if ctx is not None and ctx.interrupt.is_set():
                 dev.stop()
                 return
         return
@@ -667,13 +710,13 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         done = threading.Event()
         threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
         while not done.wait(timeout=0.05):
-            if _interrupt.is_set():
+            if ctx is not None and ctx.interrupt.is_set():
                 dev.stop()
                 return
 
 
-def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event):
-    """Poll the wake model in a background thread and set `_interrupt` if the wake word is detected during TTS."""
+def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event, interrupt: threading.Event):
+    """Poll the wake model in a background thread and set `interrupt` if the wake word is detected during TTS."""
     score_window = deque(maxlen=5)
     while not stop_flag.is_set():
         audio_flat = _read_audio(stream, WAKE_CHUNK, input_sample_rate)
@@ -682,34 +725,26 @@ def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag
             score_window.append(score > 0.9)
             if sum(score_window) >= 3:
                 log("interrupt: wake word during TTS")
-                _interrupt.set()
+                interrupt.set()
                 return
 
 
 def _player_loop():
-    """Background thread: consume commands from `_player_cmd_queue` and drive the mpv player."""
+    """Background thread: consume commands from `_player.cmd_queue` and drive the mpv player."""
     log("oi!! player! loop!!")
 
     player: mpv.MPV | None = None
     cleanup_dir: str | None = None
 
     def _stop():
-        global _player_active, _current_play_url
         nonlocal player, cleanup_dir
         if player is not None:
-            try:
-                pos = player.time_pos
-                if pos is not None and _current_play_url:
-                    _play_positions[_current_play_url] = pos
-                    _save_positions()
-            except Exception:
-                pass
             try:
                 player.terminate()
             except Exception:
                 pass
             player = None
-            _current_play_url = None
+            _player.current_url = None
         if cleanup_dir is not None:
             try:
                 import shutil
@@ -717,21 +752,24 @@ def _player_loop():
             except Exception:
                 pass
             cleanup_dir = None
-        _player_active = False
+        _player.active = False
 
     while True:
         try:
-            cmd, *args = _player_cmd_queue.get(timeout=0.1)
+            cmd, *args = _player.cmd_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
         if cmd == 'play':
-            global _player_active, _current_play_url
             _stop()
             url, headers, start_time, original_url = args[0], args[1], args[2], args[3]
             log(f"play_url: {url[:80]}...")
             player = mpv.MPV(vid=False, terminal=False,
                              user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                             cache=True,
+                             cache_secs=30,
+                             audio_buffer=2,
+                             demuxer_max_bytes="50MiB",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             if start_time:
@@ -740,8 +778,8 @@ def _player_loop():
                 for header in headers:
                     player.command("change-list", "http-header-fields", "append", header)
             player.play(url)
-            _current_play_url = original_url
-            _player_active = True
+            _player.current_url = original_url
+            _player.active = True
 
         elif cmd == 'play_file':
             _stop()
@@ -751,7 +789,7 @@ def _player_loop():
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             player.play(path)
-            _player_active = True
+            _player.active = True
 
         elif cmd == 'stop':
             _stop()
@@ -791,7 +829,7 @@ def _resolve_youtube_and_play(url: str, start_time: float = 0.0):
         log("yt-dlp: no stream url found")
         return
     log(f"streaming: {stream_url[:80]}...")
-    _player_cmd_queue.put(('play', stream_url, None, start_time, url))
+    _player.cmd_queue.put(('play', stream_url, None, start_time, url))
 
 
 def _download_youtube_and_play(url: str):
@@ -813,7 +851,7 @@ def _download_youtube_and_play(url: str):
         log("yt-dlp: no output file found")
         return
     audio_file = os.path.join(tmpdir, files[0])
-    _player_cmd_queue.put(('play_file', audio_file, tmpdir))
+    _player.cmd_queue.put(('play_file', audio_file, tmpdir))
 
 
 def _play_oneshot_audio_file(path: str):
@@ -831,25 +869,27 @@ def _play_oneshot_audio_file(path: str):
 
 def stop_playback():
     """Stop active playback and signal any in-progress TTS to interrupt."""
-    _interrupt.set()
-    _player_cmd_queue.put(('stop',))
+    if ctx is not None:
+        ctx.interrupt.set()
+    _player.cmd_queue.put(('stop',))
 
 
 def shutdown():
     """Signal all background threads to exit cleanly."""
-    _shutdown.set()
-    _interrupt.set()
-    _player_cmd_queue.put(('quit',))
+    if ctx is not None:
+        ctx.shutdown.set()
+        ctx.interrupt.set()
+    _player.cmd_queue.put(('quit',))
 
 
 def pause_playback():
     """Pause the current mpv player."""
-    _player_cmd_queue.put(('pause',))
+    _player.cmd_queue.put(('pause',))
 
 
 def resume_playback():
     """Resume a paused mpv player."""
-    _player_cmd_queue.put(('resume',))
+    _player.cmd_queue.put(('resume',))
 
 
 def resolve_url(url: str) -> str:
@@ -876,7 +916,7 @@ def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0
     if is_youtube:
         threading.Thread(target=_resolve_youtube_and_play, args=(url, start_time), daemon=True).start()
     else:
-        _player_cmd_queue.put(('play', url, headers, start_time, url))
+        _player.cmd_queue.put(('play', url, headers, start_time, url))
 
 
 def search_youtube(query: str, max_results: int = 5) -> str:
@@ -939,18 +979,13 @@ def set_timer(name: str, seconds: int) -> str:
         if ctx is not None:
             _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
                    f"{timer_name} timer done")
-        with _timers_lock:
-            _timers.pop(timer_name, None)
+        _timers.remove(timer_name)
 
-    with _timers_lock:
-        existing = _timers.pop(name, None)
-        if existing:
-            existing[0].cancel()
-        end_time = time.time() + seconds
-        t = threading.Timer(seconds, _fire, args=(name,))
-        t.daemon = True
-        _timers[name] = (t, end_time)
-        t.start()
+    end_time = time.time() + seconds
+    t = threading.Timer(seconds, _fire, args=(name,))
+    t.daemon = True
+    _timers.set(name, t, end_time)
+    t.start()
 
     mins, secs = divmod(seconds, 60)
     duration = f"{mins}m {secs}s" if mins else f"{secs}s"
@@ -958,28 +993,26 @@ def set_timer(name: str, seconds: int) -> str:
 
 
 def cancel_timer(name: str) -> str:
-    with _timers_lock:
-        entry = _timers.pop(name, None)
+    entry = _timers.pop(name)
     if entry:
         entry[0].cancel()
         return f"{name} timer cancelled"
-    active = list(_timers.keys())
+    active = _timers.keys()
     if active:
         return f"no timer named '{name}'. Active timers: {', '.join(active)}"
     return f"no timer named '{name}'"
 
 
 def list_timers() -> str:
-    with _timers_lock:
-        if not _timers:
-            return "no active timers"
-        now = time.time()
-        parts = []
-        for name, (_, end_time) in _timers.items():
-            remaining = max(0, int(end_time - now))
-            mins, secs = divmod(remaining, 60)
-            parts.append(f"{name}: {f'{mins}m {secs}s' if mins else f'{secs}s'} remaining")
-        return ", ".join(parts)
+    if not _timers:
+        return "no active timers"
+    now = time.time()
+    parts = []
+    for name, (_, end_time) in _timers.items():
+        remaining = max(0, int(end_time - now))
+        mins, secs = divmod(remaining, 60)
+        parts.append(f"{name}: {f'{mins}m {secs}s' if mins else f'{secs}s'} remaining")
+    return ", ".join(parts)
 
 
 def _save_history(path: Path, entry: dict):
@@ -987,10 +1020,6 @@ def _save_history(path: Path, entry: dict):
     with open(path, "a") as f:
         f.write(json.dumps({**entry, "ts": time.time()}) + "\n")
 
-
-def _save_positions():
-    PLAY_POSITIONS_PATH.parent.mkdir(exist_ok=True)
-    PLAY_POSITIONS_PATH.write_text(json.dumps(_play_positions), encoding="utf-8")
 
 
 def _load_history(path: Path, limit: int) -> list[dict]:
@@ -1012,10 +1041,10 @@ def get_history(type: str, limit: int = 20) -> str:
     if not entries:
         return f"no {type} history found"
     if type == "plays":
+        now = time.time()
         for entry in entries:
-            pos = _play_positions.get(entry.get("url", ""))
-            if pos is not None:
-                entry["saved_position"] = round(pos)
+            elapsed = now - entry.get("ts", now)
+            entry["inferred_position"] = int(elapsed + entry.get("start_time", 0))
     return json.dumps(entries)
 
 
@@ -1052,13 +1081,14 @@ def update(target: str) -> str:
             _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
                    f"Updated to {target}. Restarting now.")
 
-        if sys.platform == "linux":
-            import getpass
-            subprocess.Popen(["systemctl", "restart", f"oi-speaker@{getpass.getuser()}"])
-        else:
-            # on non-Linux, exit and let the user restart
-            threading.Timer(1.0, lambda: os._exit(0)).start()
+        def _restart():
+            if "--service" in sys.argv:
+                import getpass
+                subprocess.run(["systemctl", "restart", f"oi-speaker@{getpass.getuser()}"])
+            else:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
 
+        threading.Timer(1.5, _restart).start()
         return f"updated to {target}"
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode() if e.stderr else str(e)
@@ -1066,11 +1096,10 @@ def update(target: str) -> str:
         return f"update failed: {err}"
 
 
-def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_rate):
+def _speak_loop(ctx):
     """Background thread: main state machine driving wake detection, recording, and LLM interaction."""
     log("oi!! speak! loop!!")
     _play_oneshot_audio_file("sounds/startup.m4a")
-    global speaker_state
 
     # training data capture
     wake_audio = None
@@ -1086,7 +1115,7 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     elif "--record-positives" in sys.argv:
         log("recording positives")
         record_dir = "training/training_data/recordings/positives"
-        speaker_state = SpeakerState.VAD_RECORD
+        ctx.speaker_state = SpeakerState.VAD_RECORD
         os.makedirs(record_dir, exist_ok=True)
 
     ONSET_TIMEOUT = 8.0
@@ -1094,13 +1123,13 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
     # the loop
     transcribed_request = ""
     onset_remaining = ONSET_TIMEOUT
-    with dev.InputStream(samplerate=input_sample_rate, channels=1, dtype='int16', device=input_dev_index) as stream:
-        while not _shutdown.is_set():
-            if speaker_state == SpeakerState.LISTEN_FOR_WAKE:
+    with dev.InputStream(samplerate=ctx.input_sample_rate, channels=1, dtype='int16', device=ctx.input_dev_index) as stream:
+        while not ctx.shutdown.is_set():
+            if ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
                 wake_audio = _listen_for_wake(
-                    wake_model,
+                    ctx.wake_model,
                     stream,
-                    input_sample_rate,
+                    ctx.input_sample_rate,
                     threshold=threshold,
                     num_triggers=triggers,
                     buffer_duration=buffer_duration
@@ -1111,55 +1140,55 @@ def _speak_loop(wake_model, vad, whisper_model, input_dev_index, input_sample_ra
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                     log(f"caching {filepath}")
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
-                    speaker_state = SpeakerState.LISTEN_FOR_WAKE
+                    ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
                     _play_oneshot_audio_file("sounds/wake.wav")
-                    speaker_state = SpeakerState.RECORDING
-            elif speaker_state == SpeakerState.RECORDING:
+                    ctx.speaker_state = SpeakerState.RECORDING
+            elif ctx.speaker_state == SpeakerState.RECORDING:
                 log(f"recording (onset budget: {onset_remaining:.1f}s)")
                 pause_playback()
-                _flush_stream(stream, input_sample_rate)
-                _wait_for_silence(stream, input_sample_rate)
-                audio_request, onset_elapsed = _record_until_silence(vad, stream, input_sample_rate, onset_timeout=onset_remaining)
+                _flush_stream(stream, ctx.input_sample_rate)
+                _wait_for_silence(stream, ctx.input_sample_rate)
+                audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
                 if audio_request is None:
                     log("onset timeout, returning to wake listen")
                     resume_playback()
                     onset_remaining = ONSET_TIMEOUT
-                    speaker_state = SpeakerState.RESET
+                    ctx.speaker_state = SpeakerState.RESET
                     continue
                 _perf_timer.lap("recorded")
-                transcribed_request = _transcribe_audio(whisper_model, audio_request)
+                transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request)
                 _perf_timer.lap("transcribed")
                 if not transcribed_request.strip():
                     onset_remaining -= onset_elapsed
                     log(f"empty transcription, onset budget remaining: {onset_remaining:.1f}s")
                     if onset_remaining > 0.5:
-                        speaker_state = SpeakerState.RECORDING
+                        ctx.speaker_state = SpeakerState.RECORDING
                     else:
                         log("onset budget exhausted, returning to wake listen")
                         resume_playback()
                         onset_remaining = ONSET_TIMEOUT
-                        speaker_state = SpeakerState.RESET
+                        ctx.speaker_state = SpeakerState.RESET
                     continue
                 onset_remaining = ONSET_TIMEOUT
                 log(transcribed_request)
                 chat_history.append({"role": "user", "text": transcribed_request})
                 _save_history(CHAT_HISTORY_PATH, {"role": "user", "text": transcribed_request})
-                speaker_state = SpeakerState.LLM_AGENT
-            elif speaker_state == SpeakerState.LLM_AGENT:
-                speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
+                ctx.speaker_state = SpeakerState.LLM_AGENT
+            elif ctx.speaker_state == SpeakerState.LLM_AGENT:
+                ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
                 _perf_timer.lap("llm")
                 resume_playback()
-            elif speaker_state == SpeakerState.RESET:
-                _flush_stream(stream, input_sample_rate)
-                wake_model.reset()
-                speaker_state = SpeakerState.LISTEN_FOR_WAKE
+            elif ctx.speaker_state == SpeakerState.RESET:
+                _flush_stream(stream, ctx.input_sample_rate)
+                ctx.wake_model.reset()
+                ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 log("return to listen for wake")
-            elif speaker_state == SpeakerState.VAD_RECORD:
-                audio = _vad_record(vad, stream, input_sample_rate)
+            elif ctx.speaker_state == SpeakerState.VAD_RECORD:
+                audio = _vad_record(ctx.vad, stream, ctx.input_sample_rate)
                 filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                 log(f"caching {filepath}")
-                _write_wav(audio, input_sample_rate, filepath, gain=1.0)
+                _write_wav(audio, ctx.input_sample_rate, filepath, gain=1.0)
 
 
 def _start_worker():
@@ -1185,28 +1214,31 @@ def _start_worker():
         system="",
         voice_model=voice_model,
         whisper_model=whisper_model,
+        vad=None,
         output_dev_index=0,
         output_sample_rate=voice_model.config.sample_rate,
         wake_model=None,
         input_dev_index=0,
         input_sample_rate=16000,
+        worker_mode=True,
     )
     log("worker ready")
 
 
 def start():
     """Initialise all models and devices from config.toml and launch the background threads."""
-    global ctx, _worker_mode, _worker_url
+    global ctx
 
     # Derive from sys.argv directly — immune to the double-import problem where
     # python src/speaker.py runs as __main__ but web.py imports a second speaker instance.
-    _worker_mode = "--worker" in sys.argv
+    worker_mode = "--worker" in sys.argv
+    worker_url: str | None = None
     if "--worker-ip" in sys.argv:
         idx = sys.argv.index("--worker-ip")
         ip_arg = sys.argv[idx + 1]
-        _worker_url = f"http://{ip_arg}" if ":" in ip_arg else f"http://{ip_arg}:8000"
+        worker_url = f"http://{ip_arg}" if ":" in ip_arg else f"http://{ip_arg}:8000"
 
-    if _worker_mode:
+    if worker_mode:
         _start_worker()
         return
 
@@ -1216,8 +1248,6 @@ def start():
         return
 
     chat_history.extend(_load_history(CHAT_HISTORY_PATH, HISTORY_LOAD_LIMIT))
-    if PLAY_POSITIONS_PATH.exists():
-        _play_positions.update(json.loads(PLAY_POSITIONS_PATH.read_text(encoding="utf-8")))
 
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
@@ -1238,51 +1268,40 @@ def start():
             suffix = f" ({extra})" if extra else ""
             system += f"- [{hint['category']}] {hint['name']}: {value}{suffix}\n"
 
-    # wake
-    wake_model = Model(
-        inference_framework="onnx",
-        wakeword_models=["models/openwakeword/oi_speaker.onnx"],
-        vad_threshold=0.5,
-        enable_speex_noise_suppression=False
-    )
-
-    # vad
-    vad = webrtcvad.Vad(3)
-
-    # whisper
+    # whisper config
     inf = config.get("inference", {})
     device = inf.get("device", "cpu")
     compute = "int8"
     if device == "cuda":
         compute = "float16"
-    whisper_model = WhisperModel(
-        inf.get("whisper_model", "small"),
-        device=device,
-        compute_type=inf.get("whisper_compute", compute)
-    )
 
-    llm_client = anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"])
-    voice_model = PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx")
-
+    # audio config
     if "--verbose" in sys.argv:
         log(json.dumps(enumerate_audio_devices(), indent=4))
     input_dev_info = _get_audio_device_index(config["audio"]["input_device"])
     output_dev_info = _get_audio_device_index(config["audio"]["output_device"])
-    input_dev_index = int(input_dev_info['index'])
-    input_sample_rate = int(input_dev_info['default_samplerate'])
-    output_dev_index = int(output_dev_info['index'])
-    output_sample_rate = int(output_dev_info['default_samplerate'])
 
     ctx = SpeakerContext(
-        llm_client=llm_client,
+        llm_client=anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"]),
         system=system,
-        voice_model=voice_model,
-        whisper_model=whisper_model,
-        output_dev_index=output_dev_index,
-        output_sample_rate=output_sample_rate,
-        wake_model=wake_model,
-        input_dev_index=input_dev_index,
-        input_sample_rate=input_sample_rate,
+        wake_model=Model(
+            inference_framework="onnx",
+            wakeword_models=["models/openwakeword/oi_speaker.onnx"],
+            vad_threshold=0.5,
+            enable_speex_noise_suppression=False
+        ),
+        voice_model=PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx"),
+        whisper_model=WhisperModel(
+            inf.get("whisper_model", "small"),
+            device=device,
+            compute_type=inf.get("whisper_compute", compute)
+        ),
+        vad=webrtcvad.Vad(3),
+        input_dev_index=int(input_dev_info['index']),
+        input_sample_rate=int(input_dev_info['default_samplerate']),
+        output_dev_index=int(output_dev_info['index']),
+        output_sample_rate=int(output_dev_info['default_samplerate']),
+        worker_url=worker_url,
     )
 
     threading.Thread(
@@ -1292,7 +1311,7 @@ def start():
 
     threading.Thread(
         target=_speak_loop,
-        args=(wake_model, vad, whisper_model, input_dev_index, input_sample_rate),
+        args=(ctx,),
         daemon=True
     ).start()
 
@@ -1300,26 +1319,11 @@ def start():
 
 def main():
     """Entry point: start the speaker and serve the web UI via uvicorn."""
-    global _worker_mode, _worker_url
     log("oi! oi!!")
 
     if "--enum-audio" in sys.argv:
         log(json.dumps(enumerate_audio_devices(), indent=4))
         return
-
-    if "--worker" in sys.argv:
-        print("oi! worker!!")
-        _worker_mode = True
-
-    if "--worker-ip" in sys.argv:
-        idx = sys.argv.index("--worker-ip")
-        _worker_url = f"http://{sys.argv[idx + 1]}"
-        # append default port if none given
-        if ":" not in sys.argv[idx + 1]:
-            with open("config.toml", "rb") as _f:
-                _port_cfg = tomllib.load(_f)
-            _worker_url += f":{int(_port_cfg.get('network', {}).get('port', 8000))}"
-        log(f"using worker: {_worker_url}")
 
     sys.path.insert(0, str(__file__).replace("speaker.py", ""))
     from web import app

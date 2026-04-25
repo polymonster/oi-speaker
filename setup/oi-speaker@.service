@@ -8,7 +8,7 @@ Type=simple
 User=%i
 WorkingDirectory=%h/dev/oi-speaker
 ExecStartPre=/usr/bin/pulseaudio --start
-ExecStart=%h/.pyenv/shims/python -u src/speaker.py --verbose
+ExecStart=%h/.pyenv/shims/python -u src/speaker.py --verbose --service
 Environment=PYTHONUNBUFFERED=1
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
