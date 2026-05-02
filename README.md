@@ -114,7 +114,7 @@ journalctl -u oi-speaker@$USER -f
 
 ## Training
 
-Training of custom wake word is all located in this repo since the official training was fiddly to get working with dependendencies. 
+Training of custom wake word is all located in this repo since the official training was fiddly to get working with dependendencies.
 
 ### Additional Dependencies
 ```bash
@@ -191,3 +191,4 @@ Script can be run to diagnose model performance
 ```bash
 python training/diagnose.py --pos training/training_data/positive_samples_processed --neg training/training_data/negative_samples
 ```
+
