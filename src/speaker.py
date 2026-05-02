@@ -691,8 +691,12 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 continue
 
             if final_message.stop_reason == "tool_use":
-                # Remove live entry if nothing was streamed (chat tool will add its own entry)
-                if _live_entry is not None and not accumulated_text.strip():
+                # Remove live entry if nothing was streamed, or if the chat tool will add its own entry
+                chat_tool_used = any(
+                    block.type == "tool_use" and block.name == "chat"
+                    for block in final_message.content
+                )
+                if _live_entry is not None and (not accumulated_text.strip() or chat_tool_used):
                     chat_history.remove(_live_entry)
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
