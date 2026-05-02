@@ -38,6 +38,10 @@ class ResolveRequest(BaseModel):
     url: str
 
 
+class SyncConfigRequest(BaseModel):
+    peer_name: str
+
+
 _peers_lock = threading.Lock()
 _peers: dict[str, dict] = {}  # keyed by room name
 _zeroconf: AsyncZeroconf | None = None
@@ -145,15 +149,25 @@ async def history():
     return spk.chat_history
 
 
+@app.get("/play-history")
+async def play_history(limit: int = 100):
+    return spk._load_history(spk.PLAY_HISTORY_PATH, limit)
+
+
 @app.get("/audio-devices")
 async def audio_devices():
     return spk.enumerate_audio_devices()
 
 
+_DEFAULT_CONFIDENTIAL = ["llm.anthropic_api_key"]
+
 @app.get("/settings")
 async def get_settings():
     with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
+        cfg = tomllib.load(f)
+    meta = cfg.setdefault("meta", {})
+    meta.setdefault("confidential", _DEFAULT_CONFIDENTIAL)
+    return cfg
 
 
 @app.post("/settings")
@@ -270,6 +284,29 @@ async def rpc_speak(req: SpeakRequest):
             yield chunk.audio_int16_bytes
 
     return StreamingResponse(generate(), media_type="audio/wav")
+
+
+_LOCAL_ONLY_SECTIONS = {"audio", "network"}
+
+@app.post("/rpc/sync-config")
+async def rpc_sync_config(req: SyncConfigRequest):
+    """Pull config from a peer and apply it locally, preserving audio + network sections."""
+    with _peers_lock:
+        peer = _peers.get(req.peer_name)
+    if not peer or not peer["online"]:
+        raise HTTPException(status_code=404, detail=f"peer '{req.peer_name}' not found or offline")
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"http://{peer['ip']}:{peer['port']}/settings", timeout=10.0)
+        resp.raise_for_status()
+    remote_cfg: dict = resp.json()
+    with open(CONFIG_PATH, "rb") as f:
+        local_cfg = tomllib.load(f)
+    for section in _LOCAL_ONLY_SECTIONS:
+        if section in local_cfg:
+            remote_cfg[section] = local_cfg[section]
+    with open(CONFIG_PATH, "wb") as f:
+        f.write(tomli_w.dumps(remote_cfg).encode())
+    return {"ok": True}
 
 
 @app.post("/rpc/resolve")

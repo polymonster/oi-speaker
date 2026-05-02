@@ -59,6 +59,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "The URL to play"},
+                "title": {"type": "string", "description": "Human-readable title for this track (e.g. the title from search results). Used in play history."},
                 "start_time": {"type": "number", "description": "Seconds from start to begin playback. Use the saved position from play history to resume where you left off."},
                 "headers": {
                     "type": "array",
@@ -264,6 +265,7 @@ class _Log:
 ctx: SpeakerContext | None = None
 chat_history: list[dict] = []
 _player = _Player()
+_duck_volume: int = 0
 _perf_timer = _PerfTimer()
 _timers = _Timers()
 _log = _Log()
@@ -505,7 +507,7 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     if tool_name == "search_youtube":
         return search_youtube(tool_input["query"]), None
     elif tool_name == "play_url":
-        play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0))
+        play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
         return "playing", SpeakerState.RESET
     elif tool_name == "stop":
         stop_playback()
@@ -776,15 +778,9 @@ def _player_loop():
             if headers:
                 for header in headers:
                     player.command("change-list", "http-header-fields", "append", header)
-            player.play(url)
             if start_time:
-                def _seek(p=player, t=start_time):
-                    try:
-                        p.wait_until_playing(timeout=15)
-                        p.seek(t, 'absolute')
-                    except Exception as e:
-                        log(f"seek error: {e}")
-                threading.Thread(target=_seek, daemon=True).start()
+                player['start'] = str(int(start_time))
+            player.play(url)
             _player.current_url = original_url
             _player.active = True
 
@@ -815,26 +811,48 @@ def _player_loop():
                 except Exception:
                     pass
 
+        elif cmd == 'duck':
+            if player is not None:
+                try:
+                    player.volume = args[0]
+                except Exception:
+                    pass
+
+        elif cmd == 'unduck':
+            if player is not None:
+                try:
+                    player.volume = 100
+                except Exception:
+                    pass
+
         elif cmd == 'quit':
             _stop()
             break
 
 
-def _resolve_youtube_and_play(url: str, start_time: float = 0.0):
+def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | None = None):
     """Resolve a YouTube URL to a direct stream URL via yt-dlp and enqueue it for playback."""
     log("resolving youtube stream url...")
     result = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
-         "--get-url", "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
+         "--print", "url", "--print", "%(title)s",
+         "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
         capture_output=True, text=True
     )
     if result.returncode != 0:
         log(f"yt-dlp error: {result.stderr}")
         return
-    stream_url = result.stdout.strip().splitlines()[0]
+    lines = result.stdout.strip().splitlines()
+    stream_url = lines[0] if lines else ""
     if not stream_url:
         log("yt-dlp: no stream url found")
         return
+    if title is None and len(lines) > 1:
+        title = lines[1]
+    entry: dict = {"url": url, "start_time": start_time}
+    if title:
+        entry["title"] = title
+    _save_history(PLAY_HISTORY_PATH, entry)
     log(f"streaming: {stream_url[:80]}...")
     _player.cmd_queue.put(('play', stream_url, None, start_time, url))
 
@@ -899,6 +917,16 @@ def resume_playback():
     _player.cmd_queue.put(('resume',))
 
 
+def duck_playback():
+    """Reduce mpv player volume to _duck_volume (0 = silent, 100 = full)."""
+    _player.cmd_queue.put(('duck', _duck_volume))
+
+
+def unduck_playback():
+    """Restore mpv player volume to full after ducking."""
+    _player.cmd_queue.put(('unduck',))
+
+
 def resolve_url(url: str) -> str:
     """Resolve a URL to a direct streamable URL. For YouTube, uses yt-dlp. Other URLs pass through."""
     if "youtube.com" not in url and "youtu.be" not in url:
@@ -916,13 +944,17 @@ def resolve_url(url: str) -> str:
     return stream_url
 
 
-def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0):
+def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0, title: str | None = None):
     """Stream audio from `url`, using yt-dlp resolution for YouTube URLs on Windows."""
-    _save_history(PLAY_HISTORY_PATH, {"url": url, "start_time": start_time})
     is_youtube = "youtube.com" in url or "youtu.be" in url
     if is_youtube:
-        threading.Thread(target=_resolve_youtube_and_play, args=(url, start_time), daemon=True).start()
+        _player.cmd_queue.put(('stop',))
+        threading.Thread(target=_resolve_youtube_and_play, args=(url, start_time, title), daemon=True).start()
     else:
+        entry: dict = {"url": url, "start_time": start_time}
+        if title:
+            entry["title"] = title
+        _save_history(PLAY_HISTORY_PATH, entry)
         _player.cmd_queue.put(('play', url, headers, start_time, url))
 
 
@@ -1153,13 +1185,13 @@ def _speak_loop(ctx):
                     ctx.speaker_state = SpeakerState.RECORDING
             elif ctx.speaker_state == SpeakerState.RECORDING:
                 log(f"recording (onset budget: {onset_remaining:.1f}s)")
-                pause_playback()
+                duck_playback()
                 # _flush_stream(stream, ctx.input_sample_rate)
                 _wait_for_silence(stream, ctx.input_sample_rate)
                 audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
                 if audio_request is None:
                     log("onset timeout, returning to wake listen")
-                    resume_playback()
+                    unduck_playback()
                     onset_remaining = ONSET_TIMEOUT
                     ctx.speaker_state = SpeakerState.RESET
                     continue
@@ -1173,7 +1205,7 @@ def _speak_loop(ctx):
                         ctx.speaker_state = SpeakerState.RECORDING
                     else:
                         log("onset budget exhausted, returning to wake listen")
-                        resume_playback()
+                        unduck_playback()
                         onset_remaining = ONSET_TIMEOUT
                         ctx.speaker_state = SpeakerState.RESET
                     continue
@@ -1185,7 +1217,7 @@ def _speak_loop(ctx):
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
                 ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
                 _perf_timer.lap("llm")
-                resume_playback()
+                unduck_playback()
             elif ctx.speaker_state == SpeakerState.RESET:
                 _flush_stream(stream, ctx.input_sample_rate)
                 ctx.wake_model.reset()
@@ -1284,10 +1316,13 @@ def start():
         compute = "float16"
 
     # audio config
+    global _duck_volume
     if "--verbose" in sys.argv:
         log(json.dumps(enumerate_audio_devices(), indent=4))
-    input_dev_info = _get_audio_device_index(config["audio"]["input_device"])
-    output_dev_info = _get_audio_device_index(config["audio"]["output_device"])
+    audio_cfg = config["audio"]
+    _duck_volume = max(0, min(100, int(audio_cfg.get("duck_volume", 0))))
+    input_dev_info = _get_audio_device_index(audio_cfg["input_device"])
+    output_dev_info = _get_audio_device_index(audio_cfg["output_device"])
 
     ctx = SpeakerContext(
         llm_client=anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"]),

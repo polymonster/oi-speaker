@@ -5,18 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>oi-speaker</title>
 <style>
+  @font-face {
+    font-family: 'Cousine';
+    src: url('/static/fonts/Cousine-Regular.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+  }
   * { box-sizing: border-box; }
   html, body { height: 100%; overflow: hidden; }
-  body { font-family: monospace; background: #111; color: #eee; padding: 0 16px; display: flex; flex-direction: column; font-size: 18px; }
+  body { font-family: 'Cousine', monospace; background: #111; color: #eee; padding: 0 16px; display: flex; flex-direction: column; font-size: 18px; }
   h1 { color: #eee; font-size: 1.2em; margin: 16px 0 2px; }
   #host-ip { color: #333; font-size: 0.9em; margin-bottom: 12px; }
   nav { display: flex; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid #222; padding-bottom: 10px; }
-  nav button { background: none; border: none; color: #555; padding: 4px 12px; cursor: pointer; font-family: monospace; font-size: 1em; }
+  nav button { background: none; border: none; color: #555; padding: 4px 12px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 1em; }
   nav button.active { color: #eee; border-bottom: 2px solid #eee; }
 
   /* console */
   #console-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
-  #console-toolbar button { background: none; border: 1px solid #333; color: #555; padding: 4px 10px; cursor: pointer; font-family: monospace; font-size: 0.85em; }
+  #console-toolbar button { background: none; border: 1px solid #333; color: #555; padding: 4px 10px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 0.85em; }
   #console-toolbar button:hover { border-color: #555; color: #eee; }
   #console-log { flex: 1; overflow-y: auto; border: 1px solid #222; padding: 10px 14px; font-size: 0.82em; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
   .log-line { color: #aaa; }
@@ -33,9 +39,9 @@
   .msg.bot { color: #afa; }
   .msg.bot.action { color: #fa7; }
   #chat-form { display: flex; gap: 8px; padding-bottom: 16px; }
-  #chat-input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 10px 14px; font-family: monospace; font-size: 1em; outline: none; }
+  #chat-input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 10px 14px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; }
   #chat-input:focus { border-color: #555; }
-  .send-btn { background: #222; border: 1px solid #444; color: #eee; padding: 10px 18px; cursor: pointer; font-family: monospace; font-size: 1em; }
+  .send-btn { background: #222; border: 1px solid #444; color: #eee; padding: 10px 18px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 1em; }
   .send-btn:hover { background: #2a2a2a; }
 
   /* settings */
@@ -43,28 +49,33 @@
   .hint-row { min-width: max-content; }
   .setting { margin-bottom: 14px; }
   .setting label { display: block; color: #666; font-size: 0.85em; margin-bottom: 4px; }
-  .setting input, .setting select { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: monospace; font-size: 1em; outline: none; }
+  .setting input, .setting select { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; }
   .setting input:focus, .setting select:focus { border-color: #555; }
+  .secret-wrap { display: flex; }
+  .secret-wrap input { flex: 1; border-right: none; }
+  .eye-btn { background: #1a1a1a; border: 1px solid #333; border-left: none; color: #444; padding: 0 10px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; }
+  .eye-btn:hover { color: #aaa; }
+  .eye-btn svg { display: block; }
   .setting select { appearance: none; cursor: pointer; }
   .section-header { color: #444; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.1em; margin: 20px 0 10px; border-bottom: 1px solid #1e1e1e; padding-bottom: 6px; }
   .hint-block { margin-bottom: 8px; }
   .hint-row { display: flex; gap: 8px; align-items: center; }
   .hint-row + .hint-row { margin-top: 4px; }
-  .hint-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: monospace; font-size: 1em; outline: none; }
+  .hint-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; }
   .hint-row input:focus { border-color: #555; }
   .hint-row .name-input { width: 130px; flex-shrink: 0; }
   .hint-row .cat-input  { width: 90px; flex-shrink: 0; }
   .hint-row .val-input  { flex: 1; }
   .hint-row .extra-input { flex: 1; color: #aaa; }
-  .rm-btn { background: none; border: 1px solid #333; color: #555; padding: 8px 10px; cursor: pointer; font-family: monospace; flex-shrink: 0; }
+  .rm-btn { background: none; border: 1px solid #333; color: #555; padding: 8px 10px; cursor: pointer; font-family: 'Cousine', monospace; flex-shrink: 0; }
   .rm-btn:hover { border-color: #a44; color: #f66; }
-  .extra-btn { background: none; border: none; color: #444; padding: 8px 4px; cursor: pointer; font-family: monospace; font-size: 0.85em; flex-shrink: 0; white-space: nowrap; }
+  .extra-btn { background: none; border: none; color: #444; padding: 8px 4px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 0.85em; flex-shrink: 0; white-space: nowrap; }
   .extra-btn:hover { color: #888; }
-  .add-btn { background: none; border: 1px solid #333; color: #555; padding: 8px 14px; cursor: pointer; font-family: monospace; margin-top: 4px; }
+  .add-btn { background: none; border: 1px solid #333; color: #555; padding: 8px 14px; cursor: pointer; font-family: 'Cousine', monospace; margin-top: 4px; }
   .add-btn:hover { border-color: #555; color: #eee; }
-  #save-btn { background: #222; border: 1px solid #444; color: #eee; padding: 10px 20px; cursor: pointer; font-family: monospace; margin-top: 16px; font-size: 1em; }
+  #save-btn { background: #222; border: 1px solid #444; color: #eee; padding: 10px 20px; cursor: pointer; font-family: 'Cousine', monospace; margin-top: 16px; font-size: 1em; }
   #save-btn:hover { background: #2a2a2a; }
-  #cancel-btn { display: none; background: none; border: 1px solid #444; color: #888; padding: 10px 20px; cursor: pointer; font-family: monospace; margin-top: 16px; font-size: 1em; margin-left: 8px; }
+  #cancel-btn { display: none; background: none; border: 1px solid #444; color: #888; padding: 10px 20px; cursor: pointer; font-family: 'Cousine', monospace; margin-top: 16px; font-size: 1em; margin-left: 8px; }
   #cancel-btn:hover { color: #eee; border-color: #666; }
   #save-feedback { color: #afa; font-size: 0.9em; margin-left: 12px; opacity: 0; transition: opacity 0.3s; }
 
@@ -75,8 +86,16 @@
   .peer-status { font-size: 0.8em; padding: 2px 8px; border: 1px solid; flex-shrink: 0; }
   .peer-status.online { color: #afa; border-color: #afa; }
   .peer-status.offline { color: #555; border-color: #333; }
-  .peer-open { background: none; border: 1px solid #444; color: #888; padding: 6px 14px; cursor: pointer; font-family: monospace; font-size: 0.9em; flex-shrink: 0; }
+  .peer-open { background: none; border: 1px solid #444; color: #888; padding: 6px 14px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 0.9em; flex-shrink: 0; }
   .peer-open:hover { border-color: #888; color: #eee; }
+
+  /* history */
+  #history-list { flex: 1; overflow-y: auto; border: 1px solid #222; padding: 10px 14px; }
+  .play-entry { display: flex; align-items: baseline; gap: 12px; padding: 5px 0; border-bottom: 1px solid #1a1a1a; }
+  .play-entry:last-child { border-bottom: none; }
+  .play-ts { color: #444; font-size: 0.78em; white-space: nowrap; flex-shrink: 0; }
+  .play-link { color: #7af; text-decoration: none; font-size: 0.88em; word-break: break-all; }
+  .play-link:hover { color: #adf; text-decoration: underline; }
 
   /* desktop overrides */
   @media (min-width: 768px) {
@@ -87,6 +106,7 @@
     #chat-log { flex: none; height: 420px; }
     #chat-form { padding-bottom: 0; }
     #console-log { height: 520px; flex: none; }
+    #history-list { height: 520px; flex: none; }
   }
 </style>
 </head>
@@ -98,6 +118,7 @@
   <button onclick="show('settings', this)">settings</button>
   <button onclick="show('console', this)">console</button>
   <button onclick="show('speakers', this)">speakers</button>
+  <button onclick="show('history', this)">history</button>
 </nav>
 
 <section id="chat" class="active">
@@ -122,6 +143,10 @@
   <div id="speakers-list" style="display:flex;flex-direction:column;gap:10px;margin-top:8px;"></div>
 </section>
 
+<section id="history">
+  <div id="history-list"></div>
+</section>
+
 <section id="settings">
   <div id="settings-form"></div>
   <div style="display:flex;align-items:center;">
@@ -144,6 +169,7 @@ function show(id, btn) {
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
   if (id === 'settings') loadSettings();
+  if (id === 'history') loadPlayHistory();
 }
 
 // chat
@@ -199,6 +225,17 @@ async function syncHistory() {
   } catch {}
 }
 
+// populated from config meta.confidential after settings load
+let CONFIDENTIAL_PATHS = new Set();
+
+function toggleSecret(btn) {
+  const input = btn.previousElementSibling;
+  const showing = input.type === 'text';
+  input.type = showing ? 'password' : 'text';
+  btn.querySelector('.eye-closed').style.display = showing ? 'none' : '';
+  btn.querySelector('.eye-open').style.display = showing ? '' : 'none';
+}
+
 // settings
 let audioDevices = { inputs: [], outputs: [] };
 let originalData = {};
@@ -221,9 +258,40 @@ async function loadSettings() {
     return;
   }
   originalData = JSON.parse(JSON.stringify(settingsData));
+  CONFIDENTIAL_PATHS = new Set(settingsData.meta?.confidential ?? []);
   clearDirty();
   const form = document.getElementById('settings-form');
   form.innerHTML = '';
+
+  // Sync-from-peer row
+  let peers = [];
+  try { peers = (await fetch('/peers').then(r => r.json())).filter(p => p.online); } catch {}
+  if (peers.length) {
+    const syncHeader = document.createElement('div');
+    syncHeader.className = 'section-header';
+    syncHeader.textContent = 'sync from peer';
+    form.appendChild(syncHeader);
+    const syncRow = document.createElement('div');
+    syncRow.style.cssText = 'display:flex;gap:8px;margin-bottom:14px;';
+    const sel = document.createElement('select');
+    sel.id = 'sync-peer-select';
+    sel.style.cssText = 'flex:1;background:#1a1a1a;border:1px solid #333;color:#eee;padding:8px 10px;font-family:\'Cousine\',monospace;font-size:1em;outline:none;appearance:none;cursor:pointer;';
+    peers.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = p.name + ' (' + p.ip + ')';
+      sel.appendChild(opt);
+    });
+    const syncBtn = document.createElement('button');
+    syncBtn.type = 'button';
+    syncBtn.textContent = 'sync';
+    syncBtn.style.cssText = 'background:#222;border:1px solid #444;color:#eee;padding:8px 18px;cursor:pointer;font-family:\'Cousine\',monospace;font-size:1em;';
+    syncBtn.onclick = () => syncConfig(sel.value);
+    syncRow.appendChild(sel);
+    syncRow.appendChild(syncBtn);
+    form.appendChild(syncRow);
+  }
+
   renderObj(form, settingsData, []);
 
   // Hints — always rendered explicitly so it's never silently skipped
@@ -250,8 +318,8 @@ async function loadSettings() {
 
 function renderObj(container, obj, path) {
   for (const [key, val] of Object.entries(obj)) {
-    if (key === 'hints') {
-      continue; // rendered explicitly in loadSettings
+    if (key === 'hints' || key === 'meta') {
+      continue; // hints rendered explicitly; meta is internal
     } else if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
       continue; // other arrays of objects — skip
     } else if (typeof val === 'object' && !Array.isArray(val)) {
@@ -273,6 +341,19 @@ function renderObj(container, obj, path) {
           return `<option value="${name}"${selected}>${name}</option>`;
         }).join('');
         div.innerHTML = `<label>${fullPath}</label><select data-path="${fullPath}">${opts}</select>`;
+      } else if (CONFIDENTIAL_PATHS.has(fullPath)) {
+        div.innerHTML = `<label>${fullPath}</label>
+          <div class="secret-wrap">
+            <input type="password" data-path="${fullPath}" value="${val}">
+            <button class="eye-btn" type="button" onclick="toggleSecret(this)" title="toggle visibility">
+              <svg class="eye-open" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+              </svg>
+              <svg class="eye-closed" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/>
+              </svg>
+            </button>
+          </div>`;
       } else {
         div.innerHTML = `<label>${fullPath}</label><input data-path="${fullPath}" value="${Array.isArray(val) ? val.join(', ') : val}">`;
       }
@@ -397,6 +478,38 @@ async function syncConsole() {
   } catch {}
 }
 
+// play history tab
+function _playLabel(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes('youtube.com') || u.hostname.includes('youtu.be')) {
+      const vid = u.searchParams.get('v') || u.pathname.replace(/^\//, '');
+      return `youtube.com/watch?v=${vid}`;
+    }
+    return u.hostname + (u.pathname && u.pathname !== '/' ? u.pathname : '');
+  } catch { return url; }
+}
+
+async function loadPlayHistory() {
+  try {
+    const entries = await fetch('/play-history').then(r => r.json());
+    const el = document.getElementById('history-list');
+    if (!entries.length) {
+      el.innerHTML = '<div style="color:#444;font-size:0.9em;margin-top:8px;">no play history yet...</div>';
+      return;
+    }
+    el.innerHTML = '';
+    for (const entry of [...entries].reverse()) {
+      const div = document.createElement('div');
+      div.className = 'play-entry';
+      const ts = new Date(entry.ts * 1000).toLocaleString();
+      const label = entry.title || _playLabel(entry.url);
+      div.innerHTML = `<span class="play-ts">${ts}</span><a class="play-link" href="${entry.url}" target="_blank" rel="noopener">${label}</a>`;
+      el.appendChild(div);
+    }
+  } catch {}
+}
+
 // speakers tab
 async function syncSpeakers() {
   try {
@@ -411,11 +524,29 @@ async function syncSpeakers() {
       const card = document.createElement('div');
       card.className = 'peer-card';
       const badge = `<span class="peer-status ${p.online ? 'online' : 'offline'}">${p.online ? 'online' : 'offline'}</span>`;
-      const btn = p.online ? `<button class="peer-open" onclick="window.open('http://${p.ip}:${p.port}/','_blank')">open</button>` : '';
-      card.innerHTML = `<div style="flex:1">${p.name}<br><span style="color:#444;font-size:0.8em;">${p.ip}:${p.port}</span></div>${badge}${btn}`;
+      const openBtn = p.online ? `<button class="peer-open" onclick="window.open('http://${p.ip}:${p.port}/','_blank')">open</button>` : '';
+      const syncBtn = p.online ? `<button class="peer-open" onclick="syncConfig('${p.name}')">sync cfg</button>` : '';
+      card.innerHTML = `<div style="flex:1">${p.name}<br><span style="color:#444;font-size:0.8em;">${p.ip}:${p.port}</span></div>${badge}${openBtn}${syncBtn}`;
       el.appendChild(card);
     }
   } catch {}
+}
+
+async function syncConfig(peerName) {
+  if (!confirm(`Sync config from "${peerName}"? Local audio + network settings will be preserved, everything else will be overwritten.`)) return;
+  try {
+    const res = await fetch('/rpc/sync-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peer_name: peerName })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Sync failed: ' + (err.detail || res.status));
+      return;
+    }
+    alert(`Config synced from "${peerName}". Reload settings to see changes.`);
+  } catch (e) { alert('Sync error: ' + e); }
 }
 
 // status + history polling

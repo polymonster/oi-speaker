@@ -9,9 +9,14 @@ whisper_model = "small"
 [audio]
 input_device = "your-input-device"
 output_device = "your-output-device"
+# Volume level while listening/processing after wake (0 = muted, 100 = full). Default: 0.
+duck_volume = 0
 
 [llm]
 anthropic_api_key = ""
+
+[meta]
+confidential = ["llm.anthropic_api_key"]
 
 # Add hints to give the assistant context about you and your preferences.
 # Hints appear in the system prompt. Add as many [[hints]] blocks as you like.
