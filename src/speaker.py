@@ -10,7 +10,6 @@ import openwakeword
 import sounddevice as dev
 import numpy as np
 import time
-import webrtcvad
 import math
 import faster_whisper
 import anthropic
@@ -31,7 +30,7 @@ from enum import Enum, auto
 
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
-VAD_CHUNK = 480 # 30ms at 16kHz
+VAD_CHUNK = 512 # 32ms at 16kHz (Silero VAD frame size)
 
 HISTORY_DIR = Path(".history")
 CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
@@ -199,6 +198,9 @@ class SpeakerContext:
     input_sample_rate: int
     worker_mode: bool = False
     worker_url: str | None = None
+    aec_delay_samples: int = 0
+    aec_gain: float = 1.0
+    aec_debug: bool = False
     speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
     interrupt: threading.Event = field(default_factory=threading.Event)
     shutdown: threading.Event = field(default_factory=threading.Event)
@@ -244,6 +246,32 @@ class _Timers:
             return bool(self._store)
 
 
+class _SileroVAD:
+    """Silero VAD via the silero-vad package — stateful, same is_speech() interface as webrtcvad."""
+
+    def __init__(self, threshold: float = 0.5, mic_gain: float = 1.0, verbose: bool = False):
+        from silero_vad import load_silero_vad
+        self._model = load_silero_vad(onnx=True)
+        self._threshold = threshold
+        self._mic_gain = mic_gain
+        self._verbose = verbose
+        log(f"[VAD] Silero loaded — threshold={threshold} mic_gain={mic_gain}")
+
+    def reset(self):
+        self._model.reset_states()
+
+    def is_speech(self, audio_bytes: bytes, sample_rate: int) -> bool:
+        import torch
+        audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        audio = np.clip(audio * self._mic_gain, -1.0, 1.0)
+        tensor = torch.from_numpy(audio)
+        prob = float(self._model(tensor, sample_rate))
+        if self._verbose:
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            log(f"[VAD] rms={rms:.4f} prob={prob:.3f} speech={prob > self._threshold}")
+        return prob > self._threshold
+
+
 class _Log:
     def __init__(self):
         self._buffer: deque = deque(maxlen=2000)
@@ -269,6 +297,10 @@ _duck_volume: int = 0
 _perf_timer = _PerfTimer()
 _timers = _Timers()
 _log = _Log()
+_aec_ref: deque = deque()  # 16kHz int16 samples of recent TTS output, for AEC
+_AEC_REF_MAX = TARGET_SAMPLE_RATE * 3  # 3 seconds of reference audio
+_aec_mic_buf: list = []   # mic samples captured during TTS for debug
+_aec_capture = threading.Event()  # set while TTS is playing to collect mic samples
 
 
 def log(text: str):
@@ -378,7 +410,54 @@ def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
         audio_flat = audio_flat[:chunk_size16]
     else:
         audio_flat = np.squeeze(audio)
+    if _aec_capture.is_set():
+        _aec_mic_buf.extend(audio_flat.tolist())
+    if ctx and ctx.aec_delay_samples > 0:
+        audio_flat = _apply_aec(audio_flat, ctx.aec_delay_samples, ctx.aec_gain)
     return audio_flat
+
+
+def _apply_aec(audio: np.ndarray, delay_samples: int, gain: float) -> np.ndarray:
+    """Subtract a delayed, scaled copy of the TTS reference signal from mic audio."""
+    n = len(audio)
+    buf_len = len(_aec_ref)
+    start = buf_len - delay_samples - n
+    if start < 0 or gain == 0.0:
+        return audio
+    ref = np.array(list(_aec_ref)[start:start + n], dtype=np.float32)
+    result = audio.astype(np.float32) - gain * ref
+    return np.clip(result, -32768, 32767).astype(np.int16)
+
+
+def _aec_save_debug(ref16: np.ndarray, mic16: np.ndarray):
+    """Cross-correlate reference and mic signals, log the suggested delay, and write a stereo WAV."""
+    n = min(len(ref16), len(mic16))
+    if n < TARGET_SAMPLE_RATE // 4:
+        log("[AEC debug] not enough data captured — try a longer TTS utterance")
+        return
+    r = ref16[:n].astype(np.float32)
+    m = mic16[:n].astype(np.float32)
+    # FFT cross-correlation to find lag where mic echo matches reference
+    pad = n * 2
+    corr = np.fft.irfft(np.fft.rfft(m, pad) * np.conj(np.fft.rfft(r, pad)), pad)
+    max_lag = int(0.25 * TARGET_SAMPLE_RATE)  # search within 250ms
+    peak_idx = int(np.argmax(np.abs(corr[:max_lag])))
+    peak_ms = peak_idx * 1000 / TARGET_SAMPLE_RATE
+    log(f"[AEC debug] cross-correlation peak at {peak_ms:.1f}ms (sample {peak_idx}) — try aec_delay_ms = {int(round(peak_ms))}")
+    # Save stereo WAV: left = reference, right = mic (both start at TTS onset)
+    os.makedirs("debug", exist_ok=True)
+    ts = int(time.time() * 1000)
+    path = f"debug/aec_{ts}.wav"
+    max_len = max(len(ref16), len(mic16))
+    stereo = np.zeros((max_len, 2), dtype=np.int16)
+    stereo[:len(ref16), 0] = ref16
+    stereo[:len(mic16), 1] = mic16
+    with wave.open(path, 'wb') as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(TARGET_SAMPLE_RATE)
+        wf.writeframes(stereo.tobytes())
+    log(f"[AEC debug] saved {path} — left=reference right=mic, open in Audacity to check alignment")
 
 
 def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> np.ndarray:
@@ -708,6 +787,13 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         chunks.append(int_data)
     if chunks:
         full_audio = np.concatenate(chunks)
+        ref16 = _resample_audio(full_audio, voice_model.config.sample_rate, TARGET_SAMPLE_RATE)
+        _aec_ref.extend(ref16.tolist())
+        while len(_aec_ref) > _AEC_REF_MAX:
+            _aec_ref.popleft()
+        if ctx and ctx.aec_debug:
+            _aec_mic_buf.clear()
+            _aec_capture.set()
         resampled = _resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
         dev.play(resampled, samplerate=sample_rate, device=dev_index)
         done = threading.Event()
@@ -715,7 +801,11 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
         while not done.wait(timeout=0.05):
             if ctx is not None and ctx.interrupt.is_set():
                 dev.stop()
+                _aec_capture.clear()
                 return
+        _aec_capture.clear()
+        if ctx and ctx.aec_debug:
+            _aec_save_debug(ref16, np.array(_aec_mic_buf, dtype=np.int16))
 
 
 def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event, interrupt: threading.Event):
@@ -1308,12 +1398,18 @@ def start():
             suffix = f" ({extra})" if extra else ""
             system += f"- [{hint['category']}] {hint['name']}: {value}{suffix}\n"
 
-    # whisper config
+    # whisper / inference config
     inf = config.get("inference", {})
     device = inf.get("device", "cpu")
     compute = "int8"
     if device == "cuda":
         compute = "float16"
+    aec_delay_samples = int(inf.get("aec_delay_ms", 0) * TARGET_SAMPLE_RATE / 1000)
+    aec_gain = float(inf.get("aec_gain", 1.0))
+    aec_debug = bool(inf.get("aec_debug", False))
+    vad_threshold = float(inf.get("vad_threshold", 0.5))
+    vad_mic_gain = float(inf.get("vad_mic_gain", 1.0))
+    vad_verbose = "--verbose" in sys.argv
 
     # audio config
     global _duck_volume
@@ -1339,12 +1435,15 @@ def start():
             device=device,
             compute_type=inf.get("whisper_compute", compute)
         ),
-        vad=webrtcvad.Vad(3),
+        vad=_SileroVAD(threshold=vad_threshold, mic_gain=vad_mic_gain, verbose=vad_verbose),
         input_dev_index=int(input_dev_info['index']),
         input_sample_rate=int(input_dev_info['default_samplerate']),
         output_dev_index=int(output_dev_info['index']),
         output_sample_rate=int(output_dev_info['default_samplerate']),
         worker_url=worker_url,
+        aec_delay_samples=aec_delay_samples,
+        aec_gain=aec_gain,
+        aec_debug=aec_debug,
     )
 
     threading.Thread(

@@ -11,7 +11,6 @@ dependencies = [
     "sounddevice",
     "openwakeword @ git+https://github.com/dscripka/openWakeWord.git",
     "faster-whisper",
-    "webrtcvad",
     "setuptools<71; sys_platform == 'darwin'",
     "anthropic",
     "piper-tts",
@@ -22,6 +21,7 @@ dependencies = [
     "tomli-w",
     "zeroconf>=0.131.0",
     "httpx>=0.27.0",
+    "silero-vad",
 ]
 
 [project.optional-dependencies]
