@@ -141,16 +141,9 @@ TOOLS = [
         }
     },
     {
-        "name": "chat",
-        "description": "Speak a plain-text response aloud via text-to-speech.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Plain text only, no markdown"},
-                "follow_on": {"type": "boolean", "description": "Keep listening for user response after speaking"}
-            },
-            "required": ["text"]
-        }
+        "name": "follow_on",
+        "description": "Call this after your spoken response to keep listening for the user's reply. Use when you asked the user a question or expect a follow-up.",
+        "input_schema": {"type": "object", "properties": {}}
     }
 ]
 
@@ -529,11 +522,8 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
             return f"cancelled timers: {', '.join(active_timers)}", SpeakerState.RESET
         _player.cmd_queue.put(('stop',))
         return "stopped", SpeakerState.RESET
-    elif tool_name == "chat":
-        chat_history.append({"role": "assistant", "text": tool_input["text"]})
-        _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, tool_input["text"])
-        next_state = SpeakerState.RECORDING if tool_input.get("follow_on") else SpeakerState.RESET
-        return "spoken", next_state
+    elif tool_name == "follow_on":
+        return "listening", SpeakerState.RECORDING
     elif tool_name == "set_volume":
         return set_volume(tool_input["level"]), None
     elif tool_name == "set_timer":
@@ -572,6 +562,32 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
             daemon=True
         )
         wake_thread.start()
+
+    # TTS runs in a separate thread so the LLM stream loop is never stalled waiting for playback.
+    tts_queue: queue.Queue = queue.Queue()
+
+    def _tts_worker():
+        while True:
+            sentence = tts_queue.get()
+            if sentence is None:
+                tts_queue.task_done()
+                break
+            if not ctx.interrupt.is_set():
+                _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, sentence)
+            tts_queue.task_done()
+
+    tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+    tts_thread.start()
+
+    def _discard_tts():
+        """Drop queued-but-unspoken sentences (interrupt already set, so worker drains fast)."""
+        while not tts_queue.empty():
+            try:
+                tts_queue.get_nowait()
+                tts_queue.task_done()
+            except queue.Empty:
+                break
+
     try:
         messages = [{"role": "user", "content": text}]
         next_state = SpeakerState.RESET
@@ -602,15 +618,17 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                     sentences, sentence_buffer = _split_sentences(sentence_buffer)
                     for s in sentences:
                         if s.strip():
-                            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, s)
-                    if ctx.interrupt.is_set():
-                        return SpeakerState.RECORDING
+                            tts_queue.put(s)
 
                 if ctx.interrupt.is_set():
+                    _discard_tts()
                     return SpeakerState.RECORDING
 
                 if sentence_buffer.strip():
-                    _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, sentence_buffer)
+                    tts_queue.put(sentence_buffer)
+
+                # Wait for all queued sentences to finish playing before acting on stop_reason
+                tts_queue.join()
 
                 if ctx.interrupt.is_set():
                     return SpeakerState.RECORDING
@@ -629,12 +647,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 continue
 
             if final_message.stop_reason == "tool_use":
-                # Remove live entry if nothing was streamed, or if the chat tool will add its own entry
-                chat_tool_used = any(
-                    block.type == "tool_use" and block.name == "chat"
-                    for block in final_message.content
-                )
-                if _live_entry is not None and (not accumulated_text.strip() or chat_tool_used):
+                if _live_entry is not None and not accumulated_text.strip():
                     chat_history.remove(_live_entry)
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
@@ -653,13 +666,16 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 messages.append({"role": "user", "content": tool_results})
 
                 # Terminal actions don't need another LLM round-trip
-                if next_state == SpeakerState.RESET and any(
-                    block.type == "tool_use" and block.name in ("play_url", "stop", "chat")
+                if any(
+                    block.type == "tool_use" and block.name in ("play_url", "stop", "follow_on")
                     for block in final_message.content
                 ):
                     return next_state
 
     finally:
+        _discard_tts()
+        tts_queue.put(None)
+        tts_thread.join(timeout=2.0)
         stop_flag.set()
         if wake_thread is not None:
             wake_thread.join(timeout=0.5)
