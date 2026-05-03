@@ -198,6 +198,8 @@ class SpeakerContext:
     input_sample_rate: int
     worker_mode: bool = False
     worker_url: str | None = None
+    wake_threshold: float = 0.4
+    wake_triggers: int = 1
     speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
     interrupt: threading.Event = field(default_factory=threading.Event)
     shutdown: threading.Event = field(default_factory=threading.Event)
@@ -463,7 +465,8 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
             score_window.append(score > threshold)
             hits = sum(score_window)
             if score > 0.0:
-                log(f"score: {score:.3f} ({hits}/{num_triggers})")
+                if "--verbose" in sys.argv:
+                    log(f"[wakeword] score: {score:.3f} ({hits}/{num_triggers})")
             if hits >= num_triggers:
                 log("ello mate!")
                 if rolling_buffer is not None:
@@ -517,7 +520,14 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
         play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
         return "playing", SpeakerState.RESET
     elif tool_name == "stop":
-        stop_playback()
+        active_timers = _timers.keys()
+        if active_timers:
+            for name in active_timers:
+                entry = _timers.pop(name)
+                if entry:
+                    entry[0].cancel()
+            return f"cancelled timers: {', '.join(active_timers)}", SpeakerState.RESET
+        _player.cmd_queue.put(('stop',))
         return "stopped", SpeakerState.RESET
     elif tool_name == "chat":
         chat_history.append({"role": "assistant", "text": tool_input["text"]})
@@ -558,7 +568,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
         ctx.wake_model.reset()  # clear residual activation from the wake that triggered this session
         wake_thread = threading.Thread(
             target=_interrupt_wake_listen,
-            args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag, ctx.interrupt),
+            args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag, ctx.interrupt, ctx.wake_threshold, ctx.wake_triggers),
             daemon=True
         )
         wake_thread.start()
@@ -594,16 +604,16 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                         if s.strip():
                             _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, s)
                     if ctx.interrupt.is_set():
-                        return SpeakerState.RESET
+                        return SpeakerState.RECORDING
 
                 if ctx.interrupt.is_set():
-                    return SpeakerState.RESET
+                    return SpeakerState.RECORDING
 
                 if sentence_buffer.strip():
                     _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, sentence_buffer)
 
                 if ctx.interrupt.is_set():
-                    return SpeakerState.RESET
+                    return SpeakerState.RECORDING
 
                 final_message = stream.get_final_message()
 
@@ -729,15 +739,16 @@ def _speak(dev, dev_index, sample_rate, voice_model, text: str):
                 return
 
 
-def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event, interrupt: threading.Event):
+def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event, interrupt: threading.Event,
+                           threshold: float = 0.4, num_triggers: int = 1):
     """Poll the wake model in a background thread and set `interrupt` if the wake word is detected during TTS."""
     score_window = deque(maxlen=5)
     while not stop_flag.is_set():
         audio_flat = _read_audio(stream, WAKE_CHUNK, input_sample_rate)
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
-            score_window.append(score > 0.9)
-            if sum(score_window) >= 3:
+            score_window.append(score > threshold)
+            if sum(score_window) >= num_triggers:
                 log("interrupt: wake word during TTS")
                 interrupt.set()
                 return
@@ -904,9 +915,7 @@ def _play_oneshot_audio_file(path: str):
 
 
 def stop_playback():
-    """Stop active playback and signal any in-progress TTS to interrupt."""
-    if ctx is not None:
-        ctx.interrupt.set()
+    """Stop active playback."""
     _player.cmd_queue.put(('stop',))
 
 
@@ -1154,8 +1163,6 @@ def _speak_loop(ctx):
     # training data capture
     wake_audio = None
     buffer_duration = 0.0
-    threshold = 0.4
-    triggers = 1
     record_dir = None
     if "--record-negatives" in sys.argv:
         log("recording negatives")
@@ -1180,8 +1187,8 @@ def _speak_loop(ctx):
                     ctx.wake_model,
                     stream,
                     ctx.input_sample_rate,
-                    threshold=threshold,
-                    num_triggers=triggers,
+                    threshold=ctx.wake_threshold,
+                    num_triggers=ctx.wake_triggers,
                     buffer_duration=buffer_duration
                 )
                 _perf_timer.start()
@@ -1226,7 +1233,12 @@ def _speak_loop(ctx):
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
                 ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
                 _perf_timer.lap("llm")
-                unduck_playback()
+                if ctx.speaker_state == SpeakerState.RECORDING:
+                    onset_remaining = ONSET_TIMEOUT
+                    _flush_stream(stream, ctx.input_sample_rate)
+                    ctx.wake_model.reset()
+                else:
+                    unduck_playback()
             elif ctx.speaker_state == SpeakerState.RESET:
                 _flush_stream(stream, ctx.input_sample_rate)
                 ctx.wake_model.reset()
