@@ -81,6 +81,8 @@ pip install -e ".[cuda]"
 
 Some of the dependencies require additional downloads
 
+The openWakeWord download is required even though a custom wake word model ships in `models/` — it fetches the shared feature models (melspectrogram, embedding) and `silero_vad.onnx` into openWakeWord's own `resources/models` directory. Without it startup fails with `NO_SUCHFILE ... silero_vad.onnx`.
+
 ```bash
 python -c "import openwakeword; openwakeword.utils.download_models()"
 python -m piper.download --voice en_GB-northern_english_male-medium

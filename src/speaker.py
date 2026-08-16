@@ -31,6 +31,10 @@ from enum import Enum, auto
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 512 # 32ms at 16kHz (Silero VAD frame size)
+VAD_ONSET_FRAMES = 3 # consecutive speech frames required before onset is accepted (~96ms)
+VAD_PREROLL_FRAMES = 10 # frames kept from before onset so the first phoneme survives (~320ms)
+VAD_MIN_SPEECH = 0.35 # a recording holding less speech than this is noise, not a request
+NO_SPEECH_PROB_LIMIT = 0.6 # whisper segments above this are hallucinations on near-silence
 
 HISTORY_DIR = Path(".history")
 CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
@@ -286,6 +290,7 @@ ctx: SpeakerContext | None = None
 chat_history: list[dict] = []
 _player = _Player()
 _duck_volume: int = 0
+_silence_timeout: float = 1.6 # continuous silence that ends a recording, overridable from config
 _perf_timer = _PerfTimer()
 _timers = _Timers()
 _log = _Log()
@@ -355,10 +360,11 @@ def _test_tone(dev, dev_index: int, sample_rate: int):
     dev.wait()
 
 
-def _resample_audio(audio, orig_rate: int, target_rate: int):
-    """Linearly interpolate `audio` from `orig_rate` to `target_rate`, returning int16."""
-    ratio = target_rate / orig_rate
-    new_length = int(len(audio) * ratio)
+def _resample_audio(audio, orig_rate: int, target_rate: int, target_length: int | None = None):
+    """Linearly interpolate `audio` from `orig_rate` to `target_rate`, returning int16.
+    `target_length` forces the output size so callers needing an exact frame count do not have to
+    over-read and truncate, which silently discards audio at fractional rate ratios."""
+    new_length = target_length if target_length is not None else int(len(audio) * target_rate / orig_rate)
     return np.interp(
         np.linspace(0, len(audio), new_length),
         np.arange(len(audio)),
@@ -367,32 +373,30 @@ def _resample_audio(audio, orig_rate: int, target_rate: int):
 
 
 def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
-    """Read one chunk from `stream` at native `sample_rate` and resample to 16 kHz int16."""
-    # read audio
-    sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
-    chunk = chunk_size16 * sample_ratio
-    audio, _ = stream.read(chunk)
-    # resample to TARGET_SAMPLE_RATE and flatten
-    if sample_ratio != 1:
-        audio_flat = np.squeeze(audio)
-        audio_flat = _resample_audio(audio_flat, sample_rate, TARGET_SAMPLE_RATE)
-        audio_flat = audio_flat[:chunk_size16]
-    else:
-        audio_flat = np.squeeze(audio)
-    return audio_flat
+    """Read one chunk from `stream` at native `sample_rate` and resample to exactly `chunk_size16`
+    samples of 16 kHz int16."""
+    if sample_rate == TARGET_SAMPLE_RATE:
+        audio, _ = stream.read(chunk_size16)
+        return np.squeeze(audio)
+    # read the exact native span that maps onto chunk_size16 samples. reading ceil(rate/16k) * chunk
+    # and truncating loses 8% of every chunk at 44.1 kHz, which both mangles the audio handed to
+    # whisper and breaks the frame continuity silero's LSTM state depends on
+    native_frames = int(round(chunk_size16 * sample_rate / TARGET_SAMPLE_RATE))
+    audio, _ = stream.read(native_frames)
+    return _resample_audio(np.squeeze(audio), sample_rate, TARGET_SAMPLE_RATE, target_length=chunk_size16)
 
 
 
 def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> np.ndarray:
     """Record raw audio at native sample rate, using resampled audio only for VAD checks."""
-    sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
-    raw_chunk = VAD_CHUNK * sample_ratio
+    vad.reset()
+    raw_chunk = int(round(VAD_CHUNK * sample_rate / TARGET_SAMPLE_RATE))
     raw_chunks = []
     # wait for speech onset
     while True:
         raw, _ = stream.read(raw_chunk)
         raw_flat = np.squeeze(raw)
-        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE)[:VAD_CHUNK]
+        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE, target_length=VAD_CHUNK)
         if vad.is_speech(audio_16k.tobytes(), TARGET_SAMPLE_RATE):
             raw_chunks.append(raw_flat)
             break
@@ -402,32 +406,41 @@ def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> 
         raw, _ = stream.read(raw_chunk)
         raw_flat = np.squeeze(raw)
         raw_chunks.append(raw_flat)
-        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE)[:VAD_CHUNK]
+        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE, target_length=VAD_CHUNK)
         silent_duration = 0.0 if vad.is_speech(audio_16k.tobytes(), TARGET_SAMPLE_RATE) else silent_duration + VAD_CHUNK / TARGET_SAMPLE_RATE
     return np.concatenate(raw_chunks)
 
 
-def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.0, onset_timeout: float=8.0) -> tuple[np.ndarray | None, float]:
-    """Wait for speech onset then record until `silence_timeout` seconds of continuous silence.
-    Returns (audio, onset_elapsed). audio is None if no speech begins within `onset_timeout` seconds."""
+def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float | None = None, onset_timeout: float=8.0) -> tuple[np.ndarray | None, float]:
+    """Wait for sustained speech onset then record until `silence_timeout` seconds of continuous silence.
+    Returns (audio, onset_elapsed). audio is None if no speech begins within `onset_timeout` seconds, or if
+    what was captured holds too little speech to be a request."""
+    silence_timeout = _silence_timeout if silence_timeout is None else silence_timeout
+    vad.reset()  # silero is stateful — carrying the previous turn's LSTM state in skews early frames
+    preroll = deque(maxlen=VAD_PREROLL_FRAMES)
     chunks = []
     silent_duration = 0.0
+    speech_duration = 0.0
+    onset_run = 0
     speech_started = False
     onset_elapsed = 0.0
     chunk_duration = VAD_CHUNK / TARGET_SAMPLE_RATE
     log_limiter = 0
     while True:
         audio_flat = _read_audio(stream, VAD_CHUNK, sample_rate)
-        chunks.append(audio_flat)
         is_speech = vad.is_speech(audio_flat.tobytes(), TARGET_SAMPLE_RATE)
-        if is_speech:
-            speech_started = True
-            silent_duration = 0.0
-        elif speech_started:
-            silent_duration += chunk_duration
-            if silent_duration >= silence_timeout:
-                break
-        else:
+        if not speech_started:
+            # one frame over threshold is the wake chime bleeding back through the mic, a breath or a
+            # click. committing on it starts the silence countdown before the user has spoken, so the
+            # turn ends on a ~1s clip of room noise. require a sustained run, and keep a pre-roll so
+            # the leading phoneme is not lost to the frames it took to confirm
+            preroll.append(audio_flat)
+            onset_run = onset_run + 1 if is_speech else 0
+            if onset_run >= VAD_ONSET_FRAMES:
+                speech_started = True
+                speech_duration = onset_run * chunk_duration
+                chunks.extend(preroll)
+                continue
             if int(onset_elapsed) > log_limiter:
                 log_limiter = int(onset_elapsed)
                 log(f"waiting for onset: {log_limiter}s")
@@ -435,7 +448,20 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=
             if onset_elapsed >= onset_timeout:
                 log("no speech detected, returning to wake listen")
                 return None, onset_elapsed
+            continue
+        chunks.append(audio_flat)
+        if is_speech:
+            speech_duration += chunk_duration
+            silent_duration = 0.0
+        else:
+            silent_duration += chunk_duration
+            if silent_duration >= silence_timeout:
+                break
 
+    if speech_duration < VAD_MIN_SPEECH:
+        log(f"discarding {speech_duration:.2f}s of speech, below the {VAD_MIN_SPEECH}s minimum")
+        return None, onset_elapsed
+    log(f"recorded {len(chunks) * chunk_duration:.1f}s ({speech_duration:.1f}s speech)")
     return np.concatenate(chunks), onset_elapsed
 
 
@@ -501,8 +527,21 @@ def _transcribe_audio(whisper_model, audio: np.ndarray, worker_url: str | None =
             log(f"worker transcribe error: {e}")
             return ""
     audio_float = audio.astype(np.float32) / 32768.0
-    segments, _ = whisper_model.transcribe(audio_float, language="en", beam_size=1)
-    return " ".join(segment.text for segment in segments)
+    segments, _ = whisper_model.transcribe(
+        audio_float,
+        language="en",
+        beam_size=1,
+        # whisper invents filler ("yeah", "bye", "thanks for watching") on near-silence, and by default
+        # feeds each turn's text forward as a prompt so one invention seeds the next
+        condition_on_previous_text=False,
+    )
+    kept = []
+    for segment in segments:
+        if segment.no_speech_prob > NO_SPEECH_PROB_LIMIT:
+            log(f"dropping hallucinated segment (no_speech={segment.no_speech_prob:.2f}): {segment.text.strip()!r}")
+            continue
+        kept.append(segment.text)
+    return " ".join(kept)
 
 
 def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState | None]:
@@ -1221,18 +1260,16 @@ def _speak_loop(ctx):
                 log(f"recording (onset budget: {onset_remaining:.1f}s)")
                 duck_playback()
                 audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
-                if audio_request is None:
-                    log("onset timeout, returning to wake listen")
-                    unduck_playback()
-                    onset_remaining = ONSET_TIMEOUT
-                    ctx.speaker_state = SpeakerState.RESET
-                    continue
-                _perf_timer.lap("recorded")
-                transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
-                _perf_timer.lap("transcribed")
+                transcribed_request = ""
+                if audio_request is not None:
+                    _perf_timer.lap("recorded")
+                    transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
+                    _perf_timer.lap("transcribed")
+                # nothing usable captured — keep listening on the remaining budget rather than dropping
+                # the turn, so a false onset or a discarded noise clip does not send us back to the wake word
                 if not transcribed_request.strip():
                     onset_remaining -= onset_elapsed
-                    log(f"empty transcription, onset budget remaining: {onset_remaining:.1f}s")
+                    log(f"no request captured, onset budget remaining: {onset_remaining:.1f}s")
                     if onset_remaining > 0.5:
                         ctx.speaker_state = SpeakerState.RECORDING
                     else:
@@ -1354,6 +1391,8 @@ def start():
     vad_threshold = float(inf.get("vad_threshold", 0.5))
     vad_mic_gain = float(inf.get("vad_mic_gain", 1.0))
     vad_verbose = "--verbose" in sys.argv
+    global _silence_timeout
+    _silence_timeout = float(inf.get("silence_timeout", _silence_timeout))
 
     # audio config
     global _duck_volume

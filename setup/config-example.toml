@@ -5,6 +5,11 @@ port = 8000
 [inference]
 device = "cpu"
 whisper_model = "small"
+# seconds of continuous silence that end a recording. raise it if the speaker cuts you off
+# mid-sentence, lower it to shave latency off every turn
+silence_timeout = 1.6
+# silero speech probability above which a frame counts as speech. raise it in a noisy room
+vad_threshold = 0.5
 
 [audio]
 input_device = "your-input-device"
