@@ -106,6 +106,14 @@ bash install-service.sh
 
 This copies `setup/oi-speaker@.service` to `/etc/systemd/system/`, enables and starts `oi-speaker@<your-username>`.
 
+Any args passed to the installer are appended to the speaker command line, so to offload inference to a worker:
+
+```bash
+bash install-service.sh --worker-ip 192.168.1.247:8000
+```
+
+The interpreter and args are written to `~/.config/oi-speaker/env` (`OI_SPEAKER_PYTHON` / `OI_SPEAKER_ARGS`) rather than baked into the unit — edit that file and `sudo systemctl restart oi-speaker@$USER` to change them without reinstalling. The installer picks up your active venv if one is sourced, otherwise `python3.11` from `PATH`.
+
 Useful commands:
 
 ```bash

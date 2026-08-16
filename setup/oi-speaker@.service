@@ -8,7 +8,11 @@ Type=simple
 User=%i
 WorkingDirectory=%h/dev/oi-speaker
 ExecStartPre=/usr/bin/pulseaudio --start
-ExecStart=%h/.pyenv/shims/python -u src/speaker.py --verbose --service
+# defaults, overridden by the env file below (written by install-service.sh)
+Environment=OI_SPEAKER_PYTHON=%h/.pyenv/shims/python
+Environment=OI_SPEAKER_ARGS=
+EnvironmentFile=-%h/.config/oi-speaker/env
+ExecStart=/usr/bin/env ${OI_SPEAKER_PYTHON} -u src/speaker.py --verbose --service $OI_SPEAKER_ARGS
 Environment=PYTHONUNBUFFERED=1
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
