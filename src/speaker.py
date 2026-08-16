@@ -67,6 +67,17 @@ TOOLS = [
         }
     },
     {
+        "name": "search_soundcloud",
+        "description": "Find music on SoundCloud. Use this when search_youtube or play_url reports that YouTube rejected the request, and as the first choice for remixes, DJ sets and underground electronic music, which SoundCloud carries more of. Returns candidate matches — pick the best one yourself and play it with play_url. Do not read the candidates out to the user.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
         "name": "play_url",
         "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions). Returns 'playing' on success, or 'playback failed: ...' when the source rejected the request — YouTube does this intermittently. On failure, call this again with the next candidate from the search results rather than reporting defeat; only tell the user if several have failed.",
         "input_schema": {
@@ -566,6 +577,8 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     """Dispatch an LLM tool call and return its result string and optional next state."""
     if tool_name == "search_youtube":
         return search_youtube(tool_input["query"]), None
+    elif tool_name == "search_soundcloud":
+        return search_soundcloud(tool_input["query"]), None
     elif tool_name == "play_url":
         result = play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
         if result != "playing":
@@ -1066,6 +1079,34 @@ def _resolve_youtube_stream(url: str) -> tuple[str, str, str]:
     return "", "", "; ".join(problems)
 
 
+def _resolve_soundcloud_and_play(url: str, start_time: float = 0.0, title: str | None = None) -> str:
+    """Resolve a SoundCloud URL and enqueue it for playback. Returns "" on success, else the reason.
+
+    No player-client fallback here — that is a YouTube concept, and SoundCloud needs no API key:
+    yt-dlp lifts a client_id from the public web player."""
+    log("resolving soundcloud stream url...")
+    try:
+        result = _ytdlp(["-f", "bestaudio/best", "--print", "url",
+                         "--print", "%(title)s", "--no-playlist", url])
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    if result.returncode != 0 or not result.stdout.strip():
+        error = _ytdlp_error(result.stderr)
+        log(f"yt-dlp could not resolve {url}: {error}")
+        return error
+    lines = result.stdout.strip().splitlines()
+    stream_url = lines[0]
+    if title is None and len(lines) > 1:
+        title = lines[1]
+    entry: dict = {"url": url, "start_time": start_time}
+    if title:
+        entry["title"] = title
+    _save_history(PLAY_HISTORY_PATH, entry)
+    log(f"streaming: {stream_url[:80]}...")
+    _player.cmd_queue.put(('play', stream_url, None, start_time, url))
+    return ""
+
+
 def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | None = None) -> str:
     """Resolve a YouTube URL and enqueue it for playback. Returns "" on success, else the reason."""
     log("resolving youtube stream url...")
@@ -1180,6 +1221,10 @@ def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0
         _player.cmd_queue.put(('stop',))
         error = _resolve_youtube_and_play(url, start_time, title)
         return error or "playing"
+    if "soundcloud.com" in url:
+        _player.cmd_queue.put(('stop',))
+        error = _resolve_soundcloud_and_play(url, start_time, title)
+        return error or "playing"
     entry: dict = {"url": url, "start_time": start_time}
     if title:
         entry["title"] = title
@@ -1188,10 +1233,10 @@ def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0
     return "playing"
 
 
-def search_youtube(query: str, max_results: int = 5) -> str:
-    """Search YouTube for `query` and return a JSON list of title/url/duration/channel results."""
+def _search(search_spec: str, url_template: str) -> str:
+    """Run a yt-dlp search and return a JSON list of title/url/duration/channel results."""
     try:
-        result = _ytdlp([f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"])
+        result = _ytdlp([search_spec, "--dump-json", "--flat-playlist", "--no-download"])
     except subprocess.TimeoutExpired:
         return "search timed out"
     results = []
@@ -1200,7 +1245,7 @@ def search_youtube(query: str, max_results: int = 5) -> str:
             item = json.loads(line)
             results.append({
                 "title": item.get("title"),
-                "url": item.get("url") or f"https://www.youtube.com/watch?v={item.get('id')}",
+                "url": item.get("url") or url_template.format(id=item.get("id")),
                 "duration": item.get("duration"),
                 "channel": item.get("channel") or item.get("uploader"),
             })
@@ -1211,6 +1256,16 @@ def search_youtube(query: str, max_results: int = 5) -> str:
             return f"search failed: {_ytdlp_error(result.stderr)}"
         return "no results found"
     return json.dumps(results)
+
+
+def search_youtube(query: str, max_results: int = 5) -> str:
+    """Search YouTube for `query` and return a JSON list of title/url/duration/channel results."""
+    return _search(f"ytsearch{max_results}:{query}", "https://www.youtube.com/watch?v={id}")
+
+
+def search_soundcloud(query: str, max_results: int = 5) -> str:
+    """Search SoundCloud for `query` and return a JSON list of title/url/duration/channel results."""
+    return _search(f"scsearch{max_results}:{query}", "https://soundcloud.com/{id}")
 
 
 def set_volume(level: int) -> str:
