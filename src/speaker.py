@@ -1140,6 +1140,16 @@ def resume_playback():
     _player.cmd_queue.put(('resume',))
 
 
+def apply_audio_settings(config: dict):
+    """Apply the [audio] settings that can change at runtime, so a config save takes effect
+    without a restart. mono_output applies to the next track, not the one already playing."""
+    global _duck_volume, _mono_output
+    audio_cfg = config.get("audio", {})
+    _duck_volume = max(0, min(100, int(audio_cfg.get("duck_volume", _duck_volume))))
+    _mono_output = bool(audio_cfg.get("mono_output", False))
+    log(f"audio settings applied — duck_volume={_duck_volume} mono_output={_mono_output}")
+
+
 def duck_playback():
     """Reduce mpv player volume to _duck_volume (0 = silent, 100 = full)."""
     _player.cmd_queue.put(('duck', _duck_volume))
@@ -1559,12 +1569,10 @@ def start():
     _silence_timeout = float(inf.get("silence_timeout", _silence_timeout))
 
     # audio config
-    global _duck_volume, _mono_output
     if "--verbose" in sys.argv:
         log(json.dumps(enumerate_audio_devices(), indent=4))
     audio_cfg = config["audio"]
-    _duck_volume = max(0, min(100, int(audio_cfg.get("duck_volume", 0))))
-    _mono_output = bool(audio_cfg.get("mono_output", False))
+    apply_audio_settings(config)
     input_dev_info = _get_audio_device_index(audio_cfg["input_device"])
     output_dev_info = _get_audio_device_index(audio_cfg["output_device"])
 

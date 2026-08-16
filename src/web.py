@@ -174,6 +174,7 @@ async def get_settings():
 async def update_settings(settings: dict[str, Any] = Body(...)):
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(settings).encode())
+    spk.apply_audio_settings(settings)
     return {"ok": True}
 
 

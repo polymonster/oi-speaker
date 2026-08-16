@@ -335,7 +335,9 @@ function renderObj(container, obj, path) {
       const deviceOptions = fullPath === 'audio.input_device' ? audioDevices.inputs
                           : fullPath === 'audio.output_device' ? audioDevices.outputs
                           : null;
-      if (deviceOptions && deviceOptions.length > 0) {
+      if (typeof val === 'boolean') {
+        div.innerHTML = `<label>${fullPath}</label><input type="checkbox" data-path="${fullPath}"${val ? ' checked' : ''}>`;
+      } else if (deviceOptions && deviceOptions.length > 0) {
         const opts = deviceOptions.map(name => {
           const selected = name === val ? ' selected' : '';
           return `<option value="${name}"${selected}>${name}</option>`;
@@ -411,9 +413,11 @@ async function saveSettings() {
     for (let i = 0; i < keys.length - 1; i++) obj = obj[keys[i]];
     const lastKey = keys[keys.length - 1];
     const orig = obj[lastKey];
-    obj[lastKey] = Array.isArray(orig)
-      ? input.value.split(',').map(s => s.trim()).filter(Boolean)
-      : input.value;
+    obj[lastKey] = input.type === 'checkbox'
+      ? input.checked
+      : Array.isArray(orig)
+        ? input.value.split(',').map(s => s.trim()).filter(Boolean)
+        : input.value;
   });
   // collect hints — value goes to url or text depending on content
   document.querySelectorAll('[data-hint]').forEach(input => {
