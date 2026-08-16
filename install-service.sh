@@ -31,12 +31,20 @@ sudo cp setup/oi-speaker@.service /etc/systemd/system/oi-speaker@.service
 # paths have to be written out here.
 sudo mkdir -p "$DROPIN_DIR"
 sudo tee "$DROPIN_DIR/paths.conf" > /dev/null <<EOF
+[Unit]
+After=user@$UID_NUM.service
+Wants=user@$UID_NUM.service
+
 [Service]
 WorkingDirectory=$REPO_DIR
 EnvironmentFile=-$ENV_FILE
 Environment=XDG_RUNTIME_DIR=/run/user/$UID_NUM
 Environment=PULSE_SERVER=unix:/run/user/$UID_NUM/pulse/native
 EOF
+
+# /run/user/$UID_NUM only exists while the user has a session — linger keeps it alive from
+# boot so the service can reach pulse without anyone logging in.
+sudo loginctl enable-linger "$USER"
 
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE"
@@ -48,5 +56,6 @@ echo "  Args:    $*"
 echo "  Workdir: $REPO_DIR"
 echo "  Env:     $ENV_FILE"
 echo "  Dropin:  $DROPIN_DIR/paths.conf"
+echo "  Linger:  enabled for $USER"
 echo "  Status:  sudo systemctl status $SERVICE"
 echo "  Logs:    journalctl -u $SERVICE -f"
