@@ -6,17 +6,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=%i
-WorkingDirectory=%h/dev/oi-speaker
 # '-' so a missing or already-running pulseaudio (eg. pipewire-pulse) doesn't fail the unit
 ExecStartPre=-/usr/bin/pulseaudio --start
-# defaults, overridden by the env file below (written by install-service.sh)
-Environment=OI_SPEAKER_PYTHON=%h/.pyenv/shims/python
+# WorkingDirectory, EnvironmentFile, XDG_RUNTIME_DIR and PULSE_SERVER are supplied by the
+# drop-in that install-service.sh writes — %h and %U are NOT influenced by User= in a system
+# unit (%h is always /root), so they can't be used here.
 Environment=OI_SPEAKER_ARGS=
-EnvironmentFile=-%h/.config/oi-speaker/env
-ExecStart=/usr/bin/env ${OI_SPEAKER_PYTHON} -u src/speaker.py --verbose --service $OI_SPEAKER_ARGS
 Environment=PYTHONUNBUFFERED=1
-Environment=XDG_RUNTIME_DIR=/run/user/%U
-Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
+ExecStart=/usr/bin/env ${OI_SPEAKER_PYTHON} -u src/speaker.py --verbose --service $OI_SPEAKER_ARGS
 Restart=on-failure
 RestartSec=5
 

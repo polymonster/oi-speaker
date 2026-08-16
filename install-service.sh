@@ -7,6 +7,9 @@ set -e
 SERVICE="oi-speaker@${USER}"
 ENV_DIR="$HOME/.config/oi-speaker"
 ENV_FILE="$ENV_DIR/env"
+DROPIN_DIR="/etc/systemd/system/${SERVICE}.service.d"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UID_NUM="$(id -u)"
 
 # python used by the service — honour an active venv, else the first python3.11 on PATH
 PYTHON="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
@@ -23,6 +26,18 @@ mkdir -p "$ENV_DIR"
 } > "$ENV_FILE"
 
 sudo cp setup/oi-speaker@.service /etc/systemd/system/oi-speaker@.service
+
+# %h/%U resolve against the service manager (root), not User=, so the per-user absolute
+# paths have to be written out here.
+sudo mkdir -p "$DROPIN_DIR"
+sudo tee "$DROPIN_DIR/paths.conf" > /dev/null <<EOF
+[Service]
+WorkingDirectory=$REPO_DIR
+EnvironmentFile=-$ENV_FILE
+Environment=XDG_RUNTIME_DIR=/run/user/$UID_NUM
+Environment=PULSE_SERVER=unix:/run/user/$UID_NUM/pulse/native
+EOF
+
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE"
 sudo systemctl restart "$SERVICE"
@@ -30,6 +45,8 @@ sudo systemctl restart "$SERVICE"
 echo "Service $SERVICE installed and started."
 echo "  Python:  $PYTHON"
 echo "  Args:    $*"
+echo "  Workdir: $REPO_DIR"
 echo "  Env:     $ENV_FILE"
+echo "  Dropin:  $DROPIN_DIR/paths.conf"
 echo "  Status:  sudo systemctl status $SERVICE"
 echo "  Logs:    journalctl -u $SERVICE -f"

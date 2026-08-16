@@ -114,6 +114,8 @@ bash install-service.sh --worker-ip 192.168.1.247:8000
 
 The interpreter and args are written to `~/.config/oi-speaker/env` (`OI_SPEAKER_PYTHON` / `OI_SPEAKER_ARGS`) rather than baked into the unit — edit that file and `sudo systemctl restart oi-speaker@$USER` to change them without reinstalling. The installer picks up your active venv if one is sourced, otherwise `python3.11` from `PATH`.
 
+Run the installer from the repo you want the service to use: it records that directory, your uid and the env file path in a drop-in at `/etc/systemd/system/oi-speaker@$USER.service.d/paths.conf`. These can't live in the template because systemd's `%h` and `%U` resolve against the service manager (ie. `/root` and `0`), not the `User=` the unit runs as.
+
 Useful commands:
 
 ```bash
