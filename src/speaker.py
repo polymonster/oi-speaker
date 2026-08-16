@@ -307,6 +307,7 @@ chat_history: list[dict] = []
 api_messages: list[dict] = []
 _player = _Player()
 _duck_volume: int = 0
+_mono_output: bool = False # downmix mpv playback to mono, for devices with a single speaker
 _silence_timeout: float = 1.6 # continuous silence that ends a recording, overridable from config
 _perf_timer = _PerfTimer()
 _timers = _Timers()
@@ -943,6 +944,7 @@ def _player_loop():
                              cache_secs=30,
                              audio_buffer=2,
                              demuxer_max_bytes="50MiB",
+                             audio_channels="mono" if _mono_output else "auto-safe",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             if headers:
@@ -959,6 +961,7 @@ def _player_loop():
             path, cleanup_dir = args[0], args[1]
             log(f"playing: {path}")
             player = mpv.MPV(vid=False, terminal=False,
+                             audio_channels="mono" if _mono_output else "auto-safe",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             player.play(path)
@@ -1103,7 +1106,8 @@ def _download_youtube_and_play(url: str):
 def _play_oneshot_audio_file(path: str):
     """Play a local audio file once in a background thread without affecting the main player."""
     def _run():
-        player = mpv.MPV(vid=False, terminal=False)
+        player = mpv.MPV(vid=False, terminal=False,
+                         audio_channels="mono" if _mono_output else "auto-safe")
         player.play(path)
         player.wait_for_playback()
         try:
@@ -1555,11 +1559,12 @@ def start():
     _silence_timeout = float(inf.get("silence_timeout", _silence_timeout))
 
     # audio config
-    global _duck_volume
+    global _duck_volume, _mono_output
     if "--verbose" in sys.argv:
         log(json.dumps(enumerate_audio_devices(), indent=4))
     audio_cfg = config["audio"]
     _duck_volume = max(0, min(100, int(audio_cfg.get("duck_volume", 0))))
+    _mono_output = bool(audio_cfg.get("mono_output", False))
     input_dev_info = _get_audio_device_index(audio_cfg["input_device"])
     output_dev_info = _get_audio_device_index(audio_cfg["output_device"])
 

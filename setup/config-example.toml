@@ -16,6 +16,8 @@ input_device = "your-input-device"
 output_device = "your-output-device"
 # Volume level while listening/processing after wake (0 = muted, 100 = full). Default: 0.
 duck_volume = 0
+# Downmix playback to mono, for a device with a single speaker. Default: false.
+mono_output = false
 
 [llm]
 model = "claude-opus-5"
