@@ -19,6 +19,8 @@ import requests
 import wave
 import uvicorn
 import os
+import urllib.request
+import urllib.error
 
 from pathlib import Path
 from piper.voice import PiperVoice
@@ -40,13 +42,22 @@ HISTORY_DIR = Path(".history")
 CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
 PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
 HISTORY_LOAD_LIMIT = 30  # messages loaded into context on startup
+API_HISTORY_LIMIT = 20  # api-format messages kept in the rolling context window
+MAX_TOOL_ROUNDS = 8  # backstop on the agent loop so no stop_reason can spin it forever
+TERMINAL_TOOLS = ("play_url", "stop", "follow_on")  # tools that end the turn once they succeed
+
+# YouTube rejects player clients unpredictably — one that worked an hour ago starts returning 403 —
+# so resolution tries each in turn. "" means yt-dlp's own default client chain.
+YTDLP_CLIENTS = ("tv_embedded", "", "android_vr")
+YTDLP_TIMEOUT = 60.0
+PROBE_BYTES = 2048  # a resolved URL can still 403 on first read; find out before mpv does
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 TOOLS = [
     {
         "name": "search_youtube",
-        "description": "Search for music or videos on YouTube. Returns a list of results to choose from.",
+        "description": "Find music or videos on YouTube. Call this when the user asks to play something you don't already have a URL for. Returns candidate matches ranked by relevance — pick the best one yourself and play it with play_url. Do not read the candidates out to the user.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -57,7 +68,7 @@ TOOLS = [
     },
     {
         "name": "play_url",
-        "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions).",
+        "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions). Returns 'playing' on success, or 'playback failed: ...' when the source rejected the request — YouTube does this intermittently. On failure, call this again with the next candidate from the search results rather than reporting defeat; only tell the user if several have failed.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -79,7 +90,7 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
-        "type": "web_search_20250305",
+        "type": "web_search_20260209",
         "name": "web_search"
     },
     {
@@ -146,7 +157,7 @@ TOOLS = [
     },
     {
         "name": "follow_on",
-        "description": "Call this after your spoken response to keep listening for the user's reply. Use when you asked the user a question or expect a follow-up.",
+        "description": "Keep the microphone open for the user's reply. Call this only when your spoken response ended in a genuine question that you need answered to continue. Do not call it after a statement, a confirmation, or once you have finished the task.",
         "input_schema": {"type": "object", "properties": {}}
     }
 ]
@@ -184,7 +195,7 @@ class SpeakerState(Enum):
 @dataclass
 class SpeakerContext:
     llm_client: any
-    system: str
+    system: any  # str, or cache-controlled content blocks
     voice_model: any
     whisper_model: any
     vad: any
@@ -195,6 +206,9 @@ class SpeakerContext:
     input_sample_rate: int
     worker_mode: bool = False
     worker_url: str | None = None
+    model: str = "claude-opus-5"
+    followup_model: str = "claude-opus-5"  # set equal to `model` to keep one prompt cache
+    effort: str = "low"
     wake_threshold: float = 0.4
     wake_triggers: int = 1
     speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
@@ -288,6 +302,9 @@ class _Log:
 
 ctx: SpeakerContext | None = None
 chat_history: list[dict] = []
+# The conversation as the API sees it — content blocks, tool_use and tool_result included. Distinct
+# from chat_history, which is flattened text for the web UI and .history/chat.jsonl.
+api_messages: list[dict] = []
 _player = _Player()
 _duck_volume: int = 0
 _silence_timeout: float = 1.6 # continuous silence that ends a recording, overridable from config
@@ -549,7 +566,10 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     if tool_name == "search_youtube":
         return search_youtube(tool_input["query"]), None
     elif tool_name == "play_url":
-        play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
+        result = play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
+        if result != "playing":
+            # Returning no state keeps the turn alive so the agent can try another candidate.
+            return f"playback failed: {result}", None
         return "playing", SpeakerState.RESET
     elif tool_name == "stop":
         active_timers = _timers.keys()
@@ -586,7 +606,28 @@ def _split_sentences(text: str) -> tuple[list[str], str]:
     return parts[:-1], parts[-1]
 
 
-def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
+def _is_plain_user_turn(message: dict) -> bool:
+    """True if `message` is a spoken user turn rather than a carrier for tool_result blocks."""
+    return message["role"] == "user" and isinstance(message["content"], str)
+
+
+def _trim_api_messages():
+    """Trim `api_messages` to the rolling window, cutting only where the conversation can legally start.
+
+    A tool_use block must always be followed by its matching tool_result, so a naive slice can orphan
+    a pair and get the whole request rejected. Cut back to a plain spoken user turn instead."""
+    if len(api_messages) <= API_HISTORY_LIMIT:
+        return
+    for index in range(len(api_messages) - API_HISTORY_LIMIT, len(api_messages)):
+        if _is_plain_user_turn(api_messages[index]):
+            if index:
+                log(f"trimming {index} message(s) from context")
+                del api_messages[:index]
+            return
+    # No safe cut point in the window — the tail is one long tool exchange, so keep it whole.
+
+
+def query_llm(llm_client, system, text: str, mic_stream=None, followup: bool = False) -> SpeakerState:
     """Send `text` to the LLM, stream TTS as sentences arrive, handle tool calls, and return the next state."""
     ctx.interrupt.clear()
 
@@ -618,6 +659,21 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
     tts_thread = threading.Thread(target=_tts_worker, daemon=True)
     tts_thread.start()
 
+    def _record_partial(spoken: str):
+        """Keep what the assistant had said before an interrupt cut it off.
+
+        Without this the model has no idea it was halfway through listing options, so a follow-up
+        like "the second one" has nothing to refer back to."""
+        if spoken.strip():
+            api_messages.append({"role": "assistant", "content": spoken})
+
+    def _speak_now(line: str):
+        """Speak a canned line and wait for it, so the user hears why the turn ended."""
+        tts_queue.put(line)
+        tts_queue.join()
+        entry = {"role": "assistant", "text": line}
+        chat_history.append(entry)
+
     def _discard_tts():
         """Drop queued-but-unspoken sentences (interrupt already set, so worker drains fast)."""
         while not tts_queue.empty():
@@ -628,17 +684,27 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 break
 
     try:
-        messages = [{"role": "user", "content": text}]
+        # The rolling conversation is the whole point: without it the model cannot resolve "that one"
+        # or remember the search results it just described.
+        _trim_api_messages()
+        api_messages.append({"role": "user", "content": text})
+        messages = api_messages
+        model = ctx.followup_model if followup else ctx.model
         next_state = SpeakerState.RESET
 
-        while True:
+        for _round in range(MAX_TOOL_ROUNDS):
             accumulated_text = ""
             sentence_buffer = ""
             _live_entry = None  # mutable chat_history entry updated live during streaming
 
             with llm_client.messages.stream(
-                model="claude-sonnet-4-5",
-                max_tokens=1024,
+                model=model,
+                max_tokens=4096,  # thinking shares this budget, so it needs more room than the reply
+                # Adaptive thinking stays ON deliberately. Disabling it on Opus 5 can make the model
+                # write a tool call as plain text instead of a tool_use block — the turn looks fine
+                # and the call silently never runs. effort=low buys the latency back safely.
+                thinking={"type": "adaptive"},
+                output_config={"effort": ctx.effort},
                 system=system,
                 tools=TOOLS,
                 messages=messages
@@ -661,6 +727,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
 
                 if ctx.interrupt.is_set():
                     _discard_tts()
+                    _record_partial(accumulated_text)
                     return SpeakerState.RECORDING
 
                 if sentence_buffer.strip():
@@ -670,6 +737,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 tts_queue.join()
 
                 if ctx.interrupt.is_set():
+                    _record_partial(accumulated_text)
                     return SpeakerState.RECORDING
 
                 final_message = stream.get_final_message()
@@ -678,6 +746,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 # Remove live entry if nothing was streamed
                 if _live_entry is not None and not accumulated_text.strip():
                     chat_history.remove(_live_entry)
+                messages.append({"role": "assistant", "content": final_message.content})
                 return next_state
 
             if final_message.stop_reason == "pause_turn":
@@ -690,6 +759,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                     chat_history.remove(_live_entry)
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
+                terminal = False
                 for block in final_message.content:
                     if block.type == "tool_use":
                         log(f"\ttool: {block.name} {block.input}")
@@ -697,6 +767,9 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                         result, state = _execute_tool(block.name, block.input)
                         if state is not None:
                             next_state = state
+                            # A terminal tool only ends the turn if it actually worked — a failed
+                            # play_url returns no state, so the agent gets a round to try another.
+                            terminal = terminal or block.name in TERMINAL_TOOLS
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -705,11 +778,31 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 messages.append({"role": "user", "content": tool_results})
 
                 # Terminal actions don't need another LLM round-trip
-                if any(
-                    block.type == "tool_use" and block.name in ("play_url", "stop", "follow_on")
-                    for block in final_message.content
-                ):
+                if terminal:
                     return next_state
+                continue
+
+            # Anything else must return. Falling through the loop re-sends an identical request and
+            # gets an identical answer, so an unhandled stop_reason is an infinite spin.
+            if _live_entry is not None and not accumulated_text.strip():
+                chat_history.remove(_live_entry)
+            if final_message.stop_reason == "refusal":
+                log("llm refused the request")
+                # A refusal carries no usable content, so stand the spoken line in as the turn —
+                # an empty assistant message would be rejected on the next request.
+                _speak_now("Sorry, I can't help with that one.")
+                api_messages.append({"role": "assistant", "content": "Sorry, I can't help with that one."})
+            elif final_message.stop_reason == "max_tokens":
+                log("llm hit max_tokens")
+                messages.append({"role": "assistant", "content": final_message.content})
+                _speak_now("Sorry, I lost my thread there.")
+            else:
+                log(f"unexpected stop_reason: {final_message.stop_reason}")
+            return next_state
+
+        log(f"tool loop hit {MAX_TOOL_ROUNDS} rounds, giving up")
+        _speak_now("Sorry, I got stuck on that.")
+        return next_state
 
     finally:
         _discard_tts()
@@ -907,31 +1000,85 @@ def _player_loop():
             break
 
 
-def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | None = None):
-    """Resolve a YouTube URL to a direct stream URL via yt-dlp and enqueue it for playback."""
+def _ytdlp(args: list[str], client: str = "") -> subprocess.CompletedProcess:
+    """Run yt-dlp. `client` pins a YouTube player client; empty uses yt-dlp's own default chain."""
+    cmd = [sys.executable, "-m", "yt_dlp", *args]
+    if client:
+        cmd += ["--extractor-args", f"youtube:player_client={client}"]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_TIMEOUT)
+
+
+def _ytdlp_error(stderr: str) -> str:
+    """Condense yt-dlp's stderr to the one line worth reporting."""
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    errors = [l for l in lines if l.startswith("ERROR")] or lines
+    return (errors[-1] if errors else "no output")[:160]
+
+
+def _stream_is_playable(url: str) -> str:
+    """Range-probe a resolved stream, returning "" if it serves bytes or a short reason if not.
+
+    A successful yt-dlp resolve does not mean the URL works: YouTube hands back throttled or
+    IP-bound URLs that 403 on first read. Finding out here means we can still try another client,
+    rather than mpv failing silently after the turn has already ended."""
+    try:
+        request = urllib.request.Request(url, headers={
+            "Range": f"bytes=0-{PROBE_BYTES - 1}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        })
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return "" if response.read(1) else "empty response"
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code}"
+    except Exception as e:
+        return type(e).__name__
+
+
+def _resolve_youtube_stream(url: str) -> tuple[str, str, str]:
+    """Resolve a YouTube URL to a stream that actually serves bytes.
+
+    Returns (stream_url, title, error). Tries each player client in turn — a 403 from one client
+    is routine and says nothing about the others."""
+    problems = []
+    for client in YTDLP_CLIENTS:
+        label = client or "default"
+        try:
+            result = _ytdlp(["-f", "bestaudio[ext=m4a]/bestaudio", "--print", "url",
+                             "--print", "%(title)s", "--no-playlist", url], client)
+        except subprocess.TimeoutExpired:
+            problems.append(f"{label}: timed out")
+            continue
+        if result.returncode != 0 or not result.stdout.strip():
+            problems.append(f"{label}: {_ytdlp_error(result.stderr)}")
+            continue
+        lines = result.stdout.strip().splitlines()
+        stream_url = lines[0]
+        rejected = _stream_is_playable(stream_url)
+        if rejected:
+            problems.append(f"{label}: stream rejected ({rejected})")
+            continue
+        if client != YTDLP_CLIENTS[0]:
+            log(f"yt-dlp: '{YTDLP_CLIENTS[0]}' failed, fell back to '{label}'")
+        return stream_url, (lines[1] if len(lines) > 1 else ""), ""
+    return "", "", "; ".join(problems)
+
+
+def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | None = None) -> str:
+    """Resolve a YouTube URL and enqueue it for playback. Returns "" on success, else the reason."""
     log("resolving youtube stream url...")
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
-         "--print", "url", "--print", "%(title)s",
-         "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        log(f"yt-dlp error: {result.stderr}")
-        return
-    lines = result.stdout.strip().splitlines()
-    stream_url = lines[0] if lines else ""
-    if not stream_url:
-        log("yt-dlp: no stream url found")
-        return
-    if title is None and len(lines) > 1:
-        title = lines[1]
+    stream_url, resolved_title, error = _resolve_youtube_stream(url)
+    if error:
+        log(f"yt-dlp could not resolve {url}: {error}")
+        return error
+    if title is None and resolved_title:
+        title = resolved_title
     entry: dict = {"url": url, "start_time": start_time}
     if title:
         entry["title"] = title
     _save_history(PLAY_HISTORY_PATH, entry)
     log(f"streaming: {stream_url[:80]}...")
     _player.cmd_queue.put(('play', stream_url, None, start_time, url))
+    return ""
 
 
 def _download_youtube_and_play(url: str):
@@ -940,13 +1087,10 @@ def _download_youtube_and_play(url: str):
     tmpdir = tempfile.mkdtemp()
     output_template = os.path.join(tmpdir, "audio.%(ext)s")
     log("downloading youtube audio...")
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", output_template,
-         "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
-        capture_output=True, text=True
-    )
+    result = _ytdlp(["-f", "bestaudio[ext=m4a]/bestaudio", "-o", output_template,
+                     "--no-playlist", url], YTDLP_CLIENTS[0])
     if result.returncode != 0:
-        log(f"yt-dlp error: {result.stderr}")
+        log(f"yt-dlp error: {_ytdlp_error(result.stderr)}")
         return
     files = os.listdir(tmpdir)
     if not files:
@@ -1006,42 +1150,39 @@ def resolve_url(url: str) -> str:
     """Resolve a URL to a direct streamable URL. For YouTube, uses yt-dlp. Other URLs pass through."""
     if "youtube.com" not in url and "youtu.be" not in url:
         return url
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
-         "--get-url", "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
-    stream_url = result.stdout.strip().splitlines()[0]
-    if not stream_url:
-        raise RuntimeError("yt-dlp returned no URL")
+    stream_url, _, error = _resolve_youtube_stream(url)
+    if error:
+        raise RuntimeError(error)
     return stream_url
 
 
-def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0, title: str | None = None):
-    """Stream audio from `url`, using yt-dlp resolution for YouTube URLs on Windows."""
+def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0, title: str | None = None) -> str:
+    """Stream audio from `url`. Returns "playing" or a failure reason.
+
+    YouTube resolution runs inline rather than in a background thread so a rejection reaches the
+    caller — resolving off-thread meant a 403 produced silence that nothing in the system noticed."""
     is_youtube = "youtube.com" in url or "youtu.be" in url
     if is_youtube:
         _player.cmd_queue.put(('stop',))
-        threading.Thread(target=_resolve_youtube_and_play, args=(url, start_time, title), daemon=True).start()
-    else:
-        entry: dict = {"url": url, "start_time": start_time}
-        if title:
-            entry["title"] = title
-        _save_history(PLAY_HISTORY_PATH, entry)
-        _player.cmd_queue.put(('play', url, headers, start_time, url))
+        error = _resolve_youtube_and_play(url, start_time, title)
+        return error or "playing"
+    entry: dict = {"url": url, "start_time": start_time}
+    if title:
+        entry["title"] = title
+    _save_history(PLAY_HISTORY_PATH, entry)
+    _player.cmd_queue.put(('play', url, headers, start_time, url))
+    return "playing"
 
 
 def search_youtube(query: str, max_results: int = 5) -> str:
     """Search YouTube for `query` and return a JSON list of title/url/duration/channel results."""
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"],
-        capture_output=True, text=True
-    )
+    try:
+        result = _ytdlp([f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"])
+    except subprocess.TimeoutExpired:
+        return "search timed out"
     results = []
     for line in result.stdout.strip().splitlines():
-        if line:
+        if line.startswith("{"):
             item = json.loads(line)
             results.append({
                 "title": item.get("title"),
@@ -1049,6 +1190,12 @@ def search_youtube(query: str, max_results: int = 5) -> str:
                 "duration": item.get("duration"),
                 "channel": item.get("channel") or item.get("uploader"),
             })
+    # An empty result set and a rejected request look identical to the caller otherwise, and the
+    # agent needs to tell them apart to decide between rephrasing and trying another source.
+    if not results:
+        if result.returncode != 0:
+            return f"search failed: {_ytdlp_error(result.stderr)}"
+        return "no results found"
     return json.dumps(results)
 
 
@@ -1235,6 +1382,7 @@ def _speak_loop(ctx):
     # the loop
     transcribed_request = ""
     onset_remaining = ONSET_TIMEOUT
+    followup = False  # a turn re-entered via follow_on or an interrupt already has full context
     with dev.InputStream(samplerate=ctx.input_sample_rate, channels=1, dtype='int16', device=ctx.input_dev_index) as stream:
         while not ctx.shutdown.is_set():
             if ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
@@ -1248,6 +1396,7 @@ def _speak_loop(ctx):
                 )
                 _perf_timer.start()
                 onset_remaining = ONSET_TIMEOUT
+                followup = False
                 if record_dir:
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                     log(f"caching {filepath}")
@@ -1284,10 +1433,11 @@ def _speak_loop(ctx):
                 _save_history(CHAT_HISTORY_PATH, {"role": "user", "text": transcribed_request})
                 ctx.speaker_state = SpeakerState.LLM_AGENT
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
-                ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
+                ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream, followup=followup)
                 _perf_timer.lap("llm")
                 if ctx.speaker_state == SpeakerState.RECORDING:
                     onset_remaining = ONSET_TIMEOUT
+                    followup = True
                     _flush_stream(stream, ctx.input_sample_rate)
                     ctx.wake_model.reset()
                 else:
@@ -1382,6 +1532,16 @@ def start():
             suffix = f" ({extra})" if extra else ""
             system += f"- [{hint['category']}] {hint['name']}: {value}{suffix}\n"
 
+    # Tools render before system, so one breakpoint here caches the whole stable prefix. Everything
+    # that varies per turn lives in messages, after it.
+    system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+
+    # llm config
+    llm_cfg = config["llm"]
+    model = llm_cfg.get("model", "claude-opus-5")
+    followup_model = llm_cfg.get("followup_model", model)
+    effort = llm_cfg.get("effort", "low")
+
     # whisper / inference config
     inf = config.get("inference", {})
     device = inf.get("device", "cpu")
@@ -1419,6 +1579,9 @@ def start():
             compute_type=inf.get("whisper_compute", compute)
         ),
         vad=_SileroVAD(threshold=vad_threshold, mic_gain=vad_mic_gain, verbose=vad_verbose),
+        model=model,
+        followup_model=followup_model,
+        effort=effort,
         input_dev_index=int(input_dev_info['index']),
         input_sample_rate=int(input_dev_info['default_samplerate']),
         output_dev_index=int(output_dev_info['index']),
