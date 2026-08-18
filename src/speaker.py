@@ -22,13 +22,13 @@ import os
 import urllib.request
 import urllib.error
 
+
 from pathlib import Path
 from piper.voice import PiperVoice
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
 from dataclasses import dataclass, field
 from enum import Enum, auto
-
 
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
@@ -53,6 +53,13 @@ YTDLP_TIMEOUT = 60.0
 PROBE_BYTES = 2048  # a resolved URL can still 403 on first read; find out before mpv does
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+
+# LED ring colours per speaker state, 0xRRGGBB
+RING_COLOR_WAKE = 0xFF8800  # orange
+RING_COLOR_RECORDING = 0x40C0C0  # soft cyan
+RING_COLOR_TRANSCRIBING = 0xB57EDC  # mauve
+RING_COLOR_LLM = 0xFF8800  # orange, breathing
+RING_FLASH_INTERVAL = 0.4  # startup flash half-period
 
 TOOLS = [
     {
@@ -217,6 +224,7 @@ class SpeakerContext:
     input_sample_rate: int
     worker_mode: bool = False
     worker_url: str | None = None
+    ring: any = None  # XVF3800 LED ring, None on platforms/boxes without one
     model: str = "claude-opus-5"
     followup_model: str = "claude-opus-5"  # set equal to `model` to keep one prompt cache
     effort: str = "low"
@@ -323,6 +331,8 @@ _silence_timeout: float = 1.6 # continuous silence that ends a recording, overri
 _perf_timer = _PerfTimer()
 _timers = _Timers()
 _log = _Log()
+_ring_startup_thread: threading.Thread | None = None
+_ring_startup_stop = threading.Event()
 
 
 def log(text: str):
@@ -1168,6 +1178,7 @@ def shutdown():
     if ctx is not None:
         ctx.shutdown.set()
         ctx.interrupt.set()
+        ring_off(ctx)
     _player.cmd_queue.put(('quit',))
 
 
@@ -1455,6 +1466,8 @@ def _speak_loop(ctx):
     with dev.InputStream(samplerate=ctx.input_sample_rate, channels=1, dtype='int16', device=ctx.input_dev_index) as stream:
         while not ctx.shutdown.is_set():
             if ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
+                ring_startup_stop()  # no-op once the first wake loop has stopped it
+                ring_off(ctx)
                 wake_audio = _listen_for_wake(
                     ctx.wake_model,
                     stream,
@@ -1472,15 +1485,18 @@ def _speak_loop(ctx):
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
+                    ring_wake(ctx)
                     _play_oneshot_audio_file("sounds/wake.wav")
                     ctx.speaker_state = SpeakerState.RECORDING
             elif ctx.speaker_state == SpeakerState.RECORDING:
                 log(f"recording (onset budget: {onset_remaining:.1f}s)")
+                ring_recording(ctx)
                 duck_playback()
                 audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
                 transcribed_request = ""
                 if audio_request is not None:
                     _perf_timer.lap("recorded")
+                    ring_transcribing(ctx)
                     transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
                     _perf_timer.lap("transcribed")
                 # nothing usable captured — keep listening on the remaining budget rather than dropping
@@ -1502,6 +1518,7 @@ def _speak_loop(ctx):
                 _save_history(CHAT_HISTORY_PATH, {"role": "user", "text": transcribed_request})
                 ctx.speaker_state = SpeakerState.LLM_AGENT
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
+                ring_llm_agent(ctx)
                 ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream, followup=followup)
                 _perf_timer.lap("llm")
                 if ctx.speaker_state == SpeakerState.RECORDING:
@@ -1517,6 +1534,7 @@ def _speak_loop(ctx):
                 ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 log("return to listen for wake")
             elif ctx.speaker_state == SpeakerState.VAD_RECORD:
+                ring_recording(ctx)
                 audio = _vad_record(ctx.vad, stream, ctx.input_sample_rate)
                 filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                 log(f"caching {filepath}")
@@ -1557,6 +1575,100 @@ def _start_worker():
     log("worker ready")
 
 
+def open_ring():
+    """Open the mic array's LED ring, or return None when this box hasn't got one.
+
+    The import is deferred so a platform without pyusb or a libusb backend still starts.
+    """
+    try:
+        from xvf3800 import XVF3800
+        ring = XVF3800.open()
+        if ring is None:
+            log("ring: no XVF3800 found")
+        else:
+            log(f"ring: XVF3800 firmware {'.'.join(str(v) for v in ring.version())}")
+        return ring
+    except Exception as e:
+        log(f"ring: unavailable ({e})")
+        return None
+
+
+def _ring_call(fn, *args):
+    """The ring is cosmetic — a usb hiccup must never take the state machine down."""
+    try:
+        fn(*args)
+    except Exception as e:
+        log(f"ring: {e}")
+
+
+def ring_startup(ring):
+    """Flash mauve while the models load. Runs on its own thread until ring_startup_stop().
+
+    Takes the ring rather than ctx — startup runs before there is a SpeakerContext.
+    """
+    global _ring_startup_thread
+    if ring is None:
+        return
+
+    def _flash():
+        lit = True
+        while True:
+            _ring_call(ring.solid, RING_COLOR_TRANSCRIBING if lit else 0x000000)
+            lit = not lit
+            if _ring_startup_stop.wait(RING_FLASH_INTERVAL):
+                break
+        _ring_call(ring.off)
+
+    _ring_startup_stop.clear()
+    _ring_startup_thread = threading.Thread(target=_flash, daemon=True)
+    _ring_startup_thread.start()
+
+
+def ring_startup_stop():
+    """Stop the startup flash. Joins the thread so it can't repaint over the next state."""
+    global _ring_startup_thread
+    if _ring_startup_thread is None:
+        return
+    _ring_startup_stop.set()
+    _ring_startup_thread.join(timeout=1.0)
+    _ring_startup_thread = None
+
+
+def ring_off(ctx):
+    """Idle — nothing to show."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.off)
+
+
+def ring_wake(ctx):
+    """Wake word heard."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.solid, RING_COLOR_WAKE)
+
+
+def ring_recording(ctx):
+    """Capturing the request."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.solid, RING_COLOR_RECORDING)
+
+
+def ring_transcribing(ctx):
+    """Whisper is running on the captured audio."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.solid, RING_COLOR_TRANSCRIBING)
+
+
+def ring_llm_agent(ctx):
+    """Agent loop: thinking, calling tools, speaking."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.breathe, RING_COLOR_LLM, 1)
+
+
 def start():
     """Initialise all models and devices from config.toml and launch the background threads."""
     global ctx
@@ -1579,6 +1691,10 @@ def start():
 
     if ctx is not None:
         return
+
+    # opened up front, before the models load, so the startup flash covers the whole wait
+    ring = open_ring()
+    ring_startup(ring)
 
     chat_history.extend(_load_history(CHAT_HISTORY_PATH, HISTORY_LOAD_LIMIT))
 
@@ -1655,6 +1771,7 @@ def start():
         output_dev_index=int(output_dev_info['index']),
         output_sample_rate=int(output_dev_info['default_samplerate']),
         worker_url=worker_url,
+        ring=ring,
     )
 
     threading.Thread(

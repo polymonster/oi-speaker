@@ -77,6 +77,54 @@ pip install -e .
 pip install -e ".[cuda]"
 ```
 
+## LED Ring (reSpeaker XVF3800)
+
+`src/xvf3800.py` talks to the reSpeaker XVF3800 USB 4-Mic Array over its vendor USB control
+interface — LED ring, direction of arrival, and the DSP tuning parameters. It is a vendored
+and tidied copy of `python_control/xvf_host.py` from
+[reSpeaker_XVF3800_USB_4MIC_ARRAY](https://github.com/respeaker/reSpeaker_XVF3800_USB_4MIC_ARRAY),
+so no binaries or firmware from that repo are needed.
+
+On Linux the control transfers need permission on the raw USB device, otherwise every command
+fails with `usb.core.USBError: [Errno 13] Access denied`. `install-service.sh` installs the udev
+rule for you; to do it standalone:
+
+```bash
+sudo cp setup/99-respeaker-xvf3800.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --subsystem-match=usb
+```
+
+The rule is permanent — it re-applies on every boot and replug.
+
+From the CLI (installed as `xvf3800`, or run the file directly):
+
+```bash
+xvf3800 --list                       # every supported command
+xvf3800 VERSION
+xvf3800 DOA_VALUE                    # angle 0-359, and whether speech is detected
+xvf3800 LED_EFFECT --values 3        # 0 off, 1 breath, 2 rainbow, 3 solid, 4 doa, 5 ring
+xvf3800 LED_COLOR --values 0xFF8800
+xvf3800 LED_BRIGHTNESS --values 50
+```
+
+From Python:
+
+```python
+from xvf3800 import XVF3800
+
+ring = XVF3800.open()   # None if the array isn't plugged in
+if ring:
+    ring.solid(0xFF8800)        # whole ring one colour
+    ring.breathe(0x0000FF, 1)   # breathing, speed 1
+    ring.ring([0xFF0000, 0x000000])  # per-LED colours, repeated around the 12 LEDs
+    ring.doa_mode()             # firmware direction-of-arrival indicator (the boot default)
+    ring.off()
+```
+
+The ring boots into rainbow and switches to DoA mode after ~2 seconds, so anything you set at
+startup should be set after that.
+
 ## Downloading Models
 
 Some of the dependencies require additional downloads

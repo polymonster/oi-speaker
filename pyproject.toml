@@ -21,6 +21,8 @@ dependencies = [
     "zeroconf>=0.131.0",
     "httpx>=0.27.0",
     "silero-vad",
+    "pyusb",
+    "libusb-package; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -42,9 +44,10 @@ cuda = [
 
 [project.scripts]
 speaker = "speaker:main"
+xvf3800 = "xvf3800:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/speaker.py", "src/web.py", "src/static"]
+packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/static"]

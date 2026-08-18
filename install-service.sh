@@ -27,6 +27,12 @@ mkdir -p "$ENV_DIR"
 
 sudo cp setup/oi-speaker@.service /etc/systemd/system/oi-speaker@.service
 
+# the XVF3800 LED ring is driven over raw usb control transfers, which need permission on the
+# device node — without this the service runs but every ring command is "Access denied".
+sudo cp setup/99-respeaker-xvf3800.rules /etc/udev/rules.d/99-respeaker-xvf3800.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --subsystem-match=usb
+
 # %h/%U resolve against the service manager (root), not User=, so the per-user absolute
 # paths have to be written out here.
 sudo mkdir -p "$DROPIN_DIR"
