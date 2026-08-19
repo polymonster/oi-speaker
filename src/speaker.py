@@ -305,6 +305,45 @@ class _SileroVAD:
         return prob > self.threshold
 
 
+class _VoiceProbe:
+    """Silero VAD run purely for the timeline, so speech is visible while the speaker is listening
+    for the wake word. The recording VAD cannot serve this — it only starts once a turn already has,
+    which is after the moment you want to look at.
+
+    Holds its own model instance rather than sharing ctx.vad: silero is stateful, and a display tap
+    driving the LSTM state that recording decisions depend on would be a real bug. Loaded on first
+    use, so a speaker that never turns capture on never pays for it."""
+
+    def __init__(self):
+        self._model = None
+        self._carry: np.ndarray = np.array([], dtype=np.int16)
+        self.mic_gain: float = 1.0
+
+    def reset(self):
+        self._carry = np.array([], dtype=np.int16)
+        if self._model is not None:
+            self._model.reset_states()
+
+    def probe(self, audio: np.ndarray) -> float | None:
+        """Feed one chunk of 16 kHz int16 audio and return the highest speech probability across the
+        512-sample frames it completed, or None if it did not complete one. Wake chunks are 1280
+        samples against silero's fixed 512, so the remainder carries into the next call — 2 frames,
+        then 3, then 2, rather than dropping a fifth of the audio every chunk."""
+        import torch
+        if self._model is None:
+            from silero_vad import load_silero_vad
+            self._model = load_silero_vad(onnx=True)
+            log("[timeline] voice probe loaded")
+        self._carry = np.concatenate([self._carry, audio])
+        best = None
+        while len(self._carry) >= VAD_CHUNK:
+            frame, self._carry = self._carry[:VAD_CHUNK], self._carry[VAD_CHUNK:]
+            scaled = np.clip(frame.astype(np.float32) / 32768.0 * self.mic_gain, -1.0, 1.0)
+            prob = float(self._model(torch.from_numpy(scaled), TARGET_SAMPLE_RATE))
+            best = prob if best is None else max(best, prob)
+        return best
+
+
 class _Log:
     def __init__(self):
         self._buffer: deque = deque(maxlen=2000)
@@ -406,6 +445,7 @@ _perf_timer = _PerfTimer()
 _timers = _Timers()
 _log = _Log()
 _levels = _Levels()
+_voice_probe = _VoiceProbe()
 _ring_startup_thread: threading.Thread | None = None
 _ring_startup_stop = threading.Event()
 
@@ -431,6 +471,7 @@ def get_level_frames(since: int = -1, marker_since: int = -1) -> dict:
 def set_levels_enabled(enabled: bool):
     """Turn timeline capture on or off at runtime. Off costs nothing on the audio thread."""
     _levels.set_enabled(enabled)
+    _voice_probe.reset()  # drop carried samples and LSTM state from the last session
     log(f"timeline capture {'enabled' if enabled else 'disabled'}")
 
 
@@ -620,6 +661,12 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
         audio_flat = _read_audio(stream, WAKE_CHUNK, sample_rate)
         if rolling_buffer is not None:
             rolling_buffer.append(audio_flat)
+        # the only place speech can be told from room noise before a turn starts. debug-only, so it
+        # runs behind the capture flag rather than on every wake frame forever
+        if _levels.enabled:
+            voice_prob = _voice_probe.probe(audio_flat)
+            if voice_prob is not None:
+                _levels.set_vad(voice_prob)
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
             _levels.set_score(float(score))
@@ -1847,6 +1894,7 @@ def start():
     vad_threshold = float(inf.get("vad_threshold", 0.5))
     vad_mic_gain = float(inf.get("vad_mic_gain", 1.0))
     vad_verbose = "--verbose" in sys.argv
+    _voice_probe.mic_gain = vad_mic_gain  # match what the recording VAD hears, or the two disagree
     global _silence_timeout
     _silence_timeout = float(inf.get("silence_timeout", _silence_timeout))
 

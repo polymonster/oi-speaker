@@ -98,6 +98,8 @@
   #tl-toolbar button.on { border-color: #555; color: #eee; }
   #tl-live.on { border-color: #afa; color: #afa; }
   #tl-capture.on { border-color: #fa7; color: #fa7; }
+  .tl-key { color: #555; font-size: 0.75em; display: flex; align-items: center; gap: 4px; }
+  .tl-key i { width: 8px; height: 8px; flex-shrink: 0; }
   #tl-state { color: #7af; font-size: 0.8em; padding: 2px 8px; border: 1px solid #333; margin-left: auto; }
   #tl-db { color: #555; font-size: 0.8em; min-width: 5.5em; text-align: right; }
   #tl-canvas { width: 100%; height: 200px; border: 1px solid #222; touch-action: none; cursor: grab; display: block; flex-shrink: 0; }
@@ -176,6 +178,9 @@
     <button class="tl-win on" onclick="setWindow(30, this)">30s</button>
     <button class="tl-win" onclick="setWindow(60, this)">60s</button>
     <button id="tl-live" class="on" onclick="goLive()">&bull; live</button>
+    <span class="tl-key"><i style="background:#333"></i>peak</span>
+    <span class="tl-key"><i style="background:#7af"></i>level</span>
+    <span class="tl-key"><i style="background:#afa"></i>voice</span>
     <span id="tl-db">-inf dB</span>
     <span id="tl-state">--</span>
   </div>
@@ -782,6 +787,13 @@ function drawTimeline() {
     c.fillRect(x0, waveMid - pk, bw, pk * 2);
     c.fillStyle = '#7af';
     c.fillRect(x0, waveMid - rm, bw, rm * 2);
+    // the voice layer: amplitude scaled by speech probability, so it stands tall only when the
+    // signal is both loud and actually speech. a fridge hum stays blue, your voice goes green
+    if (f.vad != null) {
+      const vc = _tlNorm(f.rms * f.vad) * halfH;
+      c.fillStyle = '#afa';
+      c.fillRect(x0, waveMid - vc, bw, vc * 2);
+    }
   }
 
   // detector traces — sparse, only one model runs at a time, so break the line across gaps
