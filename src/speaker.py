@@ -38,6 +38,9 @@ VAD_PREROLL_FRAMES = 10 # frames kept from before onset so the first phoneme sur
 VAD_MIN_SPEECH = 0.35 # a recording holding less speech than this is noise, not a request
 NO_SPEECH_PROB_LIMIT = 0.6 # whisper segments above this are hallucinations on near-silence
 
+LEVEL_BUFFER_FRAMES = 2000 # ~64s at 31Hz (recording), ~160s at 12.5Hz (wake listen)
+MARKER_BUFFER_LEN = 200 # pipeline events kept alongside the level frames
+
 HISTORY_DIR = Path(".history")
 CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
 PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
@@ -281,7 +284,7 @@ class _SileroVAD:
     def __init__(self, threshold: float = 0.5, mic_gain: float = 1.0, verbose: bool = False):
         from silero_vad import load_silero_vad
         self._model = load_silero_vad(onnx=True)
-        self._threshold = threshold
+        self.threshold = threshold
         self._mic_gain = mic_gain
         self._verbose = verbose
         log(f"[VAD] Silero loaded — threshold={threshold} mic_gain={mic_gain}")
@@ -295,10 +298,11 @@ class _SileroVAD:
         audio = np.clip(audio * self._mic_gain, -1.0, 1.0)
         tensor = torch.from_numpy(audio)
         prob = float(self._model(tensor, sample_rate))
+        _levels.set_vad(prob)
         if self._verbose:
             rms = float(np.sqrt(np.mean(audio ** 2)))
-            log(f"[VAD] rms={rms:.4f} prob={prob:.3f} speech={prob > self._threshold}")
-        return prob > self._threshold
+            log(f"[VAD] rms={rms:.4f} prob={prob:.3f} speech={prob > self.threshold}")
+        return prob > self.threshold
 
 
 class _Log:
@@ -319,6 +323,55 @@ class _Log:
         return {"lines": lines, "total": total}
 
 
+class _Levels:
+    """Ring buffer of mic amplitude frames plus pipeline event markers, for the web timeline.
+
+    Frames arrive at a variable rate — 12.5/s while listening for the wake word (80ms chunks) and
+    31.25/s while recording (32ms chunks) — so each carries its own timestamp and the UI plots
+    against time rather than index. `score` and `vad` are whichever detector was running at the
+    time and stay None otherwise."""
+
+    def __init__(self):
+        self._buffer: deque = deque(maxlen=LEVEL_BUFFER_FRAMES)
+        self._markers: deque = deque(maxlen=MARKER_BUFFER_LEN)
+        self._counter: int = 0
+        self._marker_counter: int = 0
+        self._lock = threading.Lock()
+
+    def append(self, rms: float, peak: float):
+        with self._lock:
+            self._buffer.append({"i": self._counter, "ts": time.time(), "rms": rms, "peak": peak,
+                                 "score": None, "vad": None})
+            self._counter += 1
+
+    def _stamp(self, key: str, value: float):
+        # the detector runs immediately after the read that produced the frame, so the most recent
+        # frame is always the one this score belongs to
+        with self._lock:
+            if self._buffer:
+                self._buffer[-1][key] = value
+
+    def set_score(self, score: float):
+        self._stamp("score", score)
+
+    def set_vad(self, prob: float):
+        self._stamp("vad", prob)
+
+    def mark(self, kind: str, text: str = ""):
+        with self._lock:
+            self._markers.append({"i": self._marker_counter, "ts": time.time(), "kind": kind, "text": text})
+            self._marker_counter += 1
+
+    def get_since(self, since: int, marker_since: int = -1) -> dict:
+        # markers carry their own cursor — resending the whole window four times a second is real
+        # bandwidth on a pi, and a client watching the count cannot tell that the ring has rotated
+        with self._lock:
+            frames = [f for f in self._buffer if f["i"] > since]
+            markers = [m for m in self._markers if m["i"] > marker_since]
+            total = self._counter
+        return {"frames": frames, "markers": markers, "total": total}
+
+
 ctx: SpeakerContext | None = None
 chat_history: list[dict] = []
 # The conversation as the API sees it — content blocks, tool_use and tool_result included. Distinct
@@ -331,6 +384,7 @@ _silence_timeout: float = 1.6 # continuous silence that ends a recording, overri
 _perf_timer = _PerfTimer()
 _timers = _Timers()
 _log = _Log()
+_levels = _Levels()
 _ring_startup_thread: threading.Thread | None = None
 _ring_startup_stop = threading.Event()
 
@@ -342,6 +396,15 @@ def log(text: str):
 
 def get_log_lines(since: int = 0) -> dict:
     return _log.get_since(since)
+
+
+def mark(kind: str, text: str = ""):
+    """Record a pipeline event on the timeline (wake, record, transcribe, ...)."""
+    _levels.mark(kind, text)
+
+
+def get_level_frames(since: int = -1, marker_since: int = -1) -> dict:
+    return _levels.get_since(since, marker_since)
 
 
 def start_perf_timer():
@@ -416,13 +479,19 @@ def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
     samples of 16 kHz int16."""
     if sample_rate == TARGET_SAMPLE_RATE:
         audio, _ = stream.read(chunk_size16)
-        return np.squeeze(audio)
-    # read the exact native span that maps onto chunk_size16 samples. reading ceil(rate/16k) * chunk
-    # and truncating loses 8% of every chunk at 44.1 kHz, which both mangles the audio handed to
-    # whisper and breaks the frame continuity silero's LSTM state depends on
-    native_frames = int(round(chunk_size16 * sample_rate / TARGET_SAMPLE_RATE))
-    audio, _ = stream.read(native_frames)
-    return _resample_audio(np.squeeze(audio), sample_rate, TARGET_SAMPLE_RATE, target_length=chunk_size16)
+        flat = np.squeeze(audio)
+    else:
+        # read the exact native span that maps onto chunk_size16 samples. reading ceil(rate/16k) * chunk
+        # and truncating loses 8% of every chunk at 44.1 kHz, which both mangles the audio handed to
+        # whisper and breaks the frame continuity silero's LSTM state depends on
+        native_frames = int(round(chunk_size16 * sample_rate / TARGET_SAMPLE_RATE))
+        audio, _ = stream.read(native_frames)
+        flat = _resample_audio(np.squeeze(audio), sample_rate, TARGET_SAMPLE_RATE, target_length=chunk_size16)
+    # every live frame — wake listen, recording and barge-in — passes through here, so this is the
+    # one tap the timeline needs. float32 before squaring, int16 ** 2 overflows
+    scaled = flat.astype(np.float32) / 32768.0
+    _levels.append(float(np.sqrt(np.mean(scaled * scaled))), float(np.abs(scaled).max()))
+    return flat
 
 
 
@@ -479,6 +548,7 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float 
                 speech_started = True
                 speech_duration = onset_run * chunk_duration
                 chunks.extend(preroll)
+                mark("onset", "speech started")
                 continue
             if int(onset_elapsed) > log_limiter:
                 log_limiter = int(onset_elapsed)
@@ -486,6 +556,7 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float 
             onset_elapsed += chunk_duration
             if onset_elapsed >= onset_timeout:
                 log("no speech detected, returning to wake listen")
+                mark("warn", f"no speech within {onset_timeout:.1f}s onset budget")
                 return None, onset_elapsed
             continue
         chunks.append(audio_flat)
@@ -499,8 +570,10 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float 
 
     if speech_duration < VAD_MIN_SPEECH:
         log(f"discarding {speech_duration:.2f}s of speech, below the {VAD_MIN_SPEECH}s minimum")
+        mark("warn", f"discarded {speech_duration:.2f}s, below {VAD_MIN_SPEECH}s minimum")
         return None, onset_elapsed
     log(f"recorded {len(chunks) * chunk_duration:.1f}s ({speech_duration:.1f}s speech)")
+    mark("recorded", f"{len(chunks) * chunk_duration:.1f}s ({speech_duration:.1f}s speech)")
     return np.concatenate(chunks), onset_elapsed
 
 
@@ -520,6 +593,7 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
             rolling_buffer.append(audio_flat)
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
+            _levels.set_score(float(score))
             score_window.append(score > threshold)
             hits = sum(score_window)
             if score > 0.0:
@@ -527,6 +601,7 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
                     log(f"[wakeword] score: {score:.3f} ({hits}/{num_triggers})")
             if hits >= num_triggers:
                 log("ello mate!")
+                mark("wake", f"score {score:.2f}")
                 if rolling_buffer is not None:
                     return np.concatenate(rolling_buffer)
                 return np.array([], dtype=np.int16)
@@ -919,9 +994,11 @@ def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag
         audio_flat = _read_audio(stream, WAKE_CHUNK, input_sample_rate)
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
+            _levels.set_score(float(score))
             score_window.append(score > threshold)
             if sum(score_window) >= num_triggers:
                 log("interrupt: wake word during TTS")
+                mark("interrupt", f"wake during TTS, score {score:.2f}")
                 interrupt.set()
                 return
 
@@ -1490,15 +1567,18 @@ def _speak_loop(ctx):
                     ctx.speaker_state = SpeakerState.RECORDING
             elif ctx.speaker_state == SpeakerState.RECORDING:
                 log(f"recording (onset budget: {onset_remaining:.1f}s)")
+                mark("record", f"onset budget {onset_remaining:.1f}s")
                 ring_recording(ctx)
                 duck_playback()
                 audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
                 transcribed_request = ""
                 if audio_request is not None:
                     _perf_timer.lap("recorded")
+                    mark("transcribe", "")
                     ring_transcribing(ctx)
                     transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
                     _perf_timer.lap("transcribed")
+                    mark("transcribed", transcribed_request.strip())
                 # nothing usable captured — keep listening on the remaining budget rather than dropping
                 # the turn, so a false onset or a discarded noise clip does not send us back to the wake word
                 if not transcribed_request.strip():
@@ -1518,9 +1598,11 @@ def _speak_loop(ctx):
                 _save_history(CHAT_HISTORY_PATH, {"role": "user", "text": transcribed_request})
                 ctx.speaker_state = SpeakerState.LLM_AGENT
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
+                mark("llm", transcribed_request.strip())
                 ring_llm_agent(ctx)
                 ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream, followup=followup)
                 _perf_timer.lap("llm")
+                mark("llm-done", "")
                 if ctx.speaker_state == SpeakerState.RECORDING:
                     onset_remaining = ONSET_TIMEOUT
                     followup = True

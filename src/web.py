@@ -189,6 +189,12 @@ async def logs(since: int = 0):
     return spk.get_log_lines(since)
 
 
+@app.get("/levels")
+async def levels(since: int = -1, marker_since: int = -1):
+    # empty in --worker mode, where there is no audio thread to fill the buffer
+    return spk.get_level_frames(since, marker_since)
+
+
 @app.get("/status")
 async def status():
     with open(CONFIG_PATH, "rb") as f:
@@ -196,9 +202,13 @@ async def status():
     port = int(_cfg.get("network", {}).get("port", 8000))
     return {
         "state": spk.ctx.speaker_state.value if spk.ctx else spk.SpeakerState.LISTEN_FOR_WAKE.value,
+        "state_name": spk.ctx.speaker_state.name.lower() if spk.ctx else "starting",
         "playing": spk._player.active,
         "ip": _local_ip(),
         "port": port,
+        # drawn as the reference lines on the timeline's detector lane
+        "wake_threshold": spk.ctx.wake_threshold if spk.ctx else None,
+        "vad_threshold": spk.ctx.vad.threshold if spk.ctx and spk.ctx.vad else None,
     }
 
 
