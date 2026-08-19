@@ -161,12 +161,21 @@ async def audio_devices():
 
 _DEFAULT_CONFIDENTIAL = ["llm.anthropic_api_key"]
 
+# the settings form is generated from whatever keys config.toml happens to hold, so a runtime-tunable
+# key added after a box was set up is unreachable from the web UI — the only place to add it is the
+# config file the UI exists to avoid editing. surface these whether or not they are on disk; saving
+# writes them back. keep in step with apply_audio_settings()
+_AUDIO_DEFAULTS = {"duck_volume": 0, "mono_output": False}
+
 @app.get("/settings")
 async def get_settings():
     with open(CONFIG_PATH, "rb") as f:
         cfg = tomllib.load(f)
     meta = cfg.setdefault("meta", {})
     meta.setdefault("confidential", _DEFAULT_CONFIDENTIAL)
+    audio = cfg.setdefault("audio", {})
+    for key, default in _AUDIO_DEFAULTS.items():
+        audio.setdefault(key, default)
     return cfg
 
 
