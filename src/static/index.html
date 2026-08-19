@@ -97,6 +97,7 @@
   #tl-toolbar button:hover { border-color: #555; color: #eee; }
   #tl-toolbar button.on { border-color: #555; color: #eee; }
   #tl-live.on { border-color: #afa; color: #afa; }
+  #tl-capture.on { border-color: #fa7; color: #fa7; }
   #tl-state { color: #7af; font-size: 0.8em; padding: 2px 8px; border: 1px solid #333; margin-left: auto; }
   #tl-db { color: #555; font-size: 0.8em; min-width: 5.5em; text-align: right; }
   #tl-canvas { width: 100%; height: 200px; border: 1px solid #222; touch-action: none; cursor: grab; display: block; flex-shrink: 0; }
@@ -170,9 +171,10 @@
 
 <section id="timeline">
   <div id="tl-toolbar">
-    <button onclick="setWindow(10, this)">10s</button>
-    <button class="on" onclick="setWindow(30, this)">30s</button>
-    <button onclick="setWindow(60, this)">60s</button>
+    <button id="tl-capture" onclick="toggleCapture()">capture off</button>
+    <button class="tl-win" onclick="setWindow(10, this)">10s</button>
+    <button class="tl-win on" onclick="setWindow(30, this)">30s</button>
+    <button class="tl-win" onclick="setWindow(60, this)">60s</button>
     <button id="tl-live" class="on" onclick="goLive()">&bull; live</button>
     <span id="tl-db">-inf dB</span>
     <span id="tl-state">--</span>
@@ -609,6 +611,7 @@ let tlLive = true;        // right edge tracks the newest frame
 let tlEnd = 0;            // ts at the right edge while panned back
 let tlTimer = null;
 let tlRaf = null;
+let tlEnabled = false;    // server-owned, learned from the /levels payload
 let tlWakeThreshold = null;
 let tlVadThreshold = null;
 
@@ -621,10 +624,9 @@ function _tlNorm(v) {
 }
 
 function startTimeline() {
-  if (tlTimer) return;
+  if (tlRaf) return;
   renderMarkerList();  // paint the empty-state placeholder before the first poll lands
-  syncLevels();
-  tlTimer = setInterval(syncLevels, 250);
+  syncLevels();        // one poll to pick up whatever the server's capture state already is
   const draw = () => { drawTimeline(); tlRaf = requestAnimationFrame(draw); };
   tlRaf = requestAnimationFrame(draw);
 }
@@ -634,10 +636,46 @@ function stopTimeline() {
   if (tlRaf) { cancelAnimationFrame(tlRaf); tlRaf = null; }
 }
 
+// capture is off at every speaker start so the audio thread pays nothing for a debug view nobody is
+// watching. the server owns the flag — another phone may have turned it on
+async function toggleCapture() {
+  const next = !tlEnabled;
+  try {
+    await fetch('/levels/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next })
+    });
+  } catch { return; }
+  if (!next) { tlFrames = []; tlMarkers = []; }
+  await syncLevels();
+}
+
+function setCaptureUi(enabled) {
+  const changed = enabled !== tlEnabled;
+  tlEnabled = enabled;
+  const btn = document.getElementById('tl-capture');
+  btn.textContent = enabled ? 'capture on' : 'capture off';
+  btn.classList.toggle('on', enabled);
+  // no point polling four times a second for a buffer nothing is filling
+  if (enabled && !tlTimer) tlTimer = setInterval(syncLevels, 250);
+  if (!enabled && tlTimer) { clearInterval(tlTimer); tlTimer = null; }
+  if (!enabled) document.getElementById('tl-db').textContent = '-inf dB';
+  // covers a toggle from another phone as well as our own, in both directions
+  if (changed) renderMarkerList();
+}
+
 async function syncLevels() {
   if (document.hidden) return;
   try {
     const data = await fetch(`/levels?since=${tlSince}&marker_since=${tlMarkerSince}`).then(r => r.json());
+    setCaptureUi(data.enabled);
+    // the speaker restarted (or capture was cycled) and its counters are behind our cursor — without
+    // this the page would sit empty forever, asking for frames that will not be issued again
+    if (data.total < tlSince) {
+      tlSince = -1; tlMarkerSince = -1; tlFrames = []; tlMarkers = [];
+      return;
+    }
     for (const f of data.frames) { tlFrames.push(f); tlSince = f.i; }
     if (tlFrames.length > TL_MAX_FRAMES) tlFrames.splice(0, tlFrames.length - TL_MAX_FRAMES);
     for (const m of data.markers) { tlMarkers.push(m); tlMarkerSince = m.i; }
@@ -654,7 +692,9 @@ async function syncLevels() {
 function renderMarkerList() {
   const el = document.getElementById('tl-markers');
   if (!tlMarkers.length) {
-    el.innerHTML = '<div style="color:#444;">no events yet — say the wake word...</div>';
+    el.innerHTML = tlEnabled
+      ? '<div style="color:#444;">no events yet — say the wake word...</div>'
+      : '<div style="color:#444;">capture is off</div>';
     return;
   }
   el.innerHTML = '';
@@ -672,9 +712,7 @@ function renderMarkerList() {
 
 function setWindow(secs, btn) {
   tlWindow = secs;
-  btn.parentNode.querySelectorAll('button').forEach(b => {
-    if (b.id !== 'tl-live') b.classList.remove('on');
-  });
+  document.querySelectorAll('#tl-toolbar .tl-win').forEach(b => b.classList.remove('on'));
   btn.classList.add('on');
 }
 
@@ -698,7 +736,8 @@ function drawTimeline() {
   if (!tlFrames.length) {
     c.fillStyle = '#444';
     c.font = "12px 'Cousine', monospace";
-    c.fillText('waiting for audio...', 10, h / 2);
+    c.textBaseline = 'middle';
+    c.fillText(tlEnabled ? 'waiting for audio...' : 'capture is off — press capture to start recording levels', 10, h / 2);
     return;
   }
 

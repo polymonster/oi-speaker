@@ -42,6 +42,10 @@ class SyncConfigRequest(BaseModel):
     peer_name: str
 
 
+class LevelsEnableRequest(BaseModel):
+    enabled: bool
+
+
 _peers_lock = threading.Lock()
 _peers: dict[str, dict] = {}  # keyed by room name
 _zeroconf: AsyncZeroconf | None = None
@@ -202,6 +206,13 @@ async def logs(since: int = 0):
 async def levels(since: int = -1, marker_since: int = -1):
     # empty in --worker mode, where there is no audio thread to fill the buffer
     return spk.get_level_frames(since, marker_since)
+
+
+@app.post("/levels/enable")
+async def levels_enable(req: LevelsEnableRequest):
+    """Timeline capture is off at every start — the web ui turns it on for a debugging session."""
+    spk.set_levels_enabled(req.enabled)
+    return {"enabled": req.enabled}
 
 
 @app.get("/status")

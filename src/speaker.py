@@ -337,8 +337,22 @@ class _Levels:
         self._counter: int = 0
         self._marker_counter: int = 0
         self._lock = threading.Lock()
+        # opt-in — this is a debug view, and the capture runs on every audio frame. off on every
+        # start, the web ui turns it on for the length of a debugging session
+        self.enabled: bool = False
+
+    def set_enabled(self, enabled: bool):
+        with self._lock:
+            self.enabled = enabled
+            if not enabled:
+                # drop what was captured rather than leave a stale window to be shown on re-enable.
+                # the counters keep climbing so a client's cursor stays valid across the gap
+                self._buffer.clear()
+                self._markers.clear()
 
     def append(self, rms: float, peak: float):
+        if not self.enabled:
+            return
         with self._lock:
             self._buffer.append({"i": self._counter, "ts": time.time(), "rms": rms, "peak": peak,
                                  "score": None, "vad": None})
@@ -347,9 +361,13 @@ class _Levels:
     def _stamp(self, key: str, value: float):
         # the detector runs immediately after the read that produced the frame, so the most recent
         # frame is always the one this score belongs to
+        if not self.enabled:
+            return
         with self._lock:
             if self._buffer:
-                self._buffer[-1][key] = value
+                # cast here rather than trusting call sites — the models hand back np.float32, which
+                # only fails at json encoding time, as a 500 from /levels rather than anything local
+                self._buffer[-1][key] = float(value)
 
     def set_score(self, score: float):
         self._stamp("score", score)
@@ -358,6 +376,8 @@ class _Levels:
         self._stamp("vad", prob)
 
     def mark(self, kind: str, text: str = ""):
+        if not self.enabled:
+            return
         with self._lock:
             self._markers.append({"i": self._marker_counter, "ts": time.time(), "kind": kind, "text": text})
             self._marker_counter += 1
@@ -369,7 +389,8 @@ class _Levels:
             frames = [f for f in self._buffer if f["i"] > since]
             markers = [m for m in self._markers if m["i"] > marker_since]
             total = self._counter
-        return {"frames": frames, "markers": markers, "total": total}
+            enabled = self.enabled
+        return {"frames": frames, "markers": markers, "total": total, "enabled": enabled}
 
 
 ctx: SpeakerContext | None = None
@@ -405,6 +426,12 @@ def mark(kind: str, text: str = ""):
 
 def get_level_frames(since: int = -1, marker_since: int = -1) -> dict:
     return _levels.get_since(since, marker_since)
+
+
+def set_levels_enabled(enabled: bool):
+    """Turn timeline capture on or off at runtime. Off costs nothing on the audio thread."""
+    _levels.set_enabled(enabled)
+    log(f"timeline capture {'enabled' if enabled else 'disabled'}")
 
 
 def start_perf_timer():
@@ -488,9 +515,11 @@ def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
         audio, _ = stream.read(native_frames)
         flat = _resample_audio(np.squeeze(audio), sample_rate, TARGET_SAMPLE_RATE, target_length=chunk_size16)
     # every live frame — wake listen, recording and barge-in — passes through here, so this is the
-    # one tap the timeline needs. float32 before squaring, int16 ** 2 overflows
-    scaled = flat.astype(np.float32) / 32768.0
-    _levels.append(float(np.sqrt(np.mean(scaled * scaled))), float(np.abs(scaled).max()))
+    # one tap the timeline needs. float32 before squaring, int16 ** 2 overflows. checked before the
+    # conversion, not inside append(), so a disabled timeline costs a bool read per frame
+    if _levels.enabled:
+        scaled = flat.astype(np.float32) / 32768.0
+        _levels.append(float(np.sqrt(np.mean(scaled * scaled))), float(np.abs(scaled).max()))
     return flat
 
 
