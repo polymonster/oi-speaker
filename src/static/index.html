@@ -617,6 +617,7 @@ let tlEnd = 0;            // ts at the right edge while panned back
 let tlTimer = null;
 let tlRaf = null;
 let tlEnabled = false;    // server-owned, learned from the /levels payload
+let tlPolling = false;    // one poll in flight at a time — the cursor advances only on response
 let tlWakeThreshold = null;
 let tlVadThreshold = null;
 
@@ -671,7 +672,11 @@ function setCaptureUi(enabled) {
 }
 
 async function syncLevels() {
-  if (document.hidden) return;
+  // the cursor only advances once a response lands, so two polls in flight both ask from the same
+  // point and both append the same rows. the pi answers slower than the 250ms tick exactly when it
+  // is transcribing and running the llm, which is where the duplicates showed up
+  if (document.hidden || tlPolling) return;
+  tlPolling = true;
   try {
     const data = await fetch(`/levels?since=${tlSince}&marker_since=${tlMarkerSince}`).then(r => r.json());
     setCaptureUi(data.enabled);
@@ -681,17 +686,19 @@ async function syncLevels() {
       tlSince = -1; tlMarkerSince = -1; tlFrames = []; tlMarkers = [];
       return;
     }
-    for (const f of data.frames) { tlFrames.push(f); tlSince = f.i; }
+    // filter on the index as well, so appending stays idempotent whatever arrives
+    for (const f of data.frames) if (f.i > tlSince) { tlFrames.push(f); tlSince = f.i; }
     if (tlFrames.length > TL_MAX_FRAMES) tlFrames.splice(0, tlFrames.length - TL_MAX_FRAMES);
-    for (const m of data.markers) { tlMarkers.push(m); tlMarkerSince = m.i; }
+    let added = 0;
+    for (const m of data.markers) if (m.i > tlMarkerSince) { tlMarkers.push(m); tlMarkerSince = m.i; added++; }
     if (tlMarkers.length > TL_MAX_MARKERS) tlMarkers.splice(0, tlMarkers.length - TL_MAX_MARKERS);
-    if (data.markers.length) renderMarkerList();
+    if (added) renderMarkerList();
     if (tlFrames.length) {
       const last = tlFrames[tlFrames.length - 1];
       document.getElementById('tl-db').textContent =
         last.rms > 0 ? (20 * Math.log10(last.rms)).toFixed(0) + ' dB' : '-inf dB';
     }
-  } catch {}
+  } catch {} finally { tlPolling = false; }
 }
 
 function renderMarkerList() {
