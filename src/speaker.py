@@ -19,6 +19,9 @@ import requests
 import wave
 import uvicorn
 import os
+import urllib.request
+import urllib.error
+
 
 from pathlib import Path
 from piper.voice import PiperVoice
@@ -27,22 +30,55 @@ from faster_whisper import WhisperModel
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
 VAD_CHUNK = 512 # 32ms at 16kHz (Silero VAD frame size)
+VAD_ONSET_FRAMES = 3 # consecutive speech frames required before onset is accepted (~96ms)
+VAD_PREROLL_FRAMES = 10 # frames kept from before onset so the first phoneme survives (~320ms)
+VAD_MIN_SPEECH = 0.35 # a recording holding less speech than this is noise, not a request
+NO_SPEECH_PROB_LIMIT = 0.6 # whisper segments above this are hallucinations on near-silence
+
+LEVEL_BUFFER_FRAMES = 2000 # ~64s at 31Hz (recording), ~160s at 12.5Hz (wake listen)
+MARKER_BUFFER_LEN = 200 # pipeline events kept alongside the level frames
 
 HISTORY_DIR = Path(".history")
 CHAT_HISTORY_PATH = HISTORY_DIR / "chat.jsonl"
 PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
 HISTORY_LOAD_LIMIT = 30  # messages loaded into context on startup
+API_HISTORY_LIMIT = 20  # api-format messages kept in the rolling context window
+MAX_TOOL_ROUNDS = 8  # backstop on the agent loop so no stop_reason can spin it forever
+TERMINAL_TOOLS = ("play_url", "stop", "follow_on")  # tools that end the turn once they succeed
+
+# YouTube rejects player clients unpredictably — one that worked an hour ago starts returning 403 —
+# so resolution tries each in turn. "" means yt-dlp's own default client chain.
+YTDLP_CLIENTS = ("tv_embedded", "", "android_vr")
+YTDLP_TIMEOUT = 60.0
+PROBE_BYTES = 2048  # a resolved URL can still 403 on first read; find out before mpv does
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+
+# LED ring colours per speaker state, 0xRRGGBB
+RING_COLOR_WAKE = 0xFF8800  # orange
+RING_COLOR_RECORDING = 0x40C0C0  # soft cyan
+RING_COLOR_TRANSCRIBING = 0xB57EDC  # mauve
+RING_COLOR_LLM = 0xFF8800  # orange, breathing
+RING_FLASH_INTERVAL = 0.4  # startup flash half-period
 
 TOOLS = [
     {
         "name": "search_youtube",
-        "description": "Search for music or videos on YouTube. Returns a list of results to choose from.",
+        "description": "Find music or videos on YouTube. Call this when the user asks to play something you don't already have a URL for. Returns candidate matches ranked by relevance — pick the best one yourself and play it with play_url. Do not read the candidates out to the user.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "search_soundcloud",
+        "description": "Find music on SoundCloud. Use this when search_youtube or play_url reports that YouTube rejected the request, and as the first choice for remixes, DJ sets and underground electronic music, which SoundCloud carries more of. Returns candidate matches — pick the best one yourself and play it with play_url. Do not read the candidates out to the user.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -53,7 +89,7 @@ TOOLS = [
     },
     {
         "name": "play_url",
-        "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions).",
+        "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions). Returns 'playing' on success, or 'playback failed: ...' when the source rejected the request — YouTube does this intermittently. On failure, call this again with the next candidate from the search results rather than reporting defeat; only tell the user if several have failed.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -75,7 +111,7 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
-        "type": "web_search_20250305",
+        "type": "web_search_20260209",
         "name": "web_search"
     },
     {
@@ -142,7 +178,7 @@ TOOLS = [
     },
     {
         "name": "follow_on",
-        "description": "Call this after your spoken response to keep listening for the user's reply. Use when you asked the user a question or expect a follow-up.",
+        "description": "Keep the microphone open for the user's reply. Call this only when your spoken response ended in a genuine question that you need answered to continue. Do not call it after a statement, a confirmation, or once you have finished the task.",
         "input_schema": {"type": "object", "properties": {}}
     }
 ]
@@ -180,7 +216,7 @@ class SpeakerState(Enum):
 @dataclass
 class SpeakerContext:
     llm_client: any
-    system: str
+    system: any  # str, or cache-controlled content blocks
     voice_model: any
     whisper_model: any
     vad: any
@@ -191,6 +227,10 @@ class SpeakerContext:
     input_sample_rate: int
     worker_mode: bool = False
     worker_url: str | None = None
+    ring: any = None  # XVF3800 LED ring, None on platforms/boxes without one
+    model: str = "claude-opus-5"
+    followup_model: str = "claude-opus-5"  # set equal to `model` to keep one prompt cache
+    effort: str = "low"
     wake_threshold: float = 0.4
     wake_triggers: int = 1
     speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
@@ -244,7 +284,7 @@ class _SileroVAD:
     def __init__(self, threshold: float = 0.5, mic_gain: float = 1.0, verbose: bool = False):
         from silero_vad import load_silero_vad
         self._model = load_silero_vad(onnx=True)
-        self._threshold = threshold
+        self.threshold = threshold
         self._mic_gain = mic_gain
         self._verbose = verbose
         log(f"[VAD] Silero loaded — threshold={threshold} mic_gain={mic_gain}")
@@ -258,10 +298,50 @@ class _SileroVAD:
         audio = np.clip(audio * self._mic_gain, -1.0, 1.0)
         tensor = torch.from_numpy(audio)
         prob = float(self._model(tensor, sample_rate))
+        _levels.set_vad(prob)
         if self._verbose:
             rms = float(np.sqrt(np.mean(audio ** 2)))
-            log(f"[VAD] rms={rms:.4f} prob={prob:.3f} speech={prob > self._threshold}")
-        return prob > self._threshold
+            log(f"[VAD] rms={rms:.4f} prob={prob:.3f} speech={prob > self.threshold}")
+        return prob > self.threshold
+
+
+class _VoiceProbe:
+    """Silero VAD run purely for the timeline, so speech is visible while the speaker is listening
+    for the wake word. The recording VAD cannot serve this — it only starts once a turn already has,
+    which is after the moment you want to look at.
+
+    Holds its own model instance rather than sharing ctx.vad: silero is stateful, and a display tap
+    driving the LSTM state that recording decisions depend on would be a real bug. Loaded on first
+    use, so a speaker that never turns capture on never pays for it."""
+
+    def __init__(self):
+        self._model = None
+        self._carry: np.ndarray = np.array([], dtype=np.int16)
+        self.mic_gain: float = 1.0
+
+    def reset(self):
+        self._carry = np.array([], dtype=np.int16)
+        if self._model is not None:
+            self._model.reset_states()
+
+    def probe(self, audio: np.ndarray) -> float | None:
+        """Feed one chunk of 16 kHz int16 audio and return the highest speech probability across the
+        512-sample frames it completed, or None if it did not complete one. Wake chunks are 1280
+        samples against silero's fixed 512, so the remainder carries into the next call — 2 frames,
+        then 3, then 2, rather than dropping a fifth of the audio every chunk."""
+        import torch
+        if self._model is None:
+            from silero_vad import load_silero_vad
+            self._model = load_silero_vad(onnx=True)
+            log("[timeline] voice probe loaded")
+        self._carry = np.concatenate([self._carry, audio])
+        best = None
+        while len(self._carry) >= VAD_CHUNK:
+            frame, self._carry = self._carry[:VAD_CHUNK], self._carry[VAD_CHUNK:]
+            scaled = np.clip(frame.astype(np.float32) / 32768.0 * self.mic_gain, -1.0, 1.0)
+            prob = float(self._model(torch.from_numpy(scaled), TARGET_SAMPLE_RATE))
+            best = prob if best is None else max(best, prob)
+        return best
 
 
 class _Log:
@@ -282,13 +362,92 @@ class _Log:
         return {"lines": lines, "total": total}
 
 
+class _Levels:
+    """Ring buffer of mic amplitude frames plus pipeline event markers, for the web timeline.
+
+    Frames arrive at a variable rate — 12.5/s while listening for the wake word (80ms chunks) and
+    31.25/s while recording (32ms chunks) — so each carries its own timestamp and the UI plots
+    against time rather than index. `score` and `vad` are whichever detector was running at the
+    time and stay None otherwise."""
+
+    def __init__(self):
+        self._buffer: deque = deque(maxlen=LEVEL_BUFFER_FRAMES)
+        self._markers: deque = deque(maxlen=MARKER_BUFFER_LEN)
+        self._counter: int = 0
+        self._marker_counter: int = 0
+        self._lock = threading.Lock()
+        # opt-in — this is a debug view, and the capture runs on every audio frame. off on every
+        # start, the web ui turns it on for the length of a debugging session
+        self.enabled: bool = False
+
+    def set_enabled(self, enabled: bool):
+        with self._lock:
+            self.enabled = enabled
+            if not enabled:
+                # drop what was captured rather than leave a stale window to be shown on re-enable.
+                # the counters keep climbing so a client's cursor stays valid across the gap
+                self._buffer.clear()
+                self._markers.clear()
+
+    def append(self, rms: float, peak: float):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._buffer.append({"i": self._counter, "ts": time.time(), "rms": rms, "peak": peak,
+                                 "score": None, "vad": None})
+            self._counter += 1
+
+    def _stamp(self, key: str, value: float):
+        # the detector runs immediately after the read that produced the frame, so the most recent
+        # frame is always the one this score belongs to
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._buffer:
+                # cast here rather than trusting call sites — the models hand back np.float32, which
+                # only fails at json encoding time, as a 500 from /levels rather than anything local
+                self._buffer[-1][key] = float(value)
+
+    def set_score(self, score: float):
+        self._stamp("score", score)
+
+    def set_vad(self, prob: float):
+        self._stamp("vad", prob)
+
+    def mark(self, kind: str, text: str = ""):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._markers.append({"i": self._marker_counter, "ts": time.time(), "kind": kind, "text": text})
+            self._marker_counter += 1
+
+    def get_since(self, since: int, marker_since: int = -1) -> dict:
+        # markers carry their own cursor — resending the whole window four times a second is real
+        # bandwidth on a pi, and a client watching the count cannot tell that the ring has rotated
+        with self._lock:
+            frames = [f for f in self._buffer if f["i"] > since]
+            markers = [m for m in self._markers if m["i"] > marker_since]
+            total = self._counter
+            enabled = self.enabled
+        return {"frames": frames, "markers": markers, "total": total, "enabled": enabled}
+
+
 ctx: SpeakerContext | None = None
 chat_history: list[dict] = []
+# The conversation as the API sees it — content blocks, tool_use and tool_result included. Distinct
+# from chat_history, which is flattened text for the web UI and .history/chat.jsonl.
+api_messages: list[dict] = []
 _player = _Player()
 _duck_volume: int = 0
+_mono_output: bool = False # downmix mpv playback to mono, for devices with a single speaker
+_silence_timeout: float = 1.6 # continuous silence that ends a recording, overridable from config
 _perf_timer = _PerfTimer()
 _timers = _Timers()
 _log = _Log()
+_levels = _Levels()
+_voice_probe = _VoiceProbe()
+_ring_startup_thread: threading.Thread | None = None
+_ring_startup_stop = threading.Event()
 
 
 def log(text: str):
@@ -298,6 +457,22 @@ def log(text: str):
 
 def get_log_lines(since: int = 0) -> dict:
     return _log.get_since(since)
+
+
+def mark(kind: str, text: str = ""):
+    """Record a pipeline event on the timeline (wake, record, transcribe, ...)."""
+    _levels.mark(kind, text)
+
+
+def get_level_frames(since: int = -1, marker_since: int = -1) -> dict:
+    return _levels.get_since(since, marker_since)
+
+
+def set_levels_enabled(enabled: bool):
+    """Turn timeline capture on or off at runtime. Off costs nothing on the audio thread."""
+    _levels.set_enabled(enabled)
+    _voice_probe.reset()  # drop carried samples and LSTM state from the last session
+    log(f"timeline capture {'enabled' if enabled else 'disabled'}")
 
 
 def start_perf_timer():
@@ -355,10 +530,11 @@ def _test_tone(dev, dev_index: int, sample_rate: int):
     dev.wait()
 
 
-def _resample_audio(audio, orig_rate: int, target_rate: int):
-    """Linearly interpolate `audio` from `orig_rate` to `target_rate`, returning int16."""
-    ratio = target_rate / orig_rate
-    new_length = int(len(audio) * ratio)
+def _resample_audio(audio, orig_rate: int, target_rate: int, target_length: int | None = None):
+    """Linearly interpolate `audio` from `orig_rate` to `target_rate`, returning int16.
+    `target_length` forces the output size so callers needing an exact frame count do not have to
+    over-read and truncate, which silently discards audio at fractional rate ratios."""
+    new_length = target_length if target_length is not None else int(len(audio) * target_rate / orig_rate)
     return np.interp(
         np.linspace(0, len(audio), new_length),
         np.arange(len(audio)),
@@ -367,32 +543,38 @@ def _resample_audio(audio, orig_rate: int, target_rate: int):
 
 
 def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
-    """Read one chunk from `stream` at native `sample_rate` and resample to 16 kHz int16."""
-    # read audio
-    sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
-    chunk = chunk_size16 * sample_ratio
-    audio, _ = stream.read(chunk)
-    # resample to TARGET_SAMPLE_RATE and flatten
-    if sample_ratio != 1:
-        audio_flat = np.squeeze(audio)
-        audio_flat = _resample_audio(audio_flat, sample_rate, TARGET_SAMPLE_RATE)
-        audio_flat = audio_flat[:chunk_size16]
+    """Read one chunk from `stream` at native `sample_rate` and resample to exactly `chunk_size16`
+    samples of 16 kHz int16."""
+    if sample_rate == TARGET_SAMPLE_RATE:
+        audio, _ = stream.read(chunk_size16)
+        flat = np.squeeze(audio)
     else:
-        audio_flat = np.squeeze(audio)
-    return audio_flat
+        # read the exact native span that maps onto chunk_size16 samples. reading ceil(rate/16k) * chunk
+        # and truncating loses 8% of every chunk at 44.1 kHz, which both mangles the audio handed to
+        # whisper and breaks the frame continuity silero's LSTM state depends on
+        native_frames = int(round(chunk_size16 * sample_rate / TARGET_SAMPLE_RATE))
+        audio, _ = stream.read(native_frames)
+        flat = _resample_audio(np.squeeze(audio), sample_rate, TARGET_SAMPLE_RATE, target_length=chunk_size16)
+    # every live frame — wake listen, recording and barge-in — passes through here, so this is the
+    # one tap the timeline needs. float32 before squaring, int16 ** 2 overflows. checked before the
+    # conversion, not inside append(), so a disabled timeline costs a bool read per frame
+    if _levels.enabled:
+        scaled = flat.astype(np.float32) / 32768.0
+        _levels.append(float(np.sqrt(np.mean(scaled * scaled))), float(np.abs(scaled).max()))
+    return flat
 
 
 
 def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> np.ndarray:
     """Record raw audio at native sample rate, using resampled audio only for VAD checks."""
-    sample_ratio = int(math.ceil(sample_rate / TARGET_SAMPLE_RATE))
-    raw_chunk = VAD_CHUNK * sample_ratio
+    vad.reset()
+    raw_chunk = int(round(VAD_CHUNK * sample_rate / TARGET_SAMPLE_RATE))
     raw_chunks = []
     # wait for speech onset
     while True:
         raw, _ = stream.read(raw_chunk)
         raw_flat = np.squeeze(raw)
-        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE)[:VAD_CHUNK]
+        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE, target_length=VAD_CHUNK)
         if vad.is_speech(audio_16k.tobytes(), TARGET_SAMPLE_RATE):
             raw_chunks.append(raw_flat)
             break
@@ -402,40 +584,66 @@ def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> 
         raw, _ = stream.read(raw_chunk)
         raw_flat = np.squeeze(raw)
         raw_chunks.append(raw_flat)
-        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE)[:VAD_CHUNK]
+        audio_16k = _resample_audio(raw_flat, sample_rate, TARGET_SAMPLE_RATE, target_length=VAD_CHUNK)
         silent_duration = 0.0 if vad.is_speech(audio_16k.tobytes(), TARGET_SAMPLE_RATE) else silent_duration + VAD_CHUNK / TARGET_SAMPLE_RATE
     return np.concatenate(raw_chunks)
 
 
-def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float=1.0, onset_timeout: float=8.0) -> tuple[np.ndarray | None, float]:
-    """Wait for speech onset then record until `silence_timeout` seconds of continuous silence.
-    Returns (audio, onset_elapsed). audio is None if no speech begins within `onset_timeout` seconds."""
+def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float | None = None, onset_timeout: float=8.0) -> tuple[np.ndarray | None, float]:
+    """Wait for sustained speech onset then record until `silence_timeout` seconds of continuous silence.
+    Returns (audio, onset_elapsed). audio is None if no speech begins within `onset_timeout` seconds, or if
+    what was captured holds too little speech to be a request."""
+    silence_timeout = _silence_timeout if silence_timeout is None else silence_timeout
+    vad.reset()  # silero is stateful — carrying the previous turn's LSTM state in skews early frames
+    preroll = deque(maxlen=VAD_PREROLL_FRAMES)
     chunks = []
     silent_duration = 0.0
+    speech_duration = 0.0
+    onset_run = 0
     speech_started = False
     onset_elapsed = 0.0
     chunk_duration = VAD_CHUNK / TARGET_SAMPLE_RATE
     log_limiter = 0
     while True:
         audio_flat = _read_audio(stream, VAD_CHUNK, sample_rate)
-        chunks.append(audio_flat)
         is_speech = vad.is_speech(audio_flat.tobytes(), TARGET_SAMPLE_RATE)
-        if is_speech:
-            speech_started = True
-            silent_duration = 0.0
-        elif speech_started:
-            silent_duration += chunk_duration
-            if silent_duration >= silence_timeout:
-                break
-        else:
+        if not speech_started:
+            # one frame over threshold is the wake chime bleeding back through the mic, a breath or a
+            # click. committing on it starts the silence countdown before the user has spoken, so the
+            # turn ends on a ~1s clip of room noise. require a sustained run, and keep a pre-roll so
+            # the leading phoneme is not lost to the frames it took to confirm
+            preroll.append(audio_flat)
+            onset_run = onset_run + 1 if is_speech else 0
+            if onset_run >= VAD_ONSET_FRAMES:
+                speech_started = True
+                speech_duration = onset_run * chunk_duration
+                chunks.extend(preroll)
+                mark("onset", "speech started")
+                continue
             if int(onset_elapsed) > log_limiter:
                 log_limiter = int(onset_elapsed)
                 log(f"waiting for onset: {log_limiter}s")
             onset_elapsed += chunk_duration
             if onset_elapsed >= onset_timeout:
                 log("no speech detected, returning to wake listen")
+                mark("warn", f"no speech within {onset_timeout:.1f}s onset budget")
                 return None, onset_elapsed
+            continue
+        chunks.append(audio_flat)
+        if is_speech:
+            speech_duration += chunk_duration
+            silent_duration = 0.0
+        else:
+            silent_duration += chunk_duration
+            if silent_duration >= silence_timeout:
+                break
 
+    if speech_duration < VAD_MIN_SPEECH:
+        log(f"discarding {speech_duration:.2f}s of speech, below the {VAD_MIN_SPEECH}s minimum")
+        mark("warn", f"discarded {speech_duration:.2f}s, below {VAD_MIN_SPEECH}s minimum")
+        return None, onset_elapsed
+    log(f"recorded {len(chunks) * chunk_duration:.1f}s ({speech_duration:.1f}s speech)")
+    mark("recorded", f"{len(chunks) * chunk_duration:.1f}s ({speech_duration:.1f}s speech)")
     return np.concatenate(chunks), onset_elapsed
 
 
@@ -453,8 +661,15 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
         audio_flat = _read_audio(stream, WAKE_CHUNK, sample_rate)
         if rolling_buffer is not None:
             rolling_buffer.append(audio_flat)
+        # the only place speech can be told from room noise before a turn starts. debug-only, so it
+        # runs behind the capture flag rather than on every wake frame forever
+        if _levels.enabled:
+            voice_prob = _voice_probe.probe(audio_flat)
+            if voice_prob is not None:
+                _levels.set_vad(voice_prob)
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
+            _levels.set_score(float(score))
             score_window.append(score > threshold)
             hits = sum(score_window)
             if score > 0.0:
@@ -462,6 +677,7 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
                     log(f"[wakeword] score: {score:.3f} ({hits}/{num_triggers})")
             if hits >= num_triggers:
                 log("ello mate!")
+                mark("wake", f"score {score:.2f}")
                 if rolling_buffer is not None:
                     return np.concatenate(rolling_buffer)
                 return np.array([], dtype=np.int16)
@@ -501,16 +717,34 @@ def _transcribe_audio(whisper_model, audio: np.ndarray, worker_url: str | None =
             log(f"worker transcribe error: {e}")
             return ""
     audio_float = audio.astype(np.float32) / 32768.0
-    segments, _ = whisper_model.transcribe(audio_float, language="en", beam_size=1)
-    return " ".join(segment.text for segment in segments)
+    segments, _ = whisper_model.transcribe(
+        audio_float,
+        language="en",
+        beam_size=1,
+        # whisper invents filler ("yeah", "bye", "thanks for watching") on near-silence, and by default
+        # feeds each turn's text forward as a prompt so one invention seeds the next
+        condition_on_previous_text=False,
+    )
+    kept = []
+    for segment in segments:
+        if segment.no_speech_prob > NO_SPEECH_PROB_LIMIT:
+            log(f"dropping hallucinated segment (no_speech={segment.no_speech_prob:.2f}): {segment.text.strip()!r}")
+            continue
+        kept.append(segment.text)
+    return " ".join(kept)
 
 
 def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState | None]:
     """Dispatch an LLM tool call and return its result string and optional next state."""
     if tool_name == "search_youtube":
         return search_youtube(tool_input["query"]), None
+    elif tool_name == "search_soundcloud":
+        return search_soundcloud(tool_input["query"]), None
     elif tool_name == "play_url":
-        play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
+        result = play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
+        if result != "playing":
+            # Returning no state keeps the turn alive so the agent can try another candidate.
+            return f"playback failed: {result}", None
         return "playing", SpeakerState.RESET
     elif tool_name == "stop":
         active_timers = _timers.keys()
@@ -547,7 +781,28 @@ def _split_sentences(text: str) -> tuple[list[str], str]:
     return parts[:-1], parts[-1]
 
 
-def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerState:
+def _is_plain_user_turn(message: dict) -> bool:
+    """True if `message` is a spoken user turn rather than a carrier for tool_result blocks."""
+    return message["role"] == "user" and isinstance(message["content"], str)
+
+
+def _trim_api_messages():
+    """Trim `api_messages` to the rolling window, cutting only where the conversation can legally start.
+
+    A tool_use block must always be followed by its matching tool_result, so a naive slice can orphan
+    a pair and get the whole request rejected. Cut back to a plain spoken user turn instead."""
+    if len(api_messages) <= API_HISTORY_LIMIT:
+        return
+    for index in range(len(api_messages) - API_HISTORY_LIMIT, len(api_messages)):
+        if _is_plain_user_turn(api_messages[index]):
+            if index:
+                log(f"trimming {index} message(s) from context")
+                del api_messages[:index]
+            return
+    # No safe cut point in the window — the tail is one long tool exchange, so keep it whole.
+
+
+def query_llm(llm_client, system, text: str, mic_stream=None, followup: bool = False) -> SpeakerState:
     """Send `text` to the LLM, stream TTS as sentences arrive, handle tool calls, and return the next state."""
     ctx.interrupt.clear()
 
@@ -579,6 +834,21 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
     tts_thread = threading.Thread(target=_tts_worker, daemon=True)
     tts_thread.start()
 
+    def _record_partial(spoken: str):
+        """Keep what the assistant had said before an interrupt cut it off.
+
+        Without this the model has no idea it was halfway through listing options, so a follow-up
+        like "the second one" has nothing to refer back to."""
+        if spoken.strip():
+            api_messages.append({"role": "assistant", "content": spoken})
+
+    def _speak_now(line: str):
+        """Speak a canned line and wait for it, so the user hears why the turn ended."""
+        tts_queue.put(line)
+        tts_queue.join()
+        entry = {"role": "assistant", "text": line}
+        chat_history.append(entry)
+
     def _discard_tts():
         """Drop queued-but-unspoken sentences (interrupt already set, so worker drains fast)."""
         while not tts_queue.empty():
@@ -589,17 +859,27 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 break
 
     try:
-        messages = [{"role": "user", "content": text}]
+        # The rolling conversation is the whole point: without it the model cannot resolve "that one"
+        # or remember the search results it just described.
+        _trim_api_messages()
+        api_messages.append({"role": "user", "content": text})
+        messages = api_messages
+        model = ctx.followup_model if followup else ctx.model
         next_state = SpeakerState.RESET
 
-        while True:
+        for _round in range(MAX_TOOL_ROUNDS):
             accumulated_text = ""
             sentence_buffer = ""
             _live_entry = None  # mutable chat_history entry updated live during streaming
 
             with llm_client.messages.stream(
-                model="claude-sonnet-4-5",
-                max_tokens=1024,
+                model=model,
+                max_tokens=4096,  # thinking shares this budget, so it needs more room than the reply
+                # Adaptive thinking stays ON deliberately. Disabling it on Opus 5 can make the model
+                # write a tool call as plain text instead of a tool_use block — the turn looks fine
+                # and the call silently never runs. effort=low buys the latency back safely.
+                thinking={"type": "adaptive"},
+                output_config={"effort": ctx.effort},
                 system=system,
                 tools=TOOLS,
                 messages=messages
@@ -622,6 +902,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
 
                 if ctx.interrupt.is_set():
                     _discard_tts()
+                    _record_partial(accumulated_text)
                     return SpeakerState.RECORDING
 
                 if sentence_buffer.strip():
@@ -631,6 +912,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 tts_queue.join()
 
                 if ctx.interrupt.is_set():
+                    _record_partial(accumulated_text)
                     return SpeakerState.RECORDING
 
                 final_message = stream.get_final_message()
@@ -639,6 +921,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 # Remove live entry if nothing was streamed
                 if _live_entry is not None and not accumulated_text.strip():
                     chat_history.remove(_live_entry)
+                messages.append({"role": "assistant", "content": final_message.content})
                 return next_state
 
             if final_message.stop_reason == "pause_turn":
@@ -651,6 +934,7 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                     chat_history.remove(_live_entry)
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
+                terminal = False
                 for block in final_message.content:
                     if block.type == "tool_use":
                         log(f"\ttool: {block.name} {block.input}")
@@ -658,6 +942,9 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                         result, state = _execute_tool(block.name, block.input)
                         if state is not None:
                             next_state = state
+                            # A terminal tool only ends the turn if it actually worked — a failed
+                            # play_url returns no state, so the agent gets a round to try another.
+                            terminal = terminal or block.name in TERMINAL_TOOLS
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -666,11 +953,31 @@ def query_llm(llm_client, system: str, text: str, mic_stream=None) -> SpeakerSta
                 messages.append({"role": "user", "content": tool_results})
 
                 # Terminal actions don't need another LLM round-trip
-                if any(
-                    block.type == "tool_use" and block.name in ("play_url", "stop", "follow_on")
-                    for block in final_message.content
-                ):
+                if terminal:
                     return next_state
+                continue
+
+            # Anything else must return. Falling through the loop re-sends an identical request and
+            # gets an identical answer, so an unhandled stop_reason is an infinite spin.
+            if _live_entry is not None and not accumulated_text.strip():
+                chat_history.remove(_live_entry)
+            if final_message.stop_reason == "refusal":
+                log("llm refused the request")
+                # A refusal carries no usable content, so stand the spoken line in as the turn —
+                # an empty assistant message would be rejected on the next request.
+                _speak_now("Sorry, I can't help with that one.")
+                api_messages.append({"role": "assistant", "content": "Sorry, I can't help with that one."})
+            elif final_message.stop_reason == "max_tokens":
+                log("llm hit max_tokens")
+                messages.append({"role": "assistant", "content": final_message.content})
+                _speak_now("Sorry, I lost my thread there.")
+            else:
+                log(f"unexpected stop_reason: {final_message.stop_reason}")
+            return next_state
+
+        log(f"tool loop hit {MAX_TOOL_ROUNDS} rounds, giving up")
+        _speak_now("Sorry, I got stuck on that.")
+        return next_state
 
     finally:
         _discard_tts()
@@ -763,9 +1070,11 @@ def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag
         audio_flat = _read_audio(stream, WAKE_CHUNK, input_sample_rate)
         prediction = wake_model.predict(audio_flat)
         for _, score in prediction.items():
+            _levels.set_score(float(score))
             score_window.append(score > threshold)
             if sum(score_window) >= num_triggers:
                 log("interrupt: wake word during TTS")
+                mark("interrupt", f"wake during TTS, score {score:.2f}")
                 interrupt.set()
                 return
 
@@ -811,6 +1120,7 @@ def _player_loop():
                              cache_secs=30,
                              audio_buffer=2,
                              demuxer_max_bytes="50MiB",
+                             audio_channels="mono" if _mono_output else "auto-safe",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             if headers:
@@ -827,6 +1137,7 @@ def _player_loop():
             path, cleanup_dir = args[0], args[1]
             log(f"playing: {path}")
             player = mpv.MPV(vid=False, terminal=False,
+                             audio_channels="mono" if _mono_output else "auto-safe",
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             player.play(path)
@@ -868,23 +1179,86 @@ def _player_loop():
             break
 
 
-def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | None = None):
-    """Resolve a YouTube URL to a direct stream URL via yt-dlp and enqueue it for playback."""
-    log("resolving youtube stream url...")
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
-         "--print", "url", "--print", "%(title)s",
-         "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        log(f"yt-dlp error: {result.stderr}")
-        return
+def _ytdlp(args: list[str], client: str = "") -> subprocess.CompletedProcess:
+    """Run yt-dlp. `client` pins a YouTube player client; empty uses yt-dlp's own default chain."""
+    cmd = [sys.executable, "-m", "yt_dlp", *args]
+    if client:
+        cmd += ["--extractor-args", f"youtube:player_client={client}"]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_TIMEOUT)
+
+
+def _ytdlp_error(stderr: str) -> str:
+    """Condense yt-dlp's stderr to the one line worth reporting."""
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    errors = [l for l in lines if l.startswith("ERROR")] or lines
+    return (errors[-1] if errors else "no output")[:160]
+
+
+def _stream_is_playable(url: str) -> str:
+    """Range-probe a resolved stream, returning "" if it serves bytes or a short reason if not.
+
+    A successful yt-dlp resolve does not mean the URL works: YouTube hands back throttled or
+    IP-bound URLs that 403 on first read. Finding out here means we can still try another client,
+    rather than mpv failing silently after the turn has already ended."""
+    try:
+        request = urllib.request.Request(url, headers={
+            "Range": f"bytes=0-{PROBE_BYTES - 1}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        })
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return "" if response.read(1) else "empty response"
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code}"
+    except Exception as e:
+        return type(e).__name__
+
+
+def _resolve_youtube_stream(url: str) -> tuple[str, str, str]:
+    """Resolve a YouTube URL to a stream that actually serves bytes.
+
+    Returns (stream_url, title, error). Tries each player client in turn — a 403 from one client
+    is routine and says nothing about the others."""
+    problems = []
+    for client in YTDLP_CLIENTS:
+        label = client or "default"
+        try:
+            result = _ytdlp(["-f", "bestaudio[ext=m4a]/bestaudio", "--print", "url",
+                             "--print", "%(title)s", "--no-playlist", url], client)
+        except subprocess.TimeoutExpired:
+            problems.append(f"{label}: timed out")
+            continue
+        if result.returncode != 0 or not result.stdout.strip():
+            problems.append(f"{label}: {_ytdlp_error(result.stderr)}")
+            continue
+        lines = result.stdout.strip().splitlines()
+        stream_url = lines[0]
+        rejected = _stream_is_playable(stream_url)
+        if rejected:
+            problems.append(f"{label}: stream rejected ({rejected})")
+            continue
+        if client != YTDLP_CLIENTS[0]:
+            log(f"yt-dlp: '{YTDLP_CLIENTS[0]}' failed, fell back to '{label}'")
+        return stream_url, (lines[1] if len(lines) > 1 else ""), ""
+    return "", "", "; ".join(problems)
+
+
+def _resolve_soundcloud_and_play(url: str, start_time: float = 0.0, title: str | None = None) -> str:
+    """Resolve a SoundCloud URL and enqueue it for playback. Returns "" on success, else the reason.
+
+    No player-client fallback here — that is a YouTube concept, and SoundCloud needs no API key:
+    yt-dlp lifts a client_id from the public web player."""
+    log("resolving soundcloud stream url...")
+    try:
+        result = _ytdlp(["-f", "bestaudio/best", "--print", "url",
+                         "--print", "%(title)s", "--no-playlist", url])
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    if result.returncode != 0 or not result.stdout.strip():
+        error = _ytdlp_error(result.stderr)
+        log(f"yt-dlp could not resolve {url}: {error}")
+        return error
     lines = result.stdout.strip().splitlines()
-    stream_url = lines[0] if lines else ""
-    if not stream_url:
-        log("yt-dlp: no stream url found")
-        return
+    stream_url = lines[0]
     if title is None and len(lines) > 1:
         title = lines[1]
     entry: dict = {"url": url, "start_time": start_time}
@@ -893,6 +1267,25 @@ def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | No
     _save_history(PLAY_HISTORY_PATH, entry)
     log(f"streaming: {stream_url[:80]}...")
     _player.cmd_queue.put(('play', stream_url, None, start_time, url))
+    return ""
+
+
+def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | None = None) -> str:
+    """Resolve a YouTube URL and enqueue it for playback. Returns "" on success, else the reason."""
+    log("resolving youtube stream url...")
+    stream_url, resolved_title, error = _resolve_youtube_stream(url)
+    if error:
+        log(f"yt-dlp could not resolve {url}: {error}")
+        return error
+    if title is None and resolved_title:
+        title = resolved_title
+    entry: dict = {"url": url, "start_time": start_time}
+    if title:
+        entry["title"] = title
+    _save_history(PLAY_HISTORY_PATH, entry)
+    log(f"streaming: {stream_url[:80]}...")
+    _player.cmd_queue.put(('play', stream_url, None, start_time, url))
+    return ""
 
 
 def _download_youtube_and_play(url: str):
@@ -901,13 +1294,10 @@ def _download_youtube_and_play(url: str):
     tmpdir = tempfile.mkdtemp()
     output_template = os.path.join(tmpdir, "audio.%(ext)s")
     log("downloading youtube audio...")
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", output_template,
-         "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
-        capture_output=True, text=True
-    )
+    result = _ytdlp(["-f", "bestaudio[ext=m4a]/bestaudio", "-o", output_template,
+                     "--no-playlist", url], YTDLP_CLIENTS[0])
     if result.returncode != 0:
-        log(f"yt-dlp error: {result.stderr}")
+        log(f"yt-dlp error: {_ytdlp_error(result.stderr)}")
         return
     files = os.listdir(tmpdir)
     if not files:
@@ -920,7 +1310,8 @@ def _download_youtube_and_play(url: str):
 def _play_oneshot_audio_file(path: str):
     """Play a local audio file once in a background thread without affecting the main player."""
     def _run():
-        player = mpv.MPV(vid=False, terminal=False)
+        player = mpv.MPV(vid=False, terminal=False,
+                         audio_channels="mono" if _mono_output else "auto-safe")
         player.play(path)
         player.wait_for_playback()
         try:
@@ -940,6 +1331,7 @@ def shutdown():
     if ctx is not None:
         ctx.shutdown.set()
         ctx.interrupt.set()
+        ring_off(ctx)
     _player.cmd_queue.put(('quit',))
 
 
@@ -951,6 +1343,16 @@ def pause_playback():
 def resume_playback():
     """Resume a paused mpv player."""
     _player.cmd_queue.put(('resume',))
+
+
+def apply_audio_settings(config: dict):
+    """Apply the [audio] settings that can change at runtime, so a config save takes effect
+    without a restart. mono_output applies to the next track, not the one already playing."""
+    global _duck_volume, _mono_output
+    audio_cfg = config.get("audio", {})
+    _duck_volume = max(0, min(100, int(audio_cfg.get("duck_volume", _duck_volume))))
+    _mono_output = bool(audio_cfg.get("mono_output", False))
+    log(f"audio settings applied — duck_volume={_duck_volume} mono_output={_mono_output}")
 
 
 def duck_playback():
@@ -967,50 +1369,67 @@ def resolve_url(url: str) -> str:
     """Resolve a URL to a direct streamable URL. For YouTube, uses yt-dlp. Other URLs pass through."""
     if "youtube.com" not in url and "youtu.be" not in url:
         return url
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
-         "--get-url", "--no-playlist", "--extractor-args", "youtube:player_client=tv_embedded", url],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
-    stream_url = result.stdout.strip().splitlines()[0]
-    if not stream_url:
-        raise RuntimeError("yt-dlp returned no URL")
+    stream_url, _, error = _resolve_youtube_stream(url)
+    if error:
+        raise RuntimeError(error)
     return stream_url
 
 
-def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0, title: str | None = None):
-    """Stream audio from `url`, using yt-dlp resolution for YouTube URLs on Windows."""
+def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0, title: str | None = None) -> str:
+    """Stream audio from `url`. Returns "playing" or a failure reason.
+
+    YouTube resolution runs inline rather than in a background thread so a rejection reaches the
+    caller — resolving off-thread meant a 403 produced silence that nothing in the system noticed."""
     is_youtube = "youtube.com" in url or "youtu.be" in url
     if is_youtube:
         _player.cmd_queue.put(('stop',))
-        threading.Thread(target=_resolve_youtube_and_play, args=(url, start_time, title), daemon=True).start()
-    else:
-        entry: dict = {"url": url, "start_time": start_time}
-        if title:
-            entry["title"] = title
-        _save_history(PLAY_HISTORY_PATH, entry)
-        _player.cmd_queue.put(('play', url, headers, start_time, url))
+        error = _resolve_youtube_and_play(url, start_time, title)
+        return error or "playing"
+    if "soundcloud.com" in url:
+        _player.cmd_queue.put(('stop',))
+        error = _resolve_soundcloud_and_play(url, start_time, title)
+        return error or "playing"
+    entry: dict = {"url": url, "start_time": start_time}
+    if title:
+        entry["title"] = title
+    _save_history(PLAY_HISTORY_PATH, entry)
+    _player.cmd_queue.put(('play', url, headers, start_time, url))
+    return "playing"
+
+
+def _search(search_spec: str, url_template: str) -> str:
+    """Run a yt-dlp search and return a JSON list of title/url/duration/channel results."""
+    try:
+        result = _ytdlp([search_spec, "--dump-json", "--flat-playlist", "--no-download"])
+    except subprocess.TimeoutExpired:
+        return "search timed out"
+    results = []
+    for line in result.stdout.strip().splitlines():
+        if line.startswith("{"):
+            item = json.loads(line)
+            results.append({
+                "title": item.get("title"),
+                "url": item.get("url") or url_template.format(id=item.get("id")),
+                "duration": item.get("duration"),
+                "channel": item.get("channel") or item.get("uploader"),
+            })
+    # An empty result set and a rejected request look identical to the caller otherwise, and the
+    # agent needs to tell them apart to decide between rephrasing and trying another source.
+    if not results:
+        if result.returncode != 0:
+            return f"search failed: {_ytdlp_error(result.stderr)}"
+        return "no results found"
+    return json.dumps(results)
 
 
 def search_youtube(query: str, max_results: int = 5) -> str:
     """Search YouTube for `query` and return a JSON list of title/url/duration/channel results."""
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", f"ytsearch{max_results}:{query}", "--dump-json", "--flat-playlist", "--no-download"],
-        capture_output=True, text=True
-    )
-    results = []
-    for line in result.stdout.strip().splitlines():
-        if line:
-            item = json.loads(line)
-            results.append({
-                "title": item.get("title"),
-                "url": item.get("url") or f"https://www.youtube.com/watch?v={item.get('id')}",
-                "duration": item.get("duration"),
-                "channel": item.get("channel") or item.get("uploader"),
-            })
-    return json.dumps(results)
+    return _search(f"ytsearch{max_results}:{query}", "https://www.youtube.com/watch?v={id}")
+
+
+def search_soundcloud(query: str, max_results: int = 5) -> str:
+    """Search SoundCloud for `query` and return a JSON list of title/url/duration/channel results."""
+    return _search(f"scsearch{max_results}:{query}", "https://soundcloud.com/{id}")
 
 
 def set_volume(level: int) -> str:
@@ -1196,9 +1615,12 @@ def _speak_loop(ctx):
     # the loop
     transcribed_request = ""
     onset_remaining = ONSET_TIMEOUT
+    followup = False  # a turn re-entered via follow_on or an interrupt already has full context
     with dev.InputStream(samplerate=ctx.input_sample_rate, channels=1, dtype='int16', device=ctx.input_dev_index) as stream:
         while not ctx.shutdown.is_set():
             if ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
+                ring_startup_stop()  # no-op once the first wake loop has stopped it
+                ring_off(ctx)
                 wake_audio = _listen_for_wake(
                     ctx.wake_model,
                     stream,
@@ -1209,30 +1631,35 @@ def _speak_loop(ctx):
                 )
                 _perf_timer.start()
                 onset_remaining = ONSET_TIMEOUT
+                followup = False
                 if record_dir:
                     filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                     log(f"caching {filepath}")
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
+                    ring_wake(ctx)
                     _play_oneshot_audio_file("sounds/wake.wav")
                     ctx.speaker_state = SpeakerState.RECORDING
             elif ctx.speaker_state == SpeakerState.RECORDING:
                 log(f"recording (onset budget: {onset_remaining:.1f}s)")
+                mark("record", f"onset budget {onset_remaining:.1f}s")
+                ring_recording(ctx)
                 duck_playback()
                 audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
-                if audio_request is None:
-                    log("onset timeout, returning to wake listen")
-                    unduck_playback()
-                    onset_remaining = ONSET_TIMEOUT
-                    ctx.speaker_state = SpeakerState.RESET
-                    continue
-                _perf_timer.lap("recorded")
-                transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
-                _perf_timer.lap("transcribed")
+                transcribed_request = ""
+                if audio_request is not None:
+                    _perf_timer.lap("recorded")
+                    mark("transcribe", "")
+                    ring_transcribing(ctx)
+                    transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
+                    _perf_timer.lap("transcribed")
+                    mark("transcribed", transcribed_request.strip())
+                # nothing usable captured — keep listening on the remaining budget rather than dropping
+                # the turn, so a false onset or a discarded noise clip does not send us back to the wake word
                 if not transcribed_request.strip():
                     onset_remaining -= onset_elapsed
-                    log(f"empty transcription, onset budget remaining: {onset_remaining:.1f}s")
+                    log(f"no request captured, onset budget remaining: {onset_remaining:.1f}s")
                     if onset_remaining > 0.5:
                         ctx.speaker_state = SpeakerState.RECORDING
                     else:
@@ -1247,10 +1674,14 @@ def _speak_loop(ctx):
                 _save_history(CHAT_HISTORY_PATH, {"role": "user", "text": transcribed_request})
                 ctx.speaker_state = SpeakerState.LLM_AGENT
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
-                ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream)
+                mark("llm", transcribed_request.strip())
+                ring_llm_agent(ctx)
+                ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream, followup=followup)
                 _perf_timer.lap("llm")
+                mark("llm-done", "")
                 if ctx.speaker_state == SpeakerState.RECORDING:
                     onset_remaining = ONSET_TIMEOUT
+                    followup = True
                     _flush_stream(stream, ctx.input_sample_rate)
                     ctx.wake_model.reset()
                 else:
@@ -1261,6 +1692,7 @@ def _speak_loop(ctx):
                 ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 log("return to listen for wake")
             elif ctx.speaker_state == SpeakerState.VAD_RECORD:
+                ring_recording(ctx)
                 audio = _vad_record(ctx.vad, stream, ctx.input_sample_rate)
                 filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                 log(f"caching {filepath}")
@@ -1301,6 +1733,100 @@ def _start_worker():
     log("worker ready")
 
 
+def open_ring():
+    """Open the mic array's LED ring, or return None when this box hasn't got one.
+
+    The import is deferred so a platform without pyusb or a libusb backend still starts.
+    """
+    try:
+        from xvf3800 import XVF3800
+        ring = XVF3800.open()
+        if ring is None:
+            log("ring: no XVF3800 found")
+        else:
+            log(f"ring: XVF3800 firmware {'.'.join(str(v) for v in ring.version())}")
+        return ring
+    except Exception as e:
+        log(f"ring: unavailable ({e})")
+        return None
+
+
+def _ring_call(fn, *args):
+    """The ring is cosmetic — a usb hiccup must never take the state machine down."""
+    try:
+        fn(*args)
+    except Exception as e:
+        log(f"ring: {e}")
+
+
+def ring_startup(ring):
+    """Flash mauve while the models load. Runs on its own thread until ring_startup_stop().
+
+    Takes the ring rather than ctx — startup runs before there is a SpeakerContext.
+    """
+    global _ring_startup_thread
+    if ring is None:
+        return
+
+    def _flash():
+        lit = True
+        while True:
+            _ring_call(ring.solid, RING_COLOR_TRANSCRIBING if lit else 0x000000)
+            lit = not lit
+            if _ring_startup_stop.wait(RING_FLASH_INTERVAL):
+                break
+        _ring_call(ring.off)
+
+    _ring_startup_stop.clear()
+    _ring_startup_thread = threading.Thread(target=_flash, daemon=True)
+    _ring_startup_thread.start()
+
+
+def ring_startup_stop():
+    """Stop the startup flash. Joins the thread so it can't repaint over the next state."""
+    global _ring_startup_thread
+    if _ring_startup_thread is None:
+        return
+    _ring_startup_stop.set()
+    _ring_startup_thread.join(timeout=1.0)
+    _ring_startup_thread = None
+
+
+def ring_off(ctx):
+    """Idle — nothing to show."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.off)
+
+
+def ring_wake(ctx):
+    """Wake word heard."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.solid, RING_COLOR_WAKE)
+
+
+def ring_recording(ctx):
+    """Capturing the request."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.solid, RING_COLOR_RECORDING)
+
+
+def ring_transcribing(ctx):
+    """Whisper is running on the captured audio."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.solid, RING_COLOR_TRANSCRIBING)
+
+
+def ring_llm_agent(ctx):
+    """Agent loop: thinking, calling tools, speaking."""
+    if ctx.ring is None:
+        return
+    _ring_call(ctx.ring.breathe, RING_COLOR_LLM, 1)
+
+
 def start():
     """Initialise all models and devices from config.toml and launch the background threads."""
     global ctx
@@ -1324,6 +1850,10 @@ def start():
     if ctx is not None:
         return
 
+    # opened up front, before the models load, so the startup flash covers the whole wait
+    ring = open_ring()
+    ring_startup(ring)
+
     chat_history.extend(_load_history(CHAT_HISTORY_PATH, HISTORY_LOAD_LIMIT))
 
     with open("config.toml", "rb") as f:
@@ -1345,6 +1875,16 @@ def start():
             suffix = f" ({extra})" if extra else ""
             system += f"- [{hint['category']}] {hint['name']}: {value}{suffix}\n"
 
+    # Tools render before system, so one breakpoint here caches the whole stable prefix. Everything
+    # that varies per turn lives in messages, after it.
+    system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+
+    # llm config
+    llm_cfg = config["llm"]
+    model = llm_cfg.get("model", "claude-opus-5")
+    followup_model = llm_cfg.get("followup_model", model)
+    effort = llm_cfg.get("effort", "low")
+
     # whisper / inference config
     inf = config.get("inference", {})
     device = inf.get("device", "cpu")
@@ -1354,13 +1894,15 @@ def start():
     vad_threshold = float(inf.get("vad_threshold", 0.5))
     vad_mic_gain = float(inf.get("vad_mic_gain", 1.0))
     vad_verbose = "--verbose" in sys.argv
+    _voice_probe.mic_gain = vad_mic_gain  # match what the recording VAD hears, or the two disagree
+    global _silence_timeout
+    _silence_timeout = float(inf.get("silence_timeout", _silence_timeout))
 
     # audio config
-    global _duck_volume
     if "--verbose" in sys.argv:
         log(json.dumps(enumerate_audio_devices(), indent=4))
     audio_cfg = config["audio"]
-    _duck_volume = max(0, min(100, int(audio_cfg.get("duck_volume", 0))))
+    apply_audio_settings(config)
     input_dev_info = _get_audio_device_index(audio_cfg["input_device"])
     output_dev_info = _get_audio_device_index(audio_cfg["output_device"])
 
@@ -1380,11 +1922,15 @@ def start():
             compute_type=inf.get("whisper_compute", compute)
         ),
         vad=_SileroVAD(threshold=vad_threshold, mic_gain=vad_mic_gain, verbose=vad_verbose),
+        model=model,
+        followup_model=followup_model,
+        effort=effort,
         input_dev_index=int(input_dev_info['index']),
         input_sample_rate=int(input_dev_info['default_samplerate']),
         output_dev_index=int(output_dev_info['index']),
         output_sample_rate=int(output_dev_info['default_samplerate']),
         worker_url=worker_url,
+        ring=ring,
     )
 
     threading.Thread(

@@ -1,0 +1,6 @@
+# reSpeaker XVF3800 USB 4-Mic Array — vendor control interface (LED ring, DoA, tuning).
+# Without this the control transfers need root. Install with:
+#   sudo cp setup/99-respeaker-xvf3800.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then replug the array.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2886", ATTRS{idProduct}=="001a", MODE="0666"

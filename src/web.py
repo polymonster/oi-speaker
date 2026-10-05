@@ -42,6 +42,10 @@ class SyncConfigRequest(BaseModel):
     peer_name: str
 
 
+class LevelsEnableRequest(BaseModel):
+    enabled: bool
+
+
 _peers_lock = threading.Lock()
 _peers: dict[str, dict] = {}  # keyed by room name
 _zeroconf: AsyncZeroconf | None = None
@@ -161,12 +165,21 @@ async def audio_devices():
 
 _DEFAULT_CONFIDENTIAL = ["llm.anthropic_api_key"]
 
+# the settings form is generated from whatever keys config.toml happens to hold, so a runtime-tunable
+# key added after a box was set up is unreachable from the web UI — the only place to add it is the
+# config file the UI exists to avoid editing. surface these whether or not they are on disk; saving
+# writes them back. keep in step with apply_audio_settings()
+_AUDIO_DEFAULTS = {"duck_volume": 0, "mono_output": False}
+
 @app.get("/settings")
 async def get_settings():
     with open(CONFIG_PATH, "rb") as f:
         cfg = tomllib.load(f)
     meta = cfg.setdefault("meta", {})
     meta.setdefault("confidential", _DEFAULT_CONFIDENTIAL)
+    audio = cfg.setdefault("audio", {})
+    for key, default in _AUDIO_DEFAULTS.items():
+        audio.setdefault(key, default)
     return cfg
 
 
@@ -174,6 +187,7 @@ async def get_settings():
 async def update_settings(settings: dict[str, Any] = Body(...)):
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(settings).encode())
+    spk.apply_audio_settings(settings)
     return {"ok": True}
 
 
@@ -188,6 +202,19 @@ async def logs(since: int = 0):
     return spk.get_log_lines(since)
 
 
+@app.get("/levels")
+async def levels(since: int = -1, marker_since: int = -1):
+    # empty in --worker mode, where there is no audio thread to fill the buffer
+    return spk.get_level_frames(since, marker_since)
+
+
+@app.post("/levels/enable")
+async def levels_enable(req: LevelsEnableRequest):
+    """Timeline capture is off at every start — the web ui turns it on for a debugging session."""
+    spk.set_levels_enabled(req.enabled)
+    return {"enabled": req.enabled}
+
+
 @app.get("/status")
 async def status():
     with open(CONFIG_PATH, "rb") as f:
@@ -195,9 +222,13 @@ async def status():
     port = int(_cfg.get("network", {}).get("port", 8000))
     return {
         "state": spk.ctx.speaker_state.value if spk.ctx else spk.SpeakerState.LISTEN_FOR_WAKE.value,
+        "state_name": spk.ctx.speaker_state.name.lower() if spk.ctx else "starting",
         "playing": spk._player.active,
         "ip": _local_ip(),
         "port": port,
+        # drawn as the reference lines on the timeline's detector lane
+        "wake_threshold": spk.ctx.wake_threshold if spk.ctx else None,
+        "vad_threshold": spk.ctx.vad.threshold if spk.ctx and spk.ctx.vad else None,
     }
 
 

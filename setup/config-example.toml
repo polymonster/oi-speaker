@@ -5,14 +5,28 @@ port = 8000
 [inference]
 device = "cpu"
 whisper_model = "small"
+# seconds of continuous silence that end a recording. raise it if the speaker cuts you off
+# mid-sentence, lower it to shave latency off every turn
+silence_timeout = 1.6
+# silero speech probability above which a frame counts as speech. raise it in a noisy room
+vad_threshold = 0.5
 
 [audio]
 input_device = "your-input-device"
 output_device = "your-output-device"
 # Volume level while listening/processing after wake (0 = muted, 100 = full). Default: 0.
 duck_volume = 0
+# Downmix playback to mono, for a device with a single speaker. Default: false.
+mono_output = false
 
 [llm]
+model = "claude-opus-5"
+# Follow-up turns (after follow_on or an interrupt) already carry full context, so a cheaper model
+# copes. Prompt caches are per-model though, so a split means two cached prefixes and a cache write
+# on each switch — set this equal to `model` to collapse back to one.
+followup_model = "claude-sonnet-5"
+# Thinking stays on; effort controls how much. Raise to "medium" if answers feel shallow.
+effort = "low"
 anthropic_api_key = ""
 
 [meta]

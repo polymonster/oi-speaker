@@ -7,7 +7,7 @@
 <style>
   @font-face {
     font-family: 'Cousine';
-    src: url('/static/fonts/Cousine-Regular.ttf') format('truetype');
+    src: url('/static/fonts/cousine_regular.ttf') format('truetype');
     font-weight: normal;
     font-style: normal;
   }
@@ -16,8 +16,10 @@
   body { font-family: 'Cousine', monospace; background: #111; color: #eee; padding: 0 16px; display: flex; flex-direction: column; font-size: 18px; }
   h1 { color: #eee; font-size: 1.2em; margin: 16px 0 2px; }
   #host-ip { color: #333; font-size: 0.9em; margin-bottom: 12px; }
-  nav { display: flex; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid #222; padding-bottom: 10px; }
-  nav button { background: none; border: none; color: #555; padding: 4px 12px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 1em; }
+  /* wrap — six single-word buttons overflow a phone viewport, and body is overflow:hidden so
+     anything past the right edge is clipped with no way to scroll to it */
+  nav { display: flex; flex-wrap: wrap; gap: 6px 4px; margin-bottom: 12px; border-bottom: 1px solid #222; padding-bottom: 10px; }
+  nav button { background: none; border: none; color: #555; padding: 4px 10px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 1em; }
   nav button.active { color: #eee; border-bottom: 2px solid #eee; }
 
   /* console */
@@ -89,6 +91,25 @@
   .peer-open { background: none; border: 1px solid #444; color: #888; padding: 6px 14px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 0.9em; flex-shrink: 0; }
   .peer-open:hover { border-color: #888; color: #eee; }
 
+  /* timeline */
+  #tl-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+  #tl-toolbar button { background: none; border: 1px solid #333; color: #555; padding: 4px 10px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 0.85em; }
+  #tl-toolbar button:hover { border-color: #555; color: #eee; }
+  #tl-toolbar button.on { border-color: #555; color: #eee; }
+  #tl-live.on { border-color: #afa; color: #afa; }
+  #tl-capture.on { border-color: #fa7; color: #fa7; }
+  .tl-key { color: #555; font-size: 0.75em; display: flex; align-items: center; gap: 4px; }
+  .tl-key i { width: 8px; height: 8px; flex-shrink: 0; }
+  #tl-state { color: #7af; font-size: 0.8em; padding: 2px 8px; border: 1px solid #333; margin-left: auto; }
+  #tl-db { color: #555; font-size: 0.8em; min-width: 5.5em; text-align: right; }
+  #tl-canvas { width: 100%; height: 200px; border: 1px solid #222; touch-action: none; cursor: grab; display: block; flex-shrink: 0; }
+  #tl-canvas.dragging { cursor: grabbing; }
+  #tl-markers { flex: 1; overflow-y: auto; border: 1px solid #222; border-top: none; padding: 8px 12px; font-size: 0.8em; line-height: 1.5; }
+  .tl-mark { display: flex; gap: 10px; padding: 2px 0; }
+  .tl-mark-ts { color: #444; white-space: nowrap; flex-shrink: 0; }
+  .tl-mark-kind { width: 9em; flex-shrink: 0; }
+  .tl-mark-text { color: #888; word-break: break-word; }
+
   /* history */
   #history-list { flex: 1; overflow-y: auto; border: 1px solid #222; padding: 10px 14px; }
   .play-entry { display: flex; align-items: baseline; gap: 12px; padding: 5px 0; border-bottom: 1px solid #1a1a1a; }
@@ -107,6 +128,8 @@
     #chat-form { padding-bottom: 0; }
     #console-log { height: 520px; flex: none; }
     #history-list { height: 520px; flex: none; }
+    #tl-canvas { height: 280px; }
+    #tl-markers { height: 240px; flex: none; }
   }
 </style>
 </head>
@@ -119,6 +142,7 @@
   <button onclick="show('console', this)">console</button>
   <button onclick="show('speakers', this)">speakers</button>
   <button onclick="show('history', this)">history</button>
+  <button onclick="show('timeline', this)">timeline</button>
 </nav>
 
 <section id="chat" class="active">
@@ -147,6 +171,23 @@
   <div id="history-list"></div>
 </section>
 
+<section id="timeline">
+  <div id="tl-toolbar">
+    <button id="tl-capture" onclick="toggleCapture()">capture off</button>
+    <button class="tl-win" onclick="setWindow(10, this)">10s</button>
+    <button class="tl-win on" onclick="setWindow(30, this)">30s</button>
+    <button class="tl-win" onclick="setWindow(60, this)">60s</button>
+    <button id="tl-live" class="on" onclick="goLive()">&bull; live</button>
+    <span class="tl-key"><i style="background:#333"></i>peak</span>
+    <span class="tl-key"><i style="background:#7af"></i>level</span>
+    <span class="tl-key"><i style="background:#afa"></i>voice</span>
+    <span id="tl-db">-inf dB</span>
+    <span id="tl-state">--</span>
+  </div>
+  <canvas id="tl-canvas"></canvas>
+  <div id="tl-markers"></div>
+</section>
+
 <section id="settings">
   <div id="settings-form"></div>
   <div style="display:flex;align-items:center;">
@@ -170,6 +211,7 @@ function show(id, btn) {
   btn.classList.add('active');
   if (id === 'settings') loadSettings();
   if (id === 'history') loadPlayHistory();
+  if (id === 'timeline') startTimeline(); else stopTimeline();
 }
 
 // chat
@@ -335,7 +377,9 @@ function renderObj(container, obj, path) {
       const deviceOptions = fullPath === 'audio.input_device' ? audioDevices.inputs
                           : fullPath === 'audio.output_device' ? audioDevices.outputs
                           : null;
-      if (deviceOptions && deviceOptions.length > 0) {
+      if (typeof val === 'boolean') {
+        div.innerHTML = `<label>${fullPath}</label><input type="checkbox" data-path="${fullPath}"${val ? ' checked' : ''}>`;
+      } else if (deviceOptions && deviceOptions.length > 0) {
         const opts = deviceOptions.map(name => {
           const selected = name === val ? ' selected' : '';
           return `<option value="${name}"${selected}>${name}</option>`;
@@ -411,9 +455,11 @@ async function saveSettings() {
     for (let i = 0; i < keys.length - 1; i++) obj = obj[keys[i]];
     const lastKey = keys[keys.length - 1];
     const orig = obj[lastKey];
-    obj[lastKey] = Array.isArray(orig)
-      ? input.value.split(',').map(s => s.trim()).filter(Boolean)
-      : input.value;
+    obj[lastKey] = input.type === 'checkbox'
+      ? input.checked
+      : Array.isArray(orig)
+        ? input.value.split(',').map(s => s.trim()).filter(Boolean)
+        : input.value;
   });
   // collect hints — value goes to url or text depending on content
   document.querySelectorAll('[data-hint]').forEach(input => {
@@ -549,6 +595,289 @@ async function syncConfig(peerName) {
   } catch (e) { alert('Sync error: ' + e); }
 }
 
+// timeline tab
+const TL_MAX_FRAMES = 2000;   // matches LEVEL_BUFFER_FRAMES server side
+const TL_MAX_MARKERS = 200;   // matches MARKER_BUFFER_LEN server side
+const TL_LABEL_H = 14;        // marker label strip along the top
+const TL_DET_H = 56;          // wake score / vad probability lane
+const TL_FLOOR_DB = -60;      // amplitude below this reads as silence
+const TL_KIND_COLOURS = {
+  wake: '#fa7', interrupt: '#fa7', record: '#f66', warn: '#f66',
+  onset: '#afa', recorded: '#afa', transcribe: '#7af', transcribed: '#7af',
+  llm: '#7af', 'llm-done': '#7af'
+};
+
+let tlFrames = [];
+let tlMarkers = [];
+let tlSince = -1;         // cursors are exclusive, so -1 picks up index 0
+let tlMarkerSince = -1;
+let tlWindow = 30;        // seconds visible
+let tlLive = true;        // right edge tracks the newest frame
+let tlEnd = 0;            // ts at the right edge while panned back
+let tlTimer = null;
+let tlRaf = null;
+let tlEnabled = false;    // server-owned, learned from the /levels payload
+let tlPolling = false;    // one poll in flight at a time — the cursor advances only on response
+let tlWakeThreshold = null;
+let tlVadThreshold = null;
+
+// amplitudes are 0..1 but speech sits around 0.02-0.1, so a linear bar is invisible. map through
+// dBFS with a floor, which is also what makes the height meaningful for judging mic gain
+function _tlNorm(v) {
+  if (!v) return 0;
+  const db = 20 * Math.log10(v);
+  return Math.max(0, Math.min(1, (db - TL_FLOOR_DB) / -TL_FLOOR_DB));
+}
+
+function startTimeline() {
+  if (tlRaf) return;
+  renderMarkerList();  // paint the empty-state placeholder before the first poll lands
+  syncLevels();        // one poll to pick up whatever the server's capture state already is
+  const draw = () => { drawTimeline(); tlRaf = requestAnimationFrame(draw); };
+  tlRaf = requestAnimationFrame(draw);
+}
+
+function stopTimeline() {
+  if (tlTimer) { clearInterval(tlTimer); tlTimer = null; }
+  if (tlRaf) { cancelAnimationFrame(tlRaf); tlRaf = null; }
+}
+
+// capture is off at every speaker start so the audio thread pays nothing for a debug view nobody is
+// watching. the server owns the flag — another phone may have turned it on
+async function toggleCapture() {
+  const next = !tlEnabled;
+  try {
+    await fetch('/levels/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next })
+    });
+  } catch { return; }
+  if (!next) { tlFrames = []; tlMarkers = []; }
+  await syncLevels();
+}
+
+function setCaptureUi(enabled) {
+  const changed = enabled !== tlEnabled;
+  tlEnabled = enabled;
+  const btn = document.getElementById('tl-capture');
+  btn.textContent = enabled ? 'capture on' : 'capture off';
+  btn.classList.toggle('on', enabled);
+  // no point polling four times a second for a buffer nothing is filling
+  if (enabled && !tlTimer) tlTimer = setInterval(syncLevels, 250);
+  if (!enabled && tlTimer) { clearInterval(tlTimer); tlTimer = null; }
+  if (!enabled) document.getElementById('tl-db').textContent = '-inf dB';
+  // covers a toggle from another phone as well as our own, in both directions
+  if (changed) renderMarkerList();
+}
+
+async function syncLevels() {
+  // the cursor only advances once a response lands, so two polls in flight both ask from the same
+  // point and both append the same rows. the pi answers slower than the 250ms tick exactly when it
+  // is transcribing and running the llm, which is where the duplicates showed up
+  if (document.hidden || tlPolling) return;
+  tlPolling = true;
+  try {
+    const data = await fetch(`/levels?since=${tlSince}&marker_since=${tlMarkerSince}`).then(r => r.json());
+    setCaptureUi(data.enabled);
+    // the speaker restarted (or capture was cycled) and its counters are behind our cursor — without
+    // this the page would sit empty forever, asking for frames that will not be issued again
+    if (data.total < tlSince) {
+      tlSince = -1; tlMarkerSince = -1; tlFrames = []; tlMarkers = [];
+      return;
+    }
+    // filter on the index as well, so appending stays idempotent whatever arrives
+    for (const f of data.frames) if (f.i > tlSince) { tlFrames.push(f); tlSince = f.i; }
+    if (tlFrames.length > TL_MAX_FRAMES) tlFrames.splice(0, tlFrames.length - TL_MAX_FRAMES);
+    let added = 0;
+    for (const m of data.markers) if (m.i > tlMarkerSince) { tlMarkers.push(m); tlMarkerSince = m.i; added++; }
+    if (tlMarkers.length > TL_MAX_MARKERS) tlMarkers.splice(0, tlMarkers.length - TL_MAX_MARKERS);
+    if (added) renderMarkerList();
+    if (tlFrames.length) {
+      const last = tlFrames[tlFrames.length - 1];
+      document.getElementById('tl-db').textContent =
+        last.rms > 0 ? (20 * Math.log10(last.rms)).toFixed(0) + ' dB' : '-inf dB';
+    }
+  } catch {} finally { tlPolling = false; }
+}
+
+function renderMarkerList() {
+  const el = document.getElementById('tl-markers');
+  if (!tlMarkers.length) {
+    el.innerHTML = tlEnabled
+      ? '<div style="color:#444;">no events yet — say the wake word...</div>'
+      : '<div style="color:#444;">capture is off</div>';
+    return;
+  }
+  el.innerHTML = '';
+  for (const m of [...tlMarkers].reverse()) {
+    const div = document.createElement('div');
+    div.className = 'tl-mark';
+    const ts = new Date(m.ts * 1000).toLocaleTimeString();
+    const colour = TL_KIND_COLOURS[m.kind] || '#888';
+    div.innerHTML = `<span class="tl-mark-ts">${ts}</span>`
+      + `<span class="tl-mark-kind" style="color:${colour}">${m.kind}</span>`
+      + `<span class="tl-mark-text">${m.text.replace(/</g, '&lt;')}</span>`;
+    el.appendChild(div);
+  }
+}
+
+function setWindow(secs, btn) {
+  tlWindow = secs;
+  document.querySelectorAll('#tl-toolbar .tl-win').forEach(b => b.classList.remove('on'));
+  btn.classList.add('on');
+}
+
+function goLive() {
+  tlLive = true;
+  document.getElementById('tl-live').classList.add('on');
+}
+
+function drawTimeline() {
+  const canvas = document.getElementById('tl-canvas');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const c = canvas.getContext('2d');
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+
+  if (!tlFrames.length) {
+    c.fillStyle = '#444';
+    c.font = "12px 'Cousine', monospace";
+    c.textBaseline = 'middle';
+    c.fillText(tlEnabled ? 'waiting for audio...' : 'capture is off — press capture to start recording levels', 10, h / 2);
+    return;
+  }
+
+  // the newest frame is "now" rather than the browser clock — server timestamps are wall clock and
+  // the phone's clock may not agree with the pi's
+  const latest = tlFrames[tlFrames.length - 1].ts;
+  if (tlLive) tlEnd = latest;
+  const start = tlEnd - tlWindow;
+  const x = ts => (ts - start) / tlWindow * w;
+
+  const detTop = TL_LABEL_H, detBot = TL_LABEL_H + TL_DET_H;
+  const waveTop = detBot + 4, waveMid = (waveTop + h) / 2, halfH = (h - waveTop) / 2;
+
+  // lane separators and the detector 0/1 rails
+  c.strokeStyle = '#1e1e1e';
+  c.lineWidth = 1;
+  c.beginPath();
+  c.moveTo(0, detBot + 0.5); c.lineTo(w, detBot + 0.5);
+  c.moveTo(0, Math.round(waveMid) + 0.5); c.lineTo(w, Math.round(waveMid) + 0.5);
+  c.stroke();
+
+  // detector thresholds — dashed, only once we know the real values from /status
+  c.setLineDash([3, 4]);
+  for (const [thr, colour] of [[tlWakeThreshold, '#456'], [tlVadThreshold, '#465']]) {
+    if (thr == null) continue;
+    const y = Math.round(detTop + TL_DET_H * (1 - thr)) + 0.5;
+    c.strokeStyle = colour;
+    c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
+  }
+  c.setLineDash([]);
+
+  // amplitude bars, mirrored about the centre. width comes from the gap to the next frame because
+  // the capture rate changes between wake listen (80ms) and recording (32ms)
+  for (let i = 0; i < tlFrames.length; i++) {
+    const f = tlFrames[i];
+    if (f.ts < start - 1 || f.ts > tlEnd) continue;
+    const x0 = x(f.ts);
+    const next = tlFrames[i + 1];
+    const bw = Math.max(1, (next ? x(next.ts) : x0 + w / tlWindow * 0.08) - x0);
+    const pk = _tlNorm(f.peak) * halfH, rm = _tlNorm(f.rms) * halfH;
+    c.fillStyle = '#333';
+    c.fillRect(x0, waveMid - pk, bw, pk * 2);
+    c.fillStyle = '#7af';
+    c.fillRect(x0, waveMid - rm, bw, rm * 2);
+    // the voice layer: amplitude scaled by speech probability, so it stands tall only when the
+    // signal is both loud and actually speech. a fridge hum stays blue, your voice goes green
+    if (f.vad != null) {
+      const vc = _tlNorm(f.rms * f.vad) * halfH;
+      c.fillStyle = '#afa';
+      c.fillRect(x0, waveMid - vc, bw, vc * 2);
+    }
+  }
+
+  // detector traces — sparse, only one model runs at a time, so break the line across gaps
+  for (const [key, colour] of [['score', '#7af'], ['vad', '#afa']]) {
+    c.strokeStyle = colour;
+    c.lineWidth = 1;
+    c.beginPath();
+    let open = false;
+    for (const f of tlFrames) {
+      if (f.ts < start - 1 || f.ts > tlEnd) continue;
+      if (f[key] == null) { open = false; continue; }
+      const px = x(f.ts), py = detTop + TL_DET_H * (1 - f[key]);
+      if (open) c.lineTo(px, py); else { c.moveTo(px, py); open = true; }
+    }
+    c.stroke();
+  }
+
+  // event markers, full height with a label in the top strip
+  c.font = "10px 'Cousine', monospace";
+  c.textBaseline = 'top';
+  let lastLabelX = -Infinity;
+  for (const m of tlMarkers) {
+    if (m.ts < start || m.ts > tlEnd) continue;
+    const px = Math.round(x(m.ts)) + 0.5;
+    const colour = TL_KIND_COLOURS[m.kind] || '#888';
+    c.strokeStyle = colour;
+    c.beginPath(); c.moveTo(px, TL_LABEL_H); c.lineTo(px, h); c.stroke();
+    // labels collide when events land within a frame of each other — drop the ones that would overlap
+    if (px - lastLabelX > 46) {
+      c.fillStyle = colour;
+      c.fillText(m.kind, px + 2, 1);
+      lastLabelX = px;
+    }
+  }
+
+  // window bounds, right-aligned so it does not sit under the marker labels
+  c.fillStyle = '#444';
+  c.textBaseline = 'bottom';
+  const age = latest - tlEnd;
+  c.fillText(age > 1 ? `-${age.toFixed(0)}s` : 'now', w - 34, h - 2);
+}
+
+// drag to pan back through the buffer, pointer events so it works with touch
+(function initTimelineDrag() {
+  const canvas = document.getElementById('tl-canvas');
+  let dragging = false, lastX = 0;
+  canvas.addEventListener('pointerdown', e => {
+    dragging = true;
+    lastX = e.clientX;
+    canvas.classList.add('dragging');
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX;
+    lastX = e.clientX;
+    if (!dx) return;
+    tlLive = false;
+    document.getElementById('tl-live').classList.remove('on');
+    tlEnd -= dx / canvas.clientWidth * tlWindow;
+    // do not let the view run past either end of what the buffer holds
+    if (tlFrames.length) {
+      const latest = tlFrames[tlFrames.length - 1].ts;
+      const oldest = tlFrames[0].ts;
+      tlEnd = Math.max(oldest + tlWindow, Math.min(latest, tlEnd));
+      if (tlEnd >= latest) goLive();
+    }
+  });
+  const end = e => {
+    dragging = false;
+    canvas.classList.remove('dragging');
+    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  };
+  canvas.addEventListener('pointerup', end);
+  canvas.addEventListener('pointercancel', end);
+})();
+
 // status + history polling
 async function updateStatus() {
   try {
@@ -557,6 +886,9 @@ async function updateStatus() {
     if (data.ip && data.ip !== 'unknown') {
       document.getElementById('host-ip').textContent = data.ip + ':' + (data.port || 8000);
     }
+    if (data.state_name) document.getElementById('tl-state').textContent = data.state_name;
+    tlWakeThreshold = data.wake_threshold;
+    tlVadThreshold = data.vad_threshold;
   } catch {}
   await syncHistory();
   await syncConsole();
