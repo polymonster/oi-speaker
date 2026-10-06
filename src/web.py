@@ -46,6 +46,13 @@ class LevelsEnableRequest(BaseModel):
     enabled: bool
 
 
+class LlmTestRequest(BaseModel):
+    provider: str
+    model: str
+    api_key: str = ""
+    api_base: str = ""
+
+
 _peers_lock = threading.Lock()
 _peers: dict[str, dict] = {}  # keyed by room name
 _zeroconf: AsyncZeroconf | None = None
@@ -144,7 +151,7 @@ async def chat(req: ChatRequest):
     spk._save_history(spk.CHAT_HISTORY_PATH, entry)
     spk.start_perf_timer()
     loop = asyncio.get_event_loop()
-    state = await loop.run_in_executor(None, spk.query_llm, spk.ctx.llm_client, spk.ctx.system, req.text)
+    state = await loop.run_in_executor(None, spk.query_llm, req.text)
     return {"response": f"[{state.value}]"}
 
 
@@ -163,8 +170,6 @@ async def audio_devices():
     return spk.enumerate_audio_devices()
 
 
-_DEFAULT_CONFIDENTIAL = ["llm.anthropic_api_key"]
-
 # the settings form is generated from whatever keys config.toml happens to hold, so a runtime-tunable
 # key added after a box was set up is unreachable from the web UI — the only place to add it is the
 # config file the UI exists to avoid editing. surface these whether or not they are on disk; saving
@@ -175,8 +180,8 @@ _AUDIO_DEFAULTS = {"duck_volume": 0, "mono_output": False}
 async def get_settings():
     with open(CONFIG_PATH, "rb") as f:
         cfg = tomllib.load(f)
-    meta = cfg.setdefault("meta", {})
-    meta.setdefault("confidential", _DEFAULT_CONFIDENTIAL)
+    # also fills meta.confidential with the vendor key paths
+    spk.migrate_llm_config(cfg)
     audio = cfg.setdefault("audio", {})
     for key, default in _AUDIO_DEFAULTS.items():
         audio.setdefault(key, default)
@@ -185,10 +190,39 @@ async def get_settings():
 
 @app.post("/settings")
 async def update_settings(settings: dict[str, Any] = Body(...)):
+    spk.migrate_llm_config(settings)
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(settings).encode())
     spk.apply_audio_settings(settings)
+    spk.apply_llm_settings(settings)
     return {"ok": True}
+
+
+@app.get("/llm/providers")
+async def llm_providers():
+    return {"providers": spk.PROVIDERS, "efforts": spk.LLM_EFFORTS}
+
+
+@app.get("/llm/models")
+async def llm_models(provider: str, api_base: str = ""):
+    if provider != "ollama":
+        return spk.list_llm_models(provider)
+    # local models are whatever has been pulled, which no registry can know
+    base = (api_base or spk.PROVIDERS["ollama"]["default_api_base"]).rstrip("/")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{base}/api/tags", timeout=5.0)
+            resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"ollama unreachable at {base}: {e}")
+    return [f"ollama_chat/{m['name']}" for m in resp.json().get("models", [])]
+
+
+@app.post("/llm/test")
+async def llm_test(req: LlmTestRequest):
+    loop = asyncio.get_event_loop()
+    error = await loop.run_in_executor(None, spk.test_llm, req.provider, req.model, req.api_key, req.api_base)
+    return {"ok": error is None, "error": error}
 
 
 @app.post("/stop")
@@ -337,6 +371,7 @@ async def rpc_sync_config(req: SyncConfigRequest):
             remote_cfg[section] = local_cfg[section]
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(remote_cfg).encode())
+    spk.apply_llm_settings(remote_cfg)
     return {"ok": True}
 
 

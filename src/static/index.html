@@ -79,6 +79,12 @@
   #save-btn:hover { background: #2a2a2a; }
   #cancel-btn { display: none; background: none; border: 1px solid #444; color: #888; padding: 10px 20px; cursor: pointer; font-family: 'Cousine', monospace; margin-top: 16px; font-size: 1em; margin-left: 8px; }
   #cancel-btn:hover { color: #eee; border-color: #666; }
+  .llm-test { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .llm-test button { background: none; border: 1px solid #333; color: #888; padding: 8px 14px; cursor: pointer; font-family: 'Cousine', monospace; font-size: 0.9em; flex-shrink: 0; }
+  .llm-test button:hover { border-color: #555; color: #eee; }
+  .llm-test-result { font-size: 0.85em; word-break: break-word; }
+  .llm-test-result.ok { color: #afa; }
+  .llm-test-result.err { color: #f66; }
   #save-feedback { color: #afa; font-size: 0.9em; margin-left: 12px; opacity: 0; transition: opacity 0.3s; }
 
   /* status */
@@ -334,6 +340,12 @@ async function loadSettings() {
     form.appendChild(syncRow);
   }
 
+  // llm first — vendor and key are the first thing a new box needs
+  const llmContainer = document.createElement('div');
+  llmContainer.id = 'llm-container';
+  form.appendChild(llmContainer);
+  await renderLlm(llmContainer);
+
   renderObj(form, settingsData, []);
 
   // Hints — always rendered explicitly so it's never silently skipped
@@ -360,8 +372,8 @@ async function loadSettings() {
 
 function renderObj(container, obj, path) {
   for (const [key, val] of Object.entries(obj)) {
-    if (key === 'hints' || key === 'meta') {
-      continue; // hints rendered explicitly; meta is internal
+    if (key === 'hints' || key === 'meta' || (key === 'llm' && path.length === 0)) {
+      continue; // hints and llm rendered explicitly; meta is internal
     } else if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
       continue; // other arrays of objects — skip
     } else if (typeof val === 'object' && !Array.isArray(val)) {
@@ -406,6 +418,166 @@ function renderObj(container, obj, path) {
   }
 }
 
+// llm — vendor, its key, models and effort. built by hand rather than by renderObj: only the chosen
+// vendor's key is shown, and the model lists depend on the vendor
+let llmProviders = null;  // {providers, efforts} from /llm/providers, fetched once
+
+function settingRow(label, control) {
+  const div = document.createElement('div');
+  div.className = 'setting';
+  const l = document.createElement('label');
+  l.textContent = label;
+  div.appendChild(l);
+  div.appendChild(control);
+  return div;
+}
+
+function pathInput(path, value, attrs = {}) {
+  const input = document.createElement('input');
+  input.dataset.path = path;
+  input.value = value ?? '';
+  Object.assign(input, attrs);
+  return input;
+}
+
+function modelBelongsTo(model, provider) {
+  // "ollama_chat/qwen3" belongs to ollama, "openrouter/x" does not belong to openai
+  return (model || '').split('/')[0].startsWith(provider);
+}
+
+async function renderLlm(container) {
+  if (!llmProviders) {
+    try { llmProviders = await fetch('/llm/providers').then(r => r.json()); }
+    catch (e) { container.textContent = 'Error loading llm providers: ' + e; return; }
+  }
+  const llm = settingsData.llm;
+  const providers = llmProviders.providers;
+  const spec = providers[llm.provider] || {};
+  container.innerHTML = '';
+
+  const header = document.createElement('div');
+  header.className = 'section-header';
+  header.textContent = 'llm';
+  container.appendChild(header);
+
+  const vendor = document.createElement('select');
+  vendor.dataset.path = 'llm.provider';
+  for (const [name, p] of Object.entries(providers)) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = p.label + (p.needs_key && llm.keys?.[name] ? '  ✓' : '');
+    vendor.appendChild(opt);
+  }
+  // a provider set by hand in config.toml that the ui does not list still shows, and still saves
+  if (!providers[llm.provider]) {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = llm.provider;
+    vendor.appendChild(opt);
+  }
+  vendor.value = llm.provider;
+  vendor.onchange = () => switchLlmProvider(container, vendor.value);
+  container.appendChild(settingRow('vendor', vendor));
+
+  if (spec.needs_key !== false) {
+    llm.keys ??= {};
+    llm.keys[llm.provider] ??= '';
+    const wrap = document.createElement('div');
+    wrap.className = 'secret-wrap';
+    wrap.appendChild(pathInput(`llm.keys.${llm.provider}`, llm.keys[llm.provider], { type: 'password', placeholder: 'api key' }));
+    wrap.insertAdjacentHTML('beforeend', `<button class="eye-btn" type="button" onclick="toggleSecret(this)" title="toggle visibility">
+        <svg class="eye-open" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+        </svg>
+        <svg class="eye-closed" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/>
+        </svg>
+      </button>`);
+    container.appendChild(settingRow('api key', wrap));
+  }
+
+  if (spec.needs_api_base) {
+    llm.api_base ??= '';
+    container.appendChild(settingRow('api base', pathInput('llm.api_base', llm.api_base, { placeholder: spec.default_api_base || '' })));
+  }
+
+  // free text backed by a datalist — the list suggests, but a model newer than litellm's registry
+  // can still be typed in
+  const list = document.createElement('datalist');
+  list.id = 'llm-models';
+  container.appendChild(list);
+  for (const [label, path, placeholder] of [['model', 'model', spec.default_model], ['followup model', 'followup_model', spec.default_followup]]) {
+    const input = pathInput(`llm.${path}`, llm[path], { placeholder: placeholder || '' });
+    input.setAttribute('list', 'llm-models');
+    container.appendChild(settingRow(label, input));
+  }
+
+  const effort = document.createElement('select');
+  effort.dataset.path = 'llm.effort';
+  const efforts = [...llmProviders.efforts];
+  if (llm.effort && !efforts.includes(llm.effort)) efforts.push(llm.effort);  // a hand-set "max" survives
+  for (const e of efforts) {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = e;
+    effort.appendChild(opt);
+  }
+  effort.value = llm.effort || 'low';
+  container.appendChild(settingRow('effort', effort));
+
+  const test = document.createElement('div');
+  test.className = 'llm-test';
+  test.innerHTML = `<button type="button">test</button><span class="llm-test-result"></span>`;
+  test.querySelector('button').onclick = () => testLlm(container, test.querySelector('.llm-test-result'));
+  container.appendChild(test);
+
+  const base = llm.api_base || '';
+  fetch(`/llm/models?provider=${encodeURIComponent(llm.provider)}&api_base=${encodeURIComponent(base)}`)
+    .then(r => r.ok ? r.json() : [])
+    .then(models => {
+      for (const m of models) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        list.appendChild(opt);
+      }
+    })
+    .catch(() => {});
+}
+
+function switchLlmProvider(container, provider) {
+  // keep what was typed into the section before it is rebuilt for the new vendor
+  collectPaths(container);
+  const llm = settingsData.llm;
+  const spec = llmProviders.providers[provider] || {};
+  llm.provider = provider;
+  if (!modelBelongsTo(llm.model, provider)) llm.model = spec.default_model || '';
+  if (!modelBelongsTo(llm.followup_model, provider)) llm.followup_model = spec.default_followup || llm.model;
+  renderLlm(container);
+  markDirty();
+}
+
+async function testLlm(container, out) {
+  collectPaths(container);
+  const llm = settingsData.llm;
+  out.className = 'llm-test-result';
+  out.textContent = 'testing...';
+  try {
+    const res = await fetch('/llm/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: llm.provider,
+        model: llm.model,
+        api_key: llm.keys?.[llm.provider] || '',
+        api_base: llm.api_base || '',
+      })
+    }).then(r => r.json());
+    out.className = 'llm-test-result ' + (res.ok ? 'ok' : 'err');
+    out.textContent = res.ok ? 'ok' : res.error;
+  } catch (e) {
+    out.className = 'llm-test-result err';
+    out.textContent = String(e);
+  }
+}
+
 function renderHints(container, hints) {
   container.innerHTML = '';
   hints.forEach((hint, i) => {
@@ -447,9 +619,9 @@ function cancelSettings() {
   loadSettings();
 }
 
-async function saveSettings() {
-  // collect scalar/array inputs
-  document.querySelectorAll('[data-path]').forEach(input => {
+// write every data-path input under `root` back into settingsData
+function collectPaths(root) {
+  root.querySelectorAll('[data-path]').forEach(input => {
     const keys = input.dataset.path.split('.');
     let obj = settingsData;
     for (let i = 0; i < keys.length - 1; i++) obj = obj[keys[i]];
@@ -461,6 +633,10 @@ async function saveSettings() {
         ? input.value.split(',').map(s => s.trim()).filter(Boolean)
         : input.value;
   });
+}
+
+async function saveSettings() {
+  collectPaths(document);
   // collect hints — value goes to url or text depending on content
   document.querySelectorAll('[data-hint]').forEach(input => {
     const i = parseInt(input.dataset.hint);
@@ -602,7 +778,7 @@ const TL_LABEL_H = 14;        // marker label strip along the top
 const TL_DET_H = 56;          // wake score / vad probability lane
 const TL_FLOOR_DB = -60;      // amplitude below this reads as silence
 const TL_KIND_COLOURS = {
-  wake: '#fa7', interrupt: '#fa7', record: '#f66', warn: '#f66',
+  wake: '#fa7', interrupt: '#fa7', nudge: '#fa7', record: '#f66', warn: '#f66',
   onset: '#afa', recorded: '#afa', transcribe: '#7af', transcribed: '#7af',
   llm: '#7af', 'llm-done': '#7af'
 };

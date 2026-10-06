@@ -138,6 +138,30 @@ python -m piper.download --voice en_GB-northern_english_male-medium
 python -m piper.download_voices en_GB-northern_english_male-medium
 ```
 
+## Language Model
+
+The assistant talks to its LLM through [LiteLLM](https://docs.litellm.ai/docs/providers), so any vendor works. Pick one in the **settings** tab of the web ui under **llm**: choose the vendor, paste its API key, pick a model and a follow-up model, then hit **test**. Changes apply on save, with no restart.
+
+The web ui offers Anthropic, OpenAI, Gemini, OpenRouter and Ollama. Any other LiteLLM provider works if you set it by hand in `config.toml`:
+
+```toml
+[llm]
+provider = "anthropic"
+model = "anthropic/claude-opus-5"
+followup_model = "anthropic/claude-sonnet-5"
+effort = "low"
+
+[llm.keys]
+anthropic = "sk-ant-..."
+openai = ""
+```
+
+- Model names are LiteLLM `vendor/model` strings, e.g. `openai/gpt-5.5`, `gemini/gemini-3.5-flash`, `ollama_chat/qwen3`.
+- Keys are stored per vendor, so you can switch back and forth. An empty key falls back to the vendor's usual environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...).
+- For **Ollama**, set `api_base` (default `http://localhost:11434`) and choose a model that supports tool calling. The model list in the web ui comes from the models you have pulled.
+- **Web search** uses Anthropic's built-in search on Anthropic. Other vendors get a local DuckDuckGo search tool that needs no key.
+- Configs from before this change (with a single `anthropic_api_key`) are migrated automatically when loaded.
+
 ## Running
 
 ```bash
