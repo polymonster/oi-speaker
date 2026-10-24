@@ -11,7 +11,8 @@ dependencies = [
     "openwakeword @ git+https://github.com/dscripka/openWakeWord.git",
     "faster-whisper",
     "setuptools<71; sys_platform == 'darwin'",
-    "anthropic",
+    "litellm",
+    "ddgs",
     "piper-tts",
     "yt-dlp",
     "python-mpv",
@@ -23,6 +24,7 @@ dependencies = [
     "silero-vad",
     "pyusb",
     "libusb-package; sys_platform == 'win32'",
+    "pycaw; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -45,9 +47,10 @@ cuda = [
 [project.scripts]
 speaker = "speaker:main"
 xvf3800 = "xvf3800:main"
+tts = "tts:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/static"]
+packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/tts.py", "src/static"]
