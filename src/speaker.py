@@ -1002,6 +1002,11 @@ def _llm_request(llm: _LLM, model: str, system: str, messages: list[dict]) -> di
         tools.append(ANTHROPIC_WEB_SEARCH_TOOL)
     else:
         tools.append(_to_openai_tool(LOCAL_WEB_SEARCH_TOOL))
+    # the vendor and model change from settings, so the model cannot know which one it is unless told.
+    # prompt caches are per model anyway, so naming it here never splits a cache
+    system = (f"{system}\n\n# About you\n\nYou are running on the {model.split('/')[-1]} model from "
+              f"{PROVIDERS.get(llm.provider, {}).get('label', llm.provider)}. If asked which model or AI "
+              f"you are, say so plainly, reading the name the way a person would.")
     if llm.provider == "anthropic":
         # Tools render before system, so one breakpoint here caches the whole stable prefix. Everything
         # that varies per turn lives in messages, after it. Other vendors cache prefixes unprompted

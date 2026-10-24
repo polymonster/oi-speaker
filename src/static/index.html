@@ -47,11 +47,12 @@
   .send-btn:hover { background: #2a2a2a; }
 
   /* settings */
-  #settings { overflow-y: auto; overflow-x: auto; }
-  .hint-row { min-width: max-content; }
+  #settings { overflow-y: auto; overflow-x: hidden; }
   .setting { margin-bottom: 14px; }
   .setting label { display: block; color: #666; font-size: 0.85em; margin-bottom: 4px; }
   .setting input, .setting select { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; }
+  /* full width would draw the box centred in a row of its own */
+  .setting input[type=checkbox] { width: auto; display: block; margin: 0; }
   .setting input:focus, .setting select:focus { border-color: #555; }
   .secret-wrap { display: flex; }
   .secret-wrap input { flex: 1; border-right: none; }
@@ -63,10 +64,11 @@
   .hint-block { margin-bottom: 8px; }
   .hint-row { display: flex; gap: 8px; align-items: center; }
   .hint-row + .hint-row { margin-top: 4px; }
-  .hint-row input { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; }
+  /* min-width 0 lets the inputs give way on a narrow screen instead of pushing the page sideways */
+  .hint-row input { min-width: 0; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; }
   .hint-row input:focus { border-color: #555; }
-  .hint-row .name-input { width: 130px; flex-shrink: 0; }
-  .hint-row .cat-input  { width: 90px; flex-shrink: 0; }
+  .hint-row .name-input { flex: 0 1 130px; }
+  .hint-row .cat-input  { flex: 0 1 90px; }
   .hint-row .val-input  { flex: 1; }
   .hint-row .extra-input { flex: 1; color: #aaa; }
   .rm-btn { background: none; border: 1px solid #333; color: #555; padding: 8px 10px; cursor: pointer; font-family: 'Cousine', monospace; flex-shrink: 0; }
