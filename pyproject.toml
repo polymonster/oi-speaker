@@ -14,6 +14,7 @@ dependencies = [
     "ddgs",
     "yt-dlp",
     "python-mpv",
+    "mutagen",  # tags of the music library's files
     "speexdsp-ns; sys_platform == 'linux'",
     "fastapi[standard]",
     "tomli-w",
@@ -60,4 +61,4 @@ tts-record = "tts_record:main"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/tts_record.py", "src/backends.py", "src/transcribe.py", "src/voice.py", "src/static"]
+packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/tts_record.py", "src/backends.py", "src/transcribe.py", "src/voice.py", "src/alarms.py", "src/library.py", "src/static"]

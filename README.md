@@ -100,6 +100,25 @@ download on first use.
 | `chatterbox` | `pip install -e ".[chatterbox]"` | [Chatterbox Turbo](https://github.com/resemble-ai/chatterbox), pulls in torch. Needs a gpu (cuda or apple `mps`) to keep up: on cpu a sentence takes ~2-5x its own length to synthesise. For cuda, install a cuda build of torch |
 | `openai` | nothing extra | cloud api (`gpt-4o-mini-tts`, `tts-1`...), uses the openai key from `[llm.keys]`. `instructions` steers tone and accent on `gpt-4o-mini-tts` |
 
+#### Kokoro voices
+
+Kokoro ships 54 voices in one file, `models/kokoro/voices-v1.0.bin`, and the model is the same for
+all of them. Pick one with `voice` under the kokoro backend in the settings tab (or
+`[voice.kokoro] voice` in `config.toml`); it applies on save, with no restart. The name says what
+it is:
+
+- first letter, the accent: `a` American, `b` British (also `e` Spanish, `f` French, `h` Hindi,
+  `i` Italian, `j` Japanese, `p` Portuguese, `z` Mandarin)
+- second letter: `f` female, `m` male
+
+| | female | male |
+|---|---|---|
+| British | `bf_alice` `bf_emma` `bf_isabella` `bf_lily` | `bm_daniel` `bm_fable` `bm_george` `bm_lewis` |
+| American | `af_alloy` `af_aoede` `af_bella` `af_heart` `af_jessica` `af_kore` `af_nicole` `af_nova` `af_river` `af_sarah` `af_sky` | `am_adam` `am_echo` `am_eric` `am_fenrir` `am_liam` `am_michael` `am_onyx` `am_puck` `am_santa` |
+
+The default is `bm_george`. Use the full `kokoro-v1.0.onnx` model rather than the int8 one: on cpu
+the int8 model ran ~3.5x slower.
+
 Chatterbox speaks in its built-in voice by default. To clone another, drop a clean recording of at
 least 5 seconds into `models/chatterbox/` and pick it as the `reference` in settings.
 
@@ -224,6 +243,47 @@ openai = ""
 - For **Ollama**, set `api_base` (default `http://localhost:11434`) and choose a model that supports tool calling. The model list in the web ui comes from the models you have pulled.
 - **Web search** uses Anthropic's built-in search on Anthropic. Other vendors get a local DuckDuckGo search tool that needs no key.
 - Configs from before this change (with a single `anthropic_api_key`) are migrated automatically when loaded.
+
+## Timers and Alarms
+
+Ask for either by voice: "set a pasta timer for ten minutes", "wake me at seven on weekdays",
+"what alarms have I got", "cancel the gym alarm". When one goes off it rings until you say the
+wake word and **stop** or **snooze** (9 minutes). Saying the wake word quiets it while you talk, so
+the request can be heard; if you ask for something else it rings on once the turn is over. "Stop"
+silences the alarm only, any music playing keeps going. A named timer or labelled alarm is
+announced by name after the first ring, and anything left ringing gives up after 10 minutes.
+
+The **alarms** tab of the web ui is the alarm clock: add alarms, set the time, a label, the days
+they repeat on (none for a one-off, which turns itself off once it has rung), the sound and whether
+snooze is allowed, and pick the sound timers ring with. Each sound can be previewed in the
+browser, and everything saves as you change it.
+
+Alarms are kept in `alarms.json` next to `config.toml`, per speaker. The sounds are whatever is in
+`sounds/alarms/`; drop in a `.wav`, `.mp3`, `.m4a`, `.ogg` or `.flac` and it is offered straight
+away. They loop gaplessly, so a clip that loops cleanly in an audio editor loops cleanly here.
+
+## Music Library
+
+Music on a local disk (a USB drive, a folder of mp3s) can be searched and played by voice: "play
+some dub techno", "put on Nevermind", "play the wedding folder", "shuffle my music", "next track",
+"what's this?". Point the speaker at it in `config.toml`, or the settings tab of the web ui:
+
+```toml
+[library]
+paths = ["/media/usb"]   # one or more folders, e.g. ["F:/"] on Windows
+```
+
+The folders are indexed on start: the tags are read with mutagen (artist, album, title, genre,
+year), with the folder layout filling any gaps (`Artist - Album/04 - Title.mp3`). The first scan of
+a big drive takes a while, ~90s for 14k tracks over USB; after that the index is cached in
+`.library.json` and only new or changed files are read again, so a rescan is a second or two. It
+rescans on its own when a folder appears or disappears (a drive plugged in or pulled out) and every
+hour otherwise; `POST /library/rescan` does it now, and `GET /library` shows how many tracks it has.
+
+The LLM searches the library first when asked for music, and falls back to YouTube and SoundCloud
+when nothing matches. It can play an artist, album, track, genre or any folder on the drive, in order
+or shuffled. A copy of an album in several folders is only played and offered once. With no
+`[library]` paths set the library tools are not offered to the LLM at all.
 
 ## Running
 

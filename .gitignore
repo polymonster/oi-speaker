@@ -4,6 +4,8 @@ models/kokoro/
 models/chatterbox/
 .credentials
 config.toml
+alarms.json
+.library.json
 ~/
 training/training_data/
 training/scores/

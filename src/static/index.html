@@ -118,6 +118,26 @@
   .tl-mark-kind { width: 9em; flex-shrink: 0; }
   .tl-mark-text { color: #888; word-break: break-word; }
 
+  /* alarms */
+  #alarms { overflow-y: auto; overflow-x: hidden; }
+  .alarm-card { border: 1px solid #222; padding: 12px 14px; margin-bottom: 10px; }
+  .alarm-card.off { opacity: 0.45; }
+  .alarm-top { display: flex; align-items: center; gap: 10px; }
+  .alarm-time { background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 4px 8px; font-family: 'Cousine', monospace; font-size: 1.6em; outline: none; color-scheme: dark; }
+  .alarm-label { flex: 1; min-width: 0; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; }
+  .alarm-time:focus, .alarm-label:focus { border-color: #555; }
+  .alarm-toggle { width: 22px; height: 22px; flex-shrink: 0; cursor: pointer; accent-color: #afa; }
+  .alarm-days { display: flex; gap: 4px; margin: 10px 0; flex-wrap: wrap; }
+  .alarm-days button { width: 2.6em; background: none; border: 1px solid #333; color: #555; padding: 6px 0; cursor: pointer; font-family: 'Cousine', monospace; font-size: 0.85em; }
+  .alarm-days button.on { border-color: #afa; color: #afa; }
+  .alarm-days .days-note { color: #555; font-size: 0.8em; align-self: center; margin-left: 6px; }
+  .sound-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sound-row select { flex: 1; min-width: 0; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 8px 10px; font-family: 'Cousine', monospace; font-size: 1em; outline: none; appearance: none; cursor: pointer; }
+  .sound-row label { color: #666; font-size: 0.85em; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .preview-btn { background: none; border: 1px solid #333; color: #888; padding: 8px 12px; cursor: pointer; font-family: 'Cousine', monospace; flex-shrink: 0; }
+  .preview-btn:hover, .preview-btn.on { border-color: #555; color: #eee; }
+  #alarms-feedback { color: #555; font-size: 0.85em; min-height: 1.2em; margin-top: 8px; }
+
   /* history */
   #history-list { flex: 1; overflow-y: auto; border: 1px solid #222; padding: 10px 14px; }
   .play-entry { display: flex; align-items: baseline; gap: 12px; padding: 5px 0; border-bottom: 1px solid #1a1a1a; }
@@ -136,6 +156,7 @@
     #chat-form { padding-bottom: 0; }
     #console-log { height: 520px; flex: none; }
     #history-list { height: 520px; flex: none; }
+    #alarms { overflow-y: visible; }
     #tl-canvas { height: 280px; }
     #tl-markers { height: 240px; flex: none; }
   }
@@ -146,6 +167,7 @@
 <div id="host-ip"></div>
 <nav>
   <button class="active" onclick="show('chat', this)">chat</button>
+  <button onclick="show('alarms', this)">alarms</button>
   <button onclick="show('settings', this)">settings</button>
   <button onclick="show('console', this)">console</button>
   <button onclick="show('speakers', this)">speakers</button>
@@ -196,6 +218,18 @@
   <div id="tl-markers"></div>
 </section>
 
+<section id="alarms">
+  <div class="section-header">alarms</div>
+  <div id="alarm-list"></div>
+  <button class="add-btn" onclick="addAlarm()">+ alarm</button>
+  <div class="section-header">timers</div>
+  <div class="setting">
+    <label>timer sound</label>
+    <div class="sound-row" id="timer-sound-row"></div>
+  </div>
+  <div id="alarms-feedback"></div>
+</section>
+
 <section id="settings">
   <div id="settings-form"></div>
   <div style="display:flex;align-items:center;">
@@ -218,6 +252,7 @@ function show(id, btn) {
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
   if (id === 'settings') loadSettings();
+  if (id === 'alarms') loadAlarms(); else stopPreview();
   if (id === 'history') loadPlayHistory();
   if (id === 'timeline') startTimeline(); else stopTimeline();
 }
@@ -273,6 +308,199 @@ async function syncHistory() {
     }
     historyLen = entries.length;
   } catch {}
+}
+
+// alarms — saved as they are edited, like a phone's clock app
+const DAY_LABELS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+const DEFAULT_ALARM_SOUND = 'sounds/alarms/midnight.wav';
+let alarmData = null;
+let alarmSaveTimer = null;
+let previewing = null;  // {audio, btn} while a sound is previewing in the browser
+
+async function loadAlarms() {
+  const feedback = document.getElementById('alarms-feedback');
+  try {
+    const res = await fetch('/alarms');
+    if (!res.ok) throw new Error((await res.json()).detail || res.status);
+    alarmData = await res.json();
+    feedback.textContent = '';
+  } catch (e) {
+    alarmData = null;
+    document.getElementById('alarm-list').innerHTML = '';
+    feedback.textContent = `alarms unavailable: ${e.message}`;
+    return;
+  }
+  renderAlarms();
+}
+
+function saveAlarms() {
+  clearTimeout(alarmSaveTimer);
+  const feedback = document.getElementById('alarms-feedback');
+  feedback.textContent = 'saving...';
+  // debounced, so typing a label is one save rather than one per key
+  alarmSaveTimer = setTimeout(async () => {
+    try {
+      const res = await fetch('/alarms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timer_sound: alarmData.timer_sound, alarms: alarmData.alarms })
+      });
+      if (!res.ok) throw new Error(res.status);
+      feedback.textContent = 'saved';
+    } catch (e) {
+      feedback.textContent = `save failed: ${e.message}`;
+    }
+  }, 400);
+}
+
+function describeDays(days) {
+  const key = days.join(',');
+  if (!days.length) return 'once';
+  if (key === '0,1,2,3,4,5,6') return 'every day';
+  if (key === '0,1,2,3,4') return 'weekdays';
+  if (key === '5,6') return 'weekends';
+  return '';
+}
+
+function soundName(path) {
+  return path.split('/').pop().replace(/\.[^.]+$/, '').replace(/_/g, ' ');
+}
+
+function stopPreview() {
+  if (!previewing) return;
+  previewing.audio.pause();
+  previewing.btn.classList.remove('on');
+  previewing.btn.textContent = '▶';
+  previewing = null;
+}
+
+function previewSound(path, btn) {
+  const same = previewing && previewing.btn === btn;
+  stopPreview();
+  if (same) return;  // a second press stops it
+  const audio = new Audio('/' + encodeURI(path));
+  audio.loop = true;  // loops the way the speaker will
+  audio.play();
+  previewing = { audio, btn };
+  btn.classList.add('on');
+  btn.textContent = '■';
+}
+
+function soundPicker(container, value, onChange) {
+  const sel = document.createElement('select');
+  const sounds = alarmData.sounds.includes(value) ? alarmData.sounds : [value, ...alarmData.sounds];
+  sounds.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s;
+    opt.textContent = soundName(s);
+    opt.selected = s === value;
+    sel.appendChild(opt);
+  });
+  const btn = document.createElement('button');
+  btn.className = 'preview-btn';
+  btn.title = 'preview';
+  btn.textContent = '▶';
+  btn.onclick = () => previewSound(sel.value, btn);
+  sel.onchange = () => {
+    onChange(sel.value);
+    if (previewing && previewing.btn === btn) { stopPreview(); previewSound(sel.value, btn); }
+  };
+  container.append(sel, btn);
+}
+
+function sortAlarms() {
+  alarmData.alarms.sort((a, b) => a.time.localeCompare(b.time));
+}
+
+function renderAlarms() {
+  stopPreview();
+  const list = document.getElementById('alarm-list');
+  list.innerHTML = '';
+  if (!alarmData.alarms.length) {
+    list.innerHTML = '<div style="color:#444;font-size:0.9em;margin-bottom:10px;">no alarms</div>';
+  }
+  alarmData.alarms.forEach((alarm, i) => {
+    const card = document.createElement('div');
+    card.className = 'alarm-card' + (alarm.enabled ? '' : ' off');
+
+    const top = document.createElement('div');
+    top.className = 'alarm-top';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.className = 'alarm-toggle';
+    toggle.title = 'on / off';
+    toggle.checked = alarm.enabled;
+    toggle.onchange = () => { alarm.enabled = toggle.checked; card.classList.toggle('off', !alarm.enabled); saveAlarms(); };
+    const time = document.createElement('input');
+    time.type = 'time';
+    time.className = 'alarm-time';
+    time.value = alarm.time;
+    time.onchange = () => { if (!time.value) return; alarm.time = time.value; sortAlarms(); renderAlarms(); saveAlarms(); };
+    const label = document.createElement('input');
+    label.className = 'alarm-label';
+    label.placeholder = 'label';
+    label.value = alarm.label;
+    label.oninput = () => { alarm.label = label.value; saveAlarms(); };
+    const rm = document.createElement('button');
+    rm.className = 'rm-btn';
+    rm.title = 'delete';
+    rm.textContent = '×';
+    rm.onclick = () => { alarmData.alarms.splice(i, 1); renderAlarms(); saveAlarms(); };
+    top.append(toggle, time, label, rm);
+
+    const days = document.createElement('div');
+    days.className = 'alarm-days';
+    const note = document.createElement('span');
+    note.className = 'days-note';
+    note.textContent = describeDays(alarm.days);
+    DAY_LABELS.forEach((letter, day) => {
+      const btn = document.createElement('button');
+      btn.textContent = letter;
+      btn.classList.toggle('on', alarm.days.includes(day));
+      btn.onclick = () => {
+        alarm.days = alarm.days.includes(day) ? alarm.days.filter(d => d !== day) : [...alarm.days, day].sort();
+        btn.classList.toggle('on', alarm.days.includes(day));
+        note.textContent = describeDays(alarm.days);
+        saveAlarms();
+      };
+      days.appendChild(btn);
+    });
+    days.appendChild(note);
+
+    const sound = document.createElement('div');
+    sound.className = 'sound-row';
+    soundPicker(sound, alarm.sound, v => { alarm.sound = v; saveAlarms(); });
+    const snooze = document.createElement('label');
+    const snoozeBox = document.createElement('input');
+    snoozeBox.type = 'checkbox';
+    snoozeBox.checked = alarm.snooze;
+    snoozeBox.onchange = () => { alarm.snooze = snoozeBox.checked; saveAlarms(); };
+    snooze.append(snoozeBox, `snooze ${alarmData.snooze_minutes}m`);
+    sound.appendChild(snooze);
+
+    card.append(top, days, sound);
+    list.appendChild(card);
+  });
+
+  const timerRow = document.getElementById('timer-sound-row');
+  timerRow.innerHTML = '';
+  soundPicker(timerRow, alarmData.timer_sound, v => { alarmData.timer_sound = v; saveAlarms(); });
+}
+
+function addAlarm() {
+  if (!alarmData) return;
+  alarmData.alarms.push({
+    id: Math.random().toString(16).slice(2, 10),  // made here so the page and server agree on it
+    time: '07:00',
+    label: '',
+    days: [],
+    sound: alarmData.sounds.includes(DEFAULT_ALARM_SOUND) ? DEFAULT_ALARM_SOUND : (alarmData.sounds[0] || DEFAULT_ALARM_SOUND),
+    snooze: true,
+    enabled: true,
+  });
+  sortAlarms();
+  renderAlarms();
+  saveAlarms();
 }
 
 // populated from config meta.confidential after settings load

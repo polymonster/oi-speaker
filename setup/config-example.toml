@@ -64,6 +64,11 @@ duck_volume = 0
 # Downmix playback to mono, for a device with a single speaker. Default: false.
 mono_output = false
 
+[library]
+# Folders of music to search and play, e.g. a usb drive: ["/media/usb"], or ["F:/"] on Windows.
+# Leave empty to only stream.
+paths = []
+
 [llm]
 # Vendor whose key is used: anthropic, openai, gemini, openrouter or ollama. All of this can be set
 # from the settings tab in the web ui instead.

@@ -33,12 +33,15 @@ import warnings
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings", category=UserWarning)
 
 
+from datetime import datetime
 from pathlib import Path
 from openwakeword.model import Model
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+import alarms
 import backends
+import library
 import transcribe
 import voice
 
@@ -52,10 +55,15 @@ ONSET_TIMEOUT = 8.0 # seconds after a wake to start speaking before the turn is 
 
 ACK_SOUND_DIR = "sounds/aknowledge" # one played at random as a request goes to the llm
 NUDGE_SOUND_DIR = "sounds/nudge" # one played at random when half the onset budget passes in silence
+# a request made only of these words, with at least one from STOP_CORE ("stop", "stop the alarm",
+# "ok snooze", "turn it off"), skips the acknowledgement — the silence it brings is answer enough
+STOP_CORE = {"stop", "snooze", "pause", "quiet", "shut", "enough", "off", "silence"}
+STOP_WORDS = STOP_CORE | {
+    "it", "that", "this", "the", "alarm", "alarms", "timer", "timers", "music", "song", "audio", "playing",
+    "now", "please", "up", "be", "turn", "ok", "okay", "oi", "just", "thanks", "thank", "you", "cheers", "mate",
+}
 SOUND_EXTENSIONS = (".wav", ".mp3", ".m4a", ".ogg", ".flac")
-TIMER_ALARM_SOUND = "sounds/midnight.wav"
-TIMER_ALARM_GAP = 1.0 # seconds of quiet between repeats of the alarm
-TIMER_ALARM_MAX = 300.0 # an alarm nobody stops gives up after this many seconds
+ALARM_RING_MAX = 600.0 # a timer or alarm nobody stops gives up after this many seconds
 UNNAMED_TIMER = "timer" # what an unnamed timer is filed as, and a name the llm passes to mean none
 
 LEVEL_BUFFER_FRAMES = 2000 # ~64s at 31Hz (recording), ~160s at 12.5Hz (wake listen)
@@ -67,7 +75,7 @@ PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
 HISTORY_LOAD_LIMIT = 30  # messages loaded into context on startup
 API_HISTORY_LIMIT = 20  # api-format messages kept in the rolling context window
 MAX_TOOL_ROUNDS = 8  # backstop on the agent loop so no stop_reason can spin it forever
-TERMINAL_TOOLS = ("play_url", "stop", "follow_on")  # tools that end the turn once they succeed
+TERMINAL_TOOLS = ("play_url", "play_library", "skip", "stop", "follow_on")  # tools that end the turn once they succeed
 LLM_MAX_TOKENS = 4096  # thinking shares this budget, so it needs more room than the reply
 WEB_SEARCH_RESULTS = 5  # results returned by the local web_search fallback
 VOLUME_STEPS = 16  # notches from silent to full for change_volume, as on iOS
@@ -188,7 +196,23 @@ TOOLS = [
     },
     {
         "name": "stop",
-        "description": "Stop a ringing timer alarm if there is one, otherwise any in-progress audio playback.",
+        "description": "Stop a ringing timer or alarm if there is one, otherwise any in-progress audio playback.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "skip",
+        "description": "Skip to the next track, or back to a previous one, in what is playing from the music library. For 'play something else' search again instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "steps": {"type": "integer", "description": "1 for the next track, -1 for the previous one"}
+            },
+            "required": ["steps"]
+        }
+    },
+    {
+        "name": "now_playing",
+        "description": "What is playing right now — title, artist and album where known, and how far through. Use when the user asks what this is.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
@@ -258,6 +282,44 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
+        "name": "set_alarm",
+        "description": "Set an alarm for a time of day, which rings until the user says stop or snooze. For 'in 20 minutes' use set_timer instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "time": {"type": "string", "description": "24 hour time, e.g. '07:00' or '18:30'"},
+                "label": {"type": "string", "description": "What it is for, e.g. 'gym'. Only when the user gave one"},
+                "days": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Days it repeats on: 'mon'..'sun', 'weekdays', 'weekends' or 'daily'. Leave out for a one-off alarm, which rings at the next occurrence of the time"
+                }
+            },
+            "required": ["time"]
+        }
+    },
+    {
+        "name": "cancel_alarm",
+        "description": "Delete an alarm, found by its time or label.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "match": {"type": "string", "description": "The alarm's 24 hour time, e.g. '07:00', or its label"}
+            },
+            "required": ["match"]
+        }
+    },
+    {
+        "name": "list_alarms",
+        "description": "List the alarms, with the current time and day.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "snooze",
+        "description": f"Snooze a ringing alarm or timer for {alarms.SNOOZE_MINUTES} minutes.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
         "name": "get_history",
         "description": "Read recent chat or play history. Use type='chat' to recall past conversations, type='plays' to see recently played tracks.",
         "input_schema": {
@@ -285,6 +347,32 @@ TOOLS = [
         "description": "Keep the microphone open for the user's reply. Call this only when your spoken response ended in a genuine question that you need answered to continue. Do not call it after a statement, a confirmation, or once you have finished the task.",
         "input_schema": {"type": "object", "properties": {}}
     }
+]
+
+# offered only when a music folder is configured, so a box without one never searches an empty library
+LIBRARY_TOOLS = [
+    {
+        "name": "search_library",
+        "description": "Search the user's own music collection on the local disk. Try this first whenever they ask to play music — it is their music, and it plays instantly and never fails like a stream can. Returns matching artists, albums, tracks, genres and folders, each with an id for play_library. Search with names only ('burial untrue', 'dub techno'), not words like 'play' or 'album'. If it has nothing suitable, use search_youtube or search_soundcloud instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Artist, album, track, genre or folder name, or a mix like 'nirvana nevermind'"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "play_library",
+        "description": "Play from the local music collection by the ids search_library returned. An artist, genre or folder id plays everything in it; an album id plays it in order. Pass several ids to queue them. Leave ids out with shuffle on to shuffle the whole collection ('play some music', 'play anything').",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "Ids from search_library, played in the order given"},
+                "shuffle": {"type": "boolean", "description": "Shuffle the tracks. Default off for an album or track, on is usual for an artist, genre or folder"}
+            }
+        }
+    },
 ]
 
 # Anthropic's server-side search. Passed through litellm untouched — its own web_search_options
@@ -381,11 +469,12 @@ class _PlaybackWatch:
     — play_url waits on it so a rejection reaches the agent inside the turn. A failure after that is
     late, and is retried or reported by _on_late_playback_failure."""
 
-    def __init__(self, url: str, start_time: float, title: str | None, retry: bool = False):
+    def __init__(self, url: str, start_time: float, title: str | None, retry: bool = False, local: bool = False):
         self.url = url  # what the user asked for, not the resolved stream
         self.start_time = start_time
         self.title = title
         self.retry = retry  # already a second attempt — a further failure is reported, not retried
+        self.local = local  # files off the disk: mpv moves past a bad one itself, so no failure is ours to handle
         self.first_position: float | None = None
         self.position: float | None = None
         self.http_error: str | None = None
@@ -399,6 +488,7 @@ class _Player:
         self.cmd_queue: queue.Queue = queue.Queue()
         self.active: bool = False
         self.current_url: str | None = None
+        self.mpv: mpv.MPV | None = None  # the playing instance, read for now_playing — only the loop writes it
 
 
 class _Timers:
@@ -434,65 +524,103 @@ class _Timers:
             return bool(self._store)
 
 
+@dataclass
+class _Ring:
+    """One ringing timer or alarm: what it plays and says, and its own player, so stopping or
+    holding it cuts it off mid-ring."""
+    sound: str
+    announce: str | None  # said once, after the first time through the sound
+    snooze: bool
+    stop: threading.Event
+    player: mpv.MPV
+
+
 class _Alarms:
-    """Timers that have fired, each ringing on its own thread until stopped. Held off while the user
-    is talking, so the alarm does not drown out the request that stops it."""
+    """Timers and clock alarms that have fired, each looping its sound on its own thread until
+    stopped or snoozed. Held off while the user is talking, so the alarm does not drown out the
+    request that stops it."""
     def __init__(self):
-        # each alarm's stop flag and its own player, so stopping or holding cuts it off mid-ring
-        self._ringing: dict[str, tuple[threading.Event, mpv.MPV]] = {}
+        self._ringing: dict[str, _Ring] = {}
         self._lock = threading.Lock()
         self._allowed = threading.Event()
         self._allowed.set()
 
-    def ring(self, name: str, announce: bool):
-        stop = threading.Event()
+    def ring(self, name: str, sound: str, announce: str | None = None, snooze: bool = True):
         player = mpv.MPV(vid=False, terminal=False, audio_channels="mono" if _mono_output else "auto-safe")
+        ring = _Ring(sound, announce, snooze, threading.Event(), player)
         with self._lock:
             existing = self._ringing.pop(name, None)
-            self._ringing[name] = (stop, player)
+            self._ringing[name] = ring
         if existing:
-            existing[0].set()
-            existing[1].stop()
-        threading.Thread(target=self._ring, args=(name, announce, stop, player), daemon=True).start()
+            existing.stop.set()
+            existing.player.stop()
+        threading.Thread(target=self._ring, args=(name, ring), daemon=True).start()
 
-    def _ring(self, name: str, announce: bool, stop: threading.Event, player: mpv.MPV):
-        give_up = time.time() + TIMER_ALARM_MAX
-        while time.time() < give_up:
-            if not self._allowed.wait(timeout=0.5):
+    def _ring(self, name: str, ring: _Ring):
+        give_up = threading.Timer(ALARM_RING_MAX, self._give_up, args=(name, ring))
+        give_up.daemon = True
+        give_up.start()
+        announce = ring.announce
+        while not ring.stop.is_set():
+            if not self._allowed.wait(timeout=0.5) or ring.stop.is_set():
                 continue
-            if stop.is_set():  # stopped while held
-                break
-            player.play(TIMER_ALARM_SOUND)
-            player.wait_for_playback()
-            if announce and not stop.is_set() and self._allowed.is_set():
-                _speak(f"{name} timer done")
-                announce = False  # once, the alarm alone carries on after that
-            if stop.wait(TIMER_ALARM_GAP):
-                break
-        else:
-            log(f"timer alarm gave up: {name}")
-        with self._lock:
-            if self._ringing.get(name, (None,))[0] is stop:
-                del self._ringing[name]
+            # once through before the announcement, then mpv loops it sample-exact until stopped.
+            # a gap between plays is the alarm stuttering, not a pause
+            ring.player.loop_file = "no" if announce else "inf"
+            ring.player.play(ring.sound)
+            if not self._allowed.is_set():  # held between the check above and the play
+                ring.player.stop()
+            ring.player.wait_for_playback()
+            if announce and not ring.stop.is_set() and self._allowed.is_set():
+                _speak(announce)
+                announce = None
+        give_up.cancel()
         try:
-            player.terminate()
+            ring.player.terminate()
         except Exception:
             pass
+
+    def _give_up(self, name: str, ring: _Ring):
+        with self._lock:
+            if self._ringing.get(name) is ring:
+                del self._ringing[name]
+        log(f"alarm gave up, nobody stopped it: {name}")
+        ring.stop.set()
+        ring.player.stop()
 
     def stop(self, name: str | None = None) -> list[str]:
         """Stop the alarm for `name`, or every alarm. Returns the names stopped."""
         with self._lock:
             names = [name] if name in self._ringing else [] if name else list(self._ringing)
             stopped = [self._ringing.pop(n) for n in names]
-        for flag, player in stopped:
-            flag.set()
-            player.stop()
+        for ring in stopped:
+            ring.stop.set()
+            ring.player.stop()
         return names
+
+    def snooze(self) -> tuple[list[str], list[str]]:
+        """Stop everything ringing and ring each again in SNOOZE_MINUTES, filed with the timers so
+        it can be listed and cancelled like one. An alarm with snooze off keeps ringing. Returns
+        the names snoozed and the names that can't be."""
+        with self._lock:
+            snoozed = {n: r for n, r in self._ringing.items() if r.snooze}
+            refused = [n for n, r in self._ringing.items() if not r.snooze]
+        for name, ring in snoozed.items():
+            self.stop(name)
+            again = threading.Timer(alarms.SNOOZE_MINUTES * 60, self._unsnooze, args=(name, ring))
+            again.daemon = True
+            _timers.set(name, again, time.time() + alarms.SNOOZE_MINUTES * 60)
+            again.start()
+        return list(snoozed), refused
+
+    def _unsnooze(self, name: str, ring: _Ring):
+        _timers.remove(name)
+        self.ring(name, ring.sound, ring.announce, ring.snooze)
 
     def hold(self):
         self._allowed.clear()
         with self._lock:
-            players = [player for _, player in self._ringing.values()]
+            players = [ring.player for ring in self._ringing.values()]
         for player in players:
             player.stop()  # the loop waits at the top until release
 
@@ -672,6 +800,8 @@ _silence_timeout: float = 1.6 # continuous silence that ends a recording, overri
 _perf_timer = _PerfTimer()
 _timers = _Timers()
 _alarms = _Alarms()
+_clock: alarms.AlarmClock | None = None  # the saved clock alarms, built in start()
+_library: library.Library | None = None  # music on the local disk, built in start()
 _log = _Log()
 _levels = _Levels()
 _voice_probe = _VoiceProbe()
@@ -975,6 +1105,15 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
             # Returning no state keeps the turn alive so the agent can try another candidate.
             return f"playback failed: {result}", None
         return "playing", SpeakerState.RESET
+    elif tool_name == "search_library":
+        return search_library(tool_input["query"]), None
+    elif tool_name == "play_library":
+        result = play_library(tool_input.get("ids") or [], bool(tool_input.get("shuffle", False)))
+        return result, SpeakerState.RESET if result.startswith("playing") else None
+    elif tool_name == "skip":
+        return skip(int(tool_input.get("steps", 1))), SpeakerState.RESET
+    elif tool_name == "now_playing":
+        return now_playing(), None
     elif tool_name == "stop":
         # a ringing alarm is what "stop" means while there is one — the music carries on under it
         ringing = _alarms.stop()
@@ -1005,6 +1144,20 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
         return cancel_timer(tool_input["name"]), None
     elif tool_name == "list_timers":
         return list_timers(), None
+    elif tool_name == "set_alarm":
+        return set_alarm(tool_input["time"], tool_input.get("label", ""), tool_input.get("days")), None
+    elif tool_name == "cancel_alarm":
+        return cancel_alarm(tool_input["match"]), None
+    elif tool_name == "list_alarms":
+        return list_alarms(), None
+    elif tool_name == "snooze":
+        snoozed, refused = _alarms.snooze()
+        if not snoozed and not refused:
+            return "nothing is ringing", None
+        result = f"snoozed for {alarms.SNOOZE_MINUTES} minutes: {', '.join(snoozed)}" if snoozed else ""
+        if refused:
+            result += f"{'; ' if result else ''}snooze is off for {', '.join(refused)}, still ringing — tell the user to say stop"
+        return result, SpeakerState.RESET if snoozed and not refused else None
     elif tool_name == "get_history":
         return get_history(tool_input["type"], tool_input.get("limit", 20)), None
     elif tool_name == "update":
@@ -1061,6 +1214,8 @@ def _model_supports(check, model: str) -> bool:
 def _llm_request(llm: _LLM, model: str, system: str, messages: list[dict]) -> dict:
     """Arguments for one streamed completion, shaped for the vendor in `llm`."""
     tools = [_to_openai_tool(t) for t in TOOLS]
+    if _library is not None and _library.roots:
+        tools += [_to_openai_tool(t) for t in LIBRARY_TOOLS]
     if PROVIDERS.get(llm.provider, {}).get("native_search"):
         tools.append(ANTHROPIC_WEB_SEARCH_TOOL)
     else:
@@ -1407,7 +1562,7 @@ def _watch_position(watch: _PlaybackWatch, position: float | None):
 def _watch_end_file(watch: _PlaybackWatch, event):
     """mpv finished the file. A failure if mpv says so, or if an HTTP error was logged on the way —
     a stream cut off by a 403 often ends as a plain EOF, so the reason alone misses it."""
-    if watch.cancelled:
+    if watch.cancelled or watch.local:
         return
     data = getattr(event, "data", None)
     reason = getattr(data, "reason", None)
@@ -1477,6 +1632,7 @@ def _player_loop():
             except Exception:
                 pass
             player = None
+            _player.mpv = None
             _player.current_url = None
         if cleanup_dir is not None:
             try:
@@ -1496,7 +1652,10 @@ def _player_loop():
         if cmd == 'play':
             _stop()
             url, headers, start_time, original_url, watch = args[0], args[1], args[2], args[3], args[4]
-            log(f"play_url: {url[:80]}...")
+            # a list is a playlist off the disk: the first plays now, the rest queue behind it
+            urls = url if isinstance(url, list) else [url]
+            url = urls[0]
+            log(f"play_url: {url[:80]}..." + (f" (+{len(urls) - 1} queued)" if len(urls) > 1 else ""))
             current = watch  # bound now — the callbacks must not see a later play's watch
             player = mpv.MPV(vid=False, terminal=False,
                              user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -1515,6 +1674,9 @@ def _player_loop():
             if start_time:
                 player['start'] = str(int(start_time))
             player.play(url)
+            for queued in urls[1:]:
+                player.playlist_append(queued)
+            _player.mpv = player
             _player.current_url = original_url
             _player.active = True
 
@@ -1527,10 +1689,19 @@ def _player_loop():
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             player.play(path)
+            _player.mpv = player
             _player.active = True
 
         elif cmd == 'stop':
             _stop()
+
+        elif cmd == 'skip':
+            if player is not None:
+                try:
+                    for _ in range(abs(args[0])):
+                        player.command("playlist-next" if args[0] > 0 else "playlist-prev")
+                except Exception:
+                    pass  # mpv refuses to step past either end of the playlist
 
         elif cmd == 'pause':
             if player is not None:
@@ -1852,6 +2023,12 @@ def apply_voice_settings(config: dict):
     _apply_model_settings("voice_model", "voice", voice, voice.Voice, config)
 
 
+def apply_library_settings(config: dict):
+    """Rescan when the music folders change. No-op on a worker, which has no library."""
+    if _library is not None:
+        _library.set_roots(config.get("library", {}).get("paths", []))
+
+
 def list_llm_models(provider: str) -> list[str]:
     """Tool-calling chat models litellm knows for `provider`, as "provider/model" strings, for the
     settings ui to offer. The registry is the one bundled with litellm, so it is only as fresh as
@@ -1978,6 +2155,71 @@ def search_youtube(query: str, max_results: int = 5) -> str:
 def search_soundcloud(query: str, max_results: int = 5) -> str:
     """Search SoundCloud for `query` and return a JSON list of title/url/duration/channel results."""
     return _search(f"scsearch{max_results}:{query}", "https://soundcloud.com/{id}")
+
+
+def search_library(query: str) -> str:
+    """Search the local music collection and return a JSON object of artists/albums/tracks/genres/folders."""
+    if _library is None or not _library.roots:
+        return "no music library is set up"
+    status = _library.status()
+    if status["missing"] and not status["tracks"]:
+        return "the music drive is not connected"
+    results = _library.search(query)
+    if not results:
+        if status["scanning"] and not status["tracks"]:
+            return f"the music library is still being indexed ({status['progress']} tracks so far), try again shortly"
+        return "nothing in the library matches"
+    return json.dumps(results)
+
+
+def play_library(ids: list[str], shuffle: bool = False) -> str:
+    """Queue tracks from the local library by id (or all of it, shuffled, for no ids) and play them."""
+    if _library is None or not _library.roots:
+        return "no music library is set up"
+    paths, unknown = _library.resolve(ids, shuffle)
+    if unknown:
+        return f"unknown ids: {', '.join(unknown)} — search_library again for current ones"
+    if not paths:
+        return "the library is empty"
+    if not os.path.exists(paths[0]):
+        return "the music drive is not connected"
+    title = _library.title(ids)
+    _save_history(PLAY_HISTORY_PATH, {"library_ids": ids, "shuffle": shuffle, "title": title})
+    watch = _PlaybackWatch(paths[0], 0.0, title, local=True)
+    _player.cmd_queue.put(('play', paths, None, 0.0, paths[0], watch))
+    if not watch.settled.wait(PLAYBACK_CONFIRM_TIMEOUT):
+        log("library playback not confirmed, assuming it is playing")
+    return f"playing {len(paths)} tracks" if len(paths) > 1 else "playing"
+
+
+def skip(steps: int) -> str:
+    if not _player.active:
+        return "nothing is playing"
+    _player.cmd_queue.put(('skip', steps or 1))
+    return "skipped"
+
+
+def now_playing() -> str:
+    """What mpv is playing: the library's tags for a file off the disk, mpv's own idea of the title
+    for a stream, plus the position and the place in the queue."""
+    player = _player.mpv
+    if player is None or not _player.active:
+        return "nothing is playing"
+    try:
+        path = player.path
+        info = (_library.describe(os.path.normpath(path)) if _library and path else None) or {"title": player.media_title}
+        info.pop("id", None)
+        position, duration = player.time_pos, player.duration
+        count, index = player.playlist_count, player.playlist_pos
+    except Exception as e:
+        return f"could not read the player: {e}"
+    if position is not None:
+        info["position"] = int(position)
+    if duration:
+        info["duration"] = int(duration)
+    if count and count > 1 and index is not None:
+        info["queue"] = f"track {index + 1} of {count}"
+    return json.dumps(info)
 
 
 def web_search(query: str, max_results: int = WEB_SEARCH_RESULTS) -> str:
@@ -2113,7 +2355,8 @@ def set_timer(name: str, seconds: int) -> str:
         log(f"timer fired: {timer_name}")
         _timers.remove(timer_name)
         # only a name the user gave is worth saying — "timer timer done" is not
-        _alarms.ring(timer_name, announce=named)
+        sound = _clock.timer_sound() if _clock else alarms.DEFAULT_SOUND
+        _alarms.ring(timer_name, sound, announce=f"{timer_name} timer done" if named else None)
 
     name = name.strip()
     named = bool(name) and name.lower() != UNNAMED_TIMER
@@ -2144,6 +2387,45 @@ def cancel_timer(name: str) -> str:
     if active:
         return f"no timer named '{name}'. Active timers: {', '.join(active)}"
     return f"no timer named '{name}'"
+
+
+def _spoken_time(hhmm: str) -> str:
+    """'07:00' as '7 o'clock' and '07:30' as '7:30', for the voice — it reads a leading zero out."""
+    hour, minute = hhmm.split(":")
+    return f"{int(hour)} o'clock" if minute == "00" else f"{int(hour)}:{minute}"
+
+
+def _fire_alarm(alarm: dict):
+    """AlarmClock callback: ring a clock alarm that has come due."""
+    name = alarm["label"] or f"{alarm['time']} alarm"
+    announce = f"It's {_spoken_time(alarm['time'])}. {alarm['label']}." if alarm["label"] else None
+    _alarms.ring(name, alarm["sound"], announce=announce, snooze=alarm["snooze"])
+
+
+def set_alarm(time_text: str, label: str = "", days=None) -> str:
+    if _clock is None:
+        return "alarms are not available on this speaker"
+    if alarms.parse_time(time_text) is None:
+        return f"'{time_text}' is not a 24 hour time like 07:00"
+    alarm = _clock.add(time_text, label, alarms.parse_days(days))
+    return f"alarm set: {alarms.describe(alarm)}"
+
+
+def cancel_alarm(match: str) -> str:
+    if _clock is None:
+        return "alarms are not available on this speaker"
+    gone = _clock.remove(match)
+    if gone:
+        return f"deleted: {'; '.join(alarms.describe(a) for a in gone)}"
+    return f"no alarm matching '{match}'. {list_alarms()}"
+
+
+def list_alarms() -> str:
+    now = datetime.now().strftime("%A %H:%M")
+    saved = _clock.data()["alarms"] if _clock else []
+    if not saved:
+        return f"no alarms (it is {now})"
+    return f"it is {now}. alarms: {'; '.join(alarms.describe(a) for a in saved)}"
 
 
 def list_timers() -> str:
@@ -2239,6 +2521,12 @@ def update(target: str) -> str:
         return f"update failed: {err}"
 
 
+def _is_stop_request(text: str) -> bool:
+    """A short bare command to stop, pause or snooze, as opposed to a request with content."""
+    words = re.findall(r"[a-z]+", text.lower())
+    return bool(words) and set(words) <= STOP_WORDS and bool(set(words) & STOP_CORE)
+
+
 def _speak_loop(ctx):
     """Background thread: main state machine driving wake detection, recording, and LLM interaction."""
     log("oi!! speak! loop!!")
@@ -2332,8 +2620,9 @@ def _speak_loop(ctx):
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
                 mark("llm", transcribed_request.strip())
                 ring_llm_agent(ctx)
-                # let the user know they were heard — the first spoken sentence can be seconds away
-                ack = _play_random_sound(ACK_SOUND_DIR)
+                # let the user know they were heard — the first spoken sentence can be seconds away.
+                # not for a bare stop, which the alarm or music going quiet already answers
+                ack = None if _is_stop_request(transcribed_request) else _play_random_sound(ACK_SOUND_DIR)
                 ctx.speaker_state = query_llm(transcribed_request, stream, followup=followup, speak_after=ack)
                 llm = _llm
                 _perf_timer.lap(f"llm ({llm.followup_model if followup else llm.model} {llm.effort})" if llm else "llm")
@@ -2571,6 +2860,14 @@ def start():
         args=(ctx,),
         daemon=True
     ).start()
+
+    global _clock
+    _clock = alarms.AlarmClock(on_fire=_fire_alarm, log=log)
+    _clock.start()
+
+    global _library
+    _library = library.Library(config.get("library", {}).get("paths", []), log=log)
+    _library.start()
 
 
 
