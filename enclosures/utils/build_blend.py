@@ -1,28 +1,39 @@
-"""Build out/oi_speaker.blend from the generated assembly, for looking at the design in Blender.
+"""Build out/<name>.blend from an enclosure's generated assembly, for looking at the design in Blender.
 
-    blender --background --python build_blend.py
+    blender --background --python utils/build_blend.py -- <enclosure folder> [--render]
 
-Reads out/oi_speaker.glb and out/parts.json (run oi_enclosure.py first), so the .blend always
-matches the DXFs. In the saved file, select the "controls" empty and use its custom properties:
+Reads out/<name>.glb and out/parts.json (run the design script first), so the .blend always matches the
+DXFs. --render also writes out/preview_front.png and out/preview_back.png, which export_cnc.py puts in
+drawings.pdf. In the saved file, select the "controls" empty and use its custom properties
+(N panel > Item > Properties):
 
-    explode   0 = assembled, 1 = pulled apart (drag it in the N panel > Item > Properties)
-    cutaway   1 = slice the body and cap down the middle to see inside
+    explode   0 = assembled, 1 = pulled apart
+    cutaway   1 = slice the wooden parts down the middle to see inside
+    plus one slider per entry in the manifest's blend.sliders
+
+The manifest's optional "blend" section, all in mm in the design's axes (Z up):
+
+    collections         {group: collection name}. Default: the group's name
+    explode_spread      how far each part travels, as a multiple of its distance from the body centre
+    explode_lift        {group: mm}: extra lift when exploded
+    explode_move        {group: [x, y, z]}: the group travels this far instead of outward
+    sliders             [{name, description, groups: [...], meshes: [name prefixes], move: [x, y, z]}]:
+                        a 0-1 property that moves those groups and meshes by move
+    hardware_materials  {mesh: material}, from MATERIALS or the section's own "materials"
+    materials           {name: [[r, g, b, a], roughness]}, added to MATERIALS
+    front               [x, y, z]: the way the front faces, for the camera. Default [0, -1, 0]
 """
-import json
+import math
+import sys
 from pathlib import Path
 
 import bpy
 from mathutils import Vector
 
-HERE = Path(__file__).resolve().parent
-GLB = HERE / "out" / "oi_speaker.glb"
-PARTS = HERE / "out" / "parts.json"
-BLEND = HERE / "out" / "oi_speaker.blend"
-PREVIEW = HERE / "out" / "blender_preview.png"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from enclosure import Enclosure, folder_arg  # noqa: E402
 
-EXPLODE_SPREAD = 0.9  # how far each part travels, as a multiple of its distance from the body centre
-EXPLODE_LIFT = {"cap": 140.0, "tray": 0.0, "hw": 0.0, "body": 0.0}  # extra mm up per group
-TRAY_PULL = 160.0  # the tray slides out of the back, so it travels along that axis instead
+EXPLODE_SPREAD = 0.9
 
 # base colours, linear. used for hardware, and as the solid-mode colour of the ply
 MATERIALS = {
@@ -32,10 +43,12 @@ MATERIALS = {
     "metal": ((0.35, 0.35, 0.37, 1.0), 0.35),
     "pcb": ((0.02, 0.18, 0.06, 1.0), 0.45),
     "conduit": ((0.55, 0.55, 0.55, 1.0), 0.5),
+    "cone": ((0.012, 0.012, 0.013, 1.0), 0.65),
+    "spider": ((0.62, 0.42, 0.08, 1.0), 0.75),
+    "brass": ((0.75, 0.55, 0.22, 1.0), 0.3),
+    "nickel": ((0.6, 0.6, 0.62, 1.0), 0.2),
+    "crimp": ((0.45, 0.02, 0.02, 1.0), 0.5),
 }
-HARDWARE_MATERIAL = {"hw_driver": "driver", "hw_pr": "driver", "hw_pi": "pcb", "hw_mic": "pcb",
-                     "hw_conduit": "conduit"}
-GROUP_COLLECTIONS = {"body": "Body", "cap": "Mic cap", "tray": "Pi tray", "hw": "Hardware"}
 
 # birch ply: odd number of ~1.4mm veneers, grain alternating, so the edge shows light long-grain plies
 # between darker end-grain ones with a thin glue line at each joint
@@ -133,26 +146,36 @@ def add_property(obj, name: str, default: float, description: str):
     ui.update(min=0.0, max=1.0, soft_min=0.0, soft_max=1.0, description=description)
 
 
-def drive(target, path: str, index: int, expression: str, controls, prop: str):
-    """Drive target.path[index] from controls[prop]. Kept to plain arithmetic so Blender's simple
-    expression evaluator runs it — no "auto-run python scripts" prompt when the file opens."""
+def drive(target, path: str, index: int, expression: str, controls, *props: str):
+    """Drive target.path[index] from controls' properties, each a variable of the same name in the
+    expression. Kept to plain arithmetic so Blender's simple expression evaluator runs it — no
+    "auto-run python scripts" prompt when the file opens."""
     fcurve = target.driver_add(path, index) if index >= 0 else target.driver_add(path)
     driver = fcurve.driver
     driver.type = "SCRIPTED"
-    var = driver.variables.new()
-    var.name = "v"
-    var.targets[0].id = controls
-    var.targets[0].data_path = f'["{prop}"]'
+    for prop in props:
+        var = driver.variables.new()
+        var.name = prop
+        var.targets[0].id = controls
+        var.targets[0].data_path = f'["{prop}"]'
     driver.expression = expression
 
 
 def main():
-    parts = json.loads(PARTS.read_text())
-    groups = parts["groups"]
+    enc = Enclosure(folder_arg(sys.argv))
+    groups = enc.manifest["groups"]
+    cfg = enc.manifest.get("blend", {})
+    library = {**MATERIALS, **{k: (tuple(c), r) for k, (c, r) in cfg.get("materials", {}).items()}}
+    hardware_materials = cfg.get("hardware_materials", {})
+    names = sorted(set(groups.values()), key=lambda g: (g == "hw", g))   # hardware's collection last
+    collection_names = {g: cfg.get("collections", {}).get(g, g) for g in names}
+    sliders = cfg.get("sliders", [])
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
-    bpy.ops.import_scene.gltf(filepath=str(GLB))
+    # tells blender_autoreload.py this file is generated, so it may reload it when it's rewritten
+    scene["autoreload"] = True
+    bpy.ops.import_scene.gltf(filepath=str(enc.glb))
     # the glb holds mm as plain units. label them mm — after the import, because the importer scales
     # by the scene's unit scale and would otherwise blow everything up a thousandfold
     scene.unit_settings.system = "METRIC"
@@ -168,10 +191,10 @@ def main():
     bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
     bpy.ops.object.select_all(action="DESELECT")
 
-    materials = {name: make_material(name, colour, rough) for name, (colour, rough) in MATERIALS.items()}
+    materials = {name: make_material(name, colour, rough) for name, (colour, rough) in library.items()}
     ply_materials = {}
     collections = {}
-    for group, label in GROUP_COLLECTIONS.items():
+    for group, label in collection_names.items():
         coll = bpy.data.collections.new(label)
         scene.collection.children.link(coll)
         collections[group] = coll
@@ -183,7 +206,7 @@ def main():
         collections[group].objects.link(obj)
         obj.data.materials.clear()
         if group == "hw":
-            obj.data.materials.append(materials[HARDWARE_MATERIAL.get(obj.name, "metal")])
+            obj.data.materials.append(materials[hardware_materials.get(obj.name, "metal")])
         else:
             # the sheet thickness is the part's thinnest local extent
             size = [max(c[i] for c in obj.bound_box) - min(c[i] for c in obj.bound_box) for i in range(3)]
@@ -192,9 +215,12 @@ def main():
             if key not in ply_materials:
                 ply_materials[key] = make_ply_material(*key)
             obj.data.materials.append(ply_materials[key])
-        # the exporter's normals are per-face already; smooth shading would round the ply edges off
+        # the exporter's normals are per-face already; smooth shading would round the ply edges off.
+        # hardware is mostly round, so smooth it but keep its hard edges
         for poly in obj.data.polygons:
-            poly.use_smooth = False
+            poly.use_smooth = group == "hw"
+        if group == "hw":
+            obj.data.set_sharp_from_angle(angle=math.radians(35))
 
     body = [o for o in imported if groups.get(o.name) == "body"]
     lo = Vector((min(o.location.x - o.dimensions.x / 2 for o in body),
@@ -204,9 +230,7 @@ def main():
                  max(o.location.y + o.dimensions.y / 2 for o in body),
                  max(o.location.z + o.dimensions.z / 2 for o in body)))
     centre = (lo + hi) / 2
-    back = bpy.data.objects.get("back")
-    # the tray leaves through whichever face the back panel is on
-    back_sign = 1.0 if back is None or back.location.y >= centre.y else -1.0
+    front = Vector(cfg.get("front", (0, -1, 0))).normalized()
 
     controls = bpy.data.objects.new("controls", None)
     controls.empty_display_type = "ARROWS"
@@ -214,17 +238,25 @@ def main():
     controls.location = (centre.x, centre.y, hi.z + 120)
     scene.collection.objects.link(controls)
     add_property(controls, "explode", 0.0, "0 assembled, 1 pulled apart")
-    add_property(controls, "cutaway", 0.0, "1 slices the body and cap to show inside")
+    add_property(controls, "cutaway", 0.0, "1 slices the wooden parts to show inside")
+    for s in sliders:
+        add_property(controls, s["name"], 0.0, s.get("description", ""))
 
+    spread = cfg.get("explode_spread", EXPLODE_SPREAD)
     for obj in imported:
         group = groups.get(obj.name, "hw")
-        offset = (obj.location - centre) * EXPLODE_SPREAD
-        offset.z += EXPLODE_LIFT.get(group, 0.0)
-        if group == "tray":
-            offset = Vector((0.0, back_sign * TRAY_PULL, 0.0))
+        if group in cfg.get("explode_move", {}):
+            offset = Vector(cfg["explode_move"][group])
+        else:
+            offset = (obj.location - centre) * spread
+            offset.z += cfg.get("explode_lift", {}).get(group, 0.0)
+        mine = [s for s in sliders if group in s.get("groups", []) or obj.name.startswith(tuple(s.get("meshes", [])))]
         for axis in range(3):
-            base = obj.location[axis]
-            drive(obj, "location", axis, f"{base:.4f} + v * {offset[axis]:.4f}", controls, "explode")
+            expression = f"{obj.location[axis]:.4f} + explode * {offset[axis]:.4f}"
+            for s in mine:
+                if s["move"][axis]:
+                    expression += f" + {s['name']} * {s['move'][axis]:.4f}"
+            drive(obj, "location", axis, expression, controls, "explode", *(s["name"] for s in mine))
 
     # cutaway: one box covering the +x half, subtracted from every wooden part while cutaway is on
     cutter = bpy.data.objects.new("cutaway_box", bpy.data.meshes.new("cutaway_box"))
@@ -241,13 +273,13 @@ def main():
     cutter.hide_render = True
     cutter.hide_viewport = True
     for obj in imported:
-        if groups.get(obj.name) in ("body", "cap", "tray"):
+        if groups.get(obj.name, "hw") != "hw":
             mod = obj.modifiers.new("cutaway", "BOOLEAN")
             mod.operation = "DIFFERENCE"
             mod.object = cutter
             mod.solver = "EXACT"
-            drive(mod, "show_viewport", -1, "v > 0.5", controls, "cutaway")
-            drive(mod, "show_render", -1, "v > 0.5", controls, "cutaway")
+            drive(mod, "show_viewport", -1, "cutaway > 0.5", controls, "cutaway")
+            drive(mod, "show_render", -1, "cutaway > 0.5", controls, "cutaway")
 
     # light and camera for a quick render — three-quarter view from the front left, above
     sun = bpy.data.objects.new("sun", bpy.data.lights.new("sun", "SUN"))
@@ -265,8 +297,9 @@ def main():
     cam.data.clip_end = 20000
     scene.collection.objects.link(cam)
     scene.camera = cam
-    front = -1.0 if back_sign > 0 else 1.0  # the baffle faces away from the back panel
-    cam.location = centre + Vector((-520.0, front * 720.0, 330.0))
+    # three-quarter view: from in front, off to the left of the front, and above
+    left = front.cross(Vector((0, 0, 1)))
+    cam.location = centre + front * 720.0 + left * 520.0 + Vector((0, 0, 330.0))
     direction = centre + Vector((0, 0, 30)) - cam.location
     cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
@@ -285,13 +318,22 @@ def main():
     scene.render.resolution_x = 900
     scene.render.resolution_y = 1100
     scene.render.film_transparent = False
-    scene.render.filepath = str(PREVIEW)
+    preview_front, preview_back = enc.renders
+    scene.render.filepath = str(preview_front)
 
-    bpy.ops.wm.save_as_mainfile(filepath=str(BLEND))
-    print(f"saved {BLEND}")
-    if "--render" in __import__("sys").argv:
+    bpy.ops.wm.save_as_mainfile(filepath=str(enc.blend))
+    print(f"saved {enc.blend}")
+    if "--render" in sys.argv:
         bpy.ops.render.render(write_still=True)
-        print(f"rendered {PREVIEW}")
+        print(f"rendered {preview_front}")
+        # and the back, from the other corner with the sun swung round to light it. after the save, so
+        # the .blend keeps the front view
+        cam.location = centre - front * 720.0 - left * 520.0 + Vector((0, 0, 330.0))
+        cam.rotation_euler = (centre + Vector((0, 0, 30)) - cam.location).to_track_quat("-Z", "Y").to_euler()
+        sun.rotation_euler.z += math.pi
+        scene.render.filepath = str(preview_back)
+        bpy.ops.render.render(write_still=True)
+        print(f"rendered {preview_back}")
 
 
 main()

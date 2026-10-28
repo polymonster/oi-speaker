@@ -12,10 +12,9 @@ import numpy as np
 import time
 import math
 import random
-import faster_whisper
+import itertools
 import tomllib
 import json
-import requests
 import wave
 import uvicorn
 import os
@@ -27,14 +26,21 @@ import urllib.error
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 import litellm
 import openai  # litellm raises openai's exception types, whichever vendor is behind the call
+import warnings
+
+# litellm stores openai responses-api usage as a plain dict (with its own cost added) where its
+# pydantic model expects ResponseAPIUsage, so every openai turn warns on serialise. harmless noise
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings", category=UserWarning)
 
 
 from pathlib import Path
-from piper.voice import PiperVoice
 from openwakeword.model import Model
-from faster_whisper import WhisperModel
 from dataclasses import dataclass, field
 from enum import Enum, auto
+
+import backends
+import transcribe
+import voice
 
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
@@ -42,12 +48,15 @@ VAD_CHUNK = 512 # 32ms at 16kHz (Silero VAD frame size)
 VAD_ONSET_FRAMES = 3 # consecutive speech frames required before onset is accepted (~96ms)
 VAD_PREROLL_FRAMES = 10 # frames kept from before onset so the first phoneme survives (~320ms)
 VAD_MIN_SPEECH = 0.35 # a recording holding less speech than this is noise, not a request
-NO_SPEECH_PROB_LIMIT = 0.6 # whisper segments above this are hallucinations on near-silence
 ONSET_TIMEOUT = 8.0 # seconds after a wake to start speaking before the turn is dropped
 
 ACK_SOUND_DIR = "sounds/aknowledge" # one played at random as a request goes to the llm
 NUDGE_SOUND_DIR = "sounds/nudge" # one played at random when half the onset budget passes in silence
 SOUND_EXTENSIONS = (".wav", ".mp3", ".m4a", ".ogg", ".flac")
+TIMER_ALARM_SOUND = "sounds/midnight.wav"
+TIMER_ALARM_GAP = 1.0 # seconds of quiet between repeats of the alarm
+TIMER_ALARM_MAX = 300.0 # an alarm nobody stops gives up after this many seconds
+UNNAMED_TIMER = "timer" # what an unnamed timer is filed as, and a name the llm passes to mean none
 
 LEVEL_BUFFER_FRAMES = 2000 # ~64s at 31Hz (recording), ~160s at 12.5Hz (wake listen)
 MARKER_BUFFER_LEN = 200 # pipeline events kept alongside the level frames
@@ -179,7 +188,7 @@ TOOLS = [
     },
     {
         "name": "stop",
-        "description": "Stop any in-progress audio playback.",
+        "description": "Stop a ringing timer alarm if there is one, otherwise any in-progress audio playback.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
@@ -222,14 +231,14 @@ TOOLS = [
     },
     {
         "name": "set_timer",
-        "description": "Set a named countdown timer. When it fires it plays an alarm and announces the name.",
+        "description": "Set a countdown timer. When it fires an alarm rings until the user says stop, and a named timer is announced by name.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "A short name for the timer, e.g. 'pasta'"},
+                "name": {"type": "string", "description": "A short name for the timer, e.g. 'pasta'. Only when the user gave one — leave it out otherwise"},
                 "seconds": {"type": "integer", "description": "Duration in seconds"}
             },
-            "required": ["name", "seconds"]
+            "required": ["seconds"]
         }
     },
     {
@@ -327,16 +336,22 @@ class SpeakerState(Enum):
 
 
 @dataclass
-class SpeakerContext:
-    system: str
-    voice_model: any
-    whisper_model: any
-    vad: any
-    output_dev_index: int
-    output_sample_rate: int
-    wake_model: any
+class AudioContext:
+    """The mic and speaker devices, at their native sample rates."""
     input_dev_index: int
     input_sample_rate: int
+    output_dev_index: int
+    output_sample_rate: int
+
+
+@dataclass
+class SpeakerContext:
+    system: str
+    voice_model: voice.Voice | None  # None when no backend is installed
+    transcribe_model: transcribe.Transcribe | None
+    vad: any
+    wake_model: any
+    audio_context: AudioContext
     worker_mode: bool = False
     worker_url: str | None = None
     ring: any = None  # XVF3800 LED ring, None on platforms/boxes without one
@@ -417,6 +432,76 @@ class _Timers:
     def __bool__(self):
         with self._lock:
             return bool(self._store)
+
+
+class _Alarms:
+    """Timers that have fired, each ringing on its own thread until stopped. Held off while the user
+    is talking, so the alarm does not drown out the request that stops it."""
+    def __init__(self):
+        # each alarm's stop flag and its own player, so stopping or holding cuts it off mid-ring
+        self._ringing: dict[str, tuple[threading.Event, mpv.MPV]] = {}
+        self._lock = threading.Lock()
+        self._allowed = threading.Event()
+        self._allowed.set()
+
+    def ring(self, name: str, announce: bool):
+        stop = threading.Event()
+        player = mpv.MPV(vid=False, terminal=False, audio_channels="mono" if _mono_output else "auto-safe")
+        with self._lock:
+            existing = self._ringing.pop(name, None)
+            self._ringing[name] = (stop, player)
+        if existing:
+            existing[0].set()
+            existing[1].stop()
+        threading.Thread(target=self._ring, args=(name, announce, stop, player), daemon=True).start()
+
+    def _ring(self, name: str, announce: bool, stop: threading.Event, player: mpv.MPV):
+        give_up = time.time() + TIMER_ALARM_MAX
+        while time.time() < give_up:
+            if not self._allowed.wait(timeout=0.5):
+                continue
+            if stop.is_set():  # stopped while held
+                break
+            player.play(TIMER_ALARM_SOUND)
+            player.wait_for_playback()
+            if announce and not stop.is_set() and self._allowed.is_set():
+                _speak(f"{name} timer done")
+                announce = False  # once, the alarm alone carries on after that
+            if stop.wait(TIMER_ALARM_GAP):
+                break
+        else:
+            log(f"timer alarm gave up: {name}")
+        with self._lock:
+            if self._ringing.get(name, (None,))[0] is stop:
+                del self._ringing[name]
+        try:
+            player.terminate()
+        except Exception:
+            pass
+
+    def stop(self, name: str | None = None) -> list[str]:
+        """Stop the alarm for `name`, or every alarm. Returns the names stopped."""
+        with self._lock:
+            names = [name] if name in self._ringing else [] if name else list(self._ringing)
+            stopped = [self._ringing.pop(n) for n in names]
+        for flag, player in stopped:
+            flag.set()
+            player.stop()
+        return names
+
+    def hold(self):
+        self._allowed.clear()
+        with self._lock:
+            players = [player for _, player in self._ringing.values()]
+        for player in players:
+            player.stop()  # the loop waits at the top until release
+
+    def release(self):
+        self._allowed.set()
+
+    def keys(self):
+        with self._lock:
+            return list(self._ringing)
 
 
 class _SileroVAD:
@@ -586,11 +671,15 @@ _mono_output: bool = False # downmix mpv playback to mono, for devices with a si
 _silence_timeout: float = 1.6 # continuous silence that ends a recording, overridable from config
 _perf_timer = _PerfTimer()
 _timers = _Timers()
+_alarms = _Alarms()
 _log = _Log()
 _levels = _Levels()
 _voice_probe = _VoiceProbe()
 _ring_startup_thread: threading.Thread | None = None
 _ring_startup_stop = threading.Event()
+# bumped per settings change, so only the newest background load of each model is swapped in
+_model_generations = {"transcribe_model": 0, "voice_model": 0}
+_model_lock = threading.Lock()
 
 
 def log(text: str):
@@ -694,7 +783,7 @@ def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
     else:
         # read the exact native span that maps onto chunk_size16 samples. reading ceil(rate/16k) * chunk
         # and truncating loses 8% of every chunk at 44.1 kHz, which both mangles the audio handed to
-        # whisper and breaks the frame continuity silero's LSTM state depends on
+        # speech to text and breaks the frame continuity silero's LSTM state depends on
         native_frames = int(round(chunk_size16 * sample_rate / TARGET_SAMPLE_RATE))
         audio, _ = stream.read(native_frames)
         flat = _resample_audio(np.squeeze(audio), sample_rate, TARGET_SAMPLE_RATE, target_length=chunk_size16)
@@ -736,7 +825,7 @@ def _play_nudge(stream, sample_rate: int) -> float:
     """Prompt a user who woke the speaker but has not spoken, and return the seconds it took.
 
     Waits for the clip to finish and then flushes the mic: a nudge is speech, and left in the buffer
-    the VAD would take it for the user's request and whisper would transcribe the speaker to itself."""
+    the VAD would take it for the user's request and the speaker would transcribe itself."""
     start = time.monotonic()
     clip = _play_random_sound(NUDGE_SOUND_DIR)
     if clip is None:
@@ -862,44 +951,14 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
 
 
 
-def _transcribe_audio(whisper_model, audio: np.ndarray, worker_url: str | None = None) -> str:
-    """Transcribe int16 audio to English text using Whisper, or delegate to worker."""
-    if worker_url:
-        log(f"delegating transcribe to worker: {worker_url}")
-        import io as _io
-        buf = _io.BytesIO()
-        with wave.open(buf, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio.tobytes())
-        try:
-            resp = requests.post(
-                f"{worker_url}/rpc/transcribe",
-                files={"audio": ("audio.wav", buf.getvalue(), "audio/wav")},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            return resp.json().get("text", "")
-        except Exception as e:
-            log(f"worker transcribe error: {e}")
-            return ""
-    audio_float = audio.astype(np.float32) / 32768.0
-    segments, _ = whisper_model.transcribe(
-        audio_float,
-        language="en",
-        beam_size=1,
-        # whisper invents filler ("yeah", "bye", "thanks for watching") on near-silence, and by default
-        # feeds each turn's text forward as a prompt so one invention seeds the next
-        condition_on_previous_text=False,
-    )
-    kept = []
-    for segment in segments:
-        if segment.no_speech_prob > NO_SPEECH_PROB_LIMIT:
-            log(f"dropping hallucinated segment (no_speech={segment.no_speech_prob:.2f}): {segment.text.strip()!r}")
-            continue
-        kept.append(segment.text)
-    return " ".join(kept)
+def transcribe_audio(audio: np.ndarray) -> str:
+    """Transcribe int16 16kHz audio with whichever model is loaded — read once, so a settings
+    change swapping the model mid-turn can't split one request across two."""
+    model = ctx.transcribe_model if ctx else None
+    if model is None:
+        log("transcribe: no model loaded, dropping request")
+        return ""
+    return model.transcribe(audio)
 
 
 def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState | None]:
@@ -917,6 +976,10 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
             return f"playback failed: {result}", None
         return "playing", SpeakerState.RESET
     elif tool_name == "stop":
+        # a ringing alarm is what "stop" means while there is one — the music carries on under it
+        ringing = _alarms.stop()
+        if ringing:
+            return f"stopped alarm: {', '.join(ringing)}", SpeakerState.RESET
         active_timers = _timers.keys()
         if active_timers:
             for name in active_timers:
@@ -937,7 +1000,7 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
     elif tool_name == "get_volume":
         return get_volume(), None
     elif tool_name == "set_timer":
-        return set_timer(tool_input["name"], tool_input["seconds"]), None
+        return set_timer(tool_input.get("name", ""), tool_input["seconds"]), None
     elif tool_name == "cancel_timer":
         return cancel_timer(tool_input["name"]), None
     elif tool_name == "list_timers":
@@ -1067,7 +1130,7 @@ def query_llm(text: str, mic_stream=None, followup: bool = False, speak_after: t
         ctx.wake_model.reset()  # clear residual activation from the wake that triggered this session
         wake_thread = threading.Thread(
             target=_interrupt_wake_listen,
-            args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag, ctx.interrupt, ctx.wake_threshold, ctx.wake_triggers),
+            args=(ctx.wake_model, mic_stream, ctx.audio_context.input_sample_rate, stop_flag, ctx.interrupt, ctx.wake_threshold, ctx.wake_triggers),
             daemon=True
         )
         wake_thread.start()
@@ -1084,7 +1147,7 @@ def query_llm(text: str, mic_stream=None, followup: bool = False, speak_after: t
             if speak_after is not None:
                 speak_after.join()
             if not ctx.interrupt.is_set():
-                _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, sentence)
+                _speak(sentence)
             tts_queue.task_done()
 
     tts_thread = threading.Thread(target=_tts_worker, daemon=True)
@@ -1284,55 +1347,27 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _speak(dev, dev_index, sample_rate, voice_model, text: str):
-    """Synthesise `text` to audio and play it, stopping early if interrupted."""
+def _speak(text: str):
+    """Synthesise `text` with the voice model and play it, stopping early if interrupted."""
     text = _strip_markdown(text)
-    if not text:
+    if not text or ctx is None or ctx.interrupt.is_set():
         return
-    if ctx is not None and ctx.interrupt.is_set():
+    model = ctx.voice_model  # read once, so a settings swap mid-sentence can't split it
+    if model is None:
+        log(f"voice: no model loaded, not speaking: {text[:60]}")
         return
-    worker_url = ctx.worker_url if ctx else None
-    if worker_url:
-        log(f"delegating speak to worker: {worker_url} — {text[:60]}")
-        import io as _io
-        try:
-            resp = requests.post(
-                f"{worker_url}/rpc/speak",
-                json={"text": text},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            buf = _io.BytesIO(resp.content)
-            with wave.open(buf, 'rb') as wf:
-                sr = wf.getframerate()
-                raw = wf.readframes(wf.getnframes())
-            audio_int16 = np.frombuffer(raw, dtype=np.int16)
-        except Exception as e:
-            log(f"worker speak error: {e}")
+    audio, voice_rate = model.synthesize(text)
+    if not len(audio):
+        return
+    out = ctx.audio_context
+    resampled = _resample_audio(audio, voice_rate, out.output_sample_rate)
+    dev.play(resampled, samplerate=out.output_sample_rate, device=out.output_dev_index)
+    done = threading.Event()
+    threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
+    while not done.wait(timeout=0.05):
+        if ctx.interrupt.is_set():
+            dev.stop()
             return
-        resampled = _resample_audio(audio_int16, sr, sample_rate)
-        dev.play(resampled, samplerate=sample_rate, device=dev_index)
-        done = threading.Event()
-        threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
-        while not done.wait(timeout=0.05):
-            if ctx is not None and ctx.interrupt.is_set():
-                dev.stop()
-                return
-        return
-    chunks = []
-    for audio_chunk in voice_model.synthesize(text):
-        int_data = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
-        chunks.append(int_data)
-    if chunks:
-        full_audio = np.concatenate(chunks)
-        resampled = _resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
-        dev.play(resampled, samplerate=sample_rate, device=dev_index)
-        done = threading.Event()
-        threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
-        while not done.wait(timeout=0.05):
-            if ctx is not None and ctx.interrupt.is_set():
-                dev.stop()
-                return
 
 
 def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event, interrupt: threading.Event,
@@ -1417,7 +1452,7 @@ def _report_playback_failure(title: str, reason: str):
     _save_history(CHAT_HISTORY_PATH, entry)
     # only speak into an idle room — mid-turn, the note above carries it instead
     if ctx is not None and ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
-        _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, line)
+        _speak(line)
     else:
         log(f"not speaking playback failure mid-turn: {line}")
 
@@ -1774,6 +1809,49 @@ def apply_llm_settings(config: dict):
     log(f"llm settings applied — provider={provider} model={_llm.model} followup_model={_llm.followup_model} effort={_llm.effort}")
 
 
+def _apply_model_settings(attr: str, kind: str, module, model_class, config: dict):
+    """Swap ctx.<attr> for the model config asks for, without a restart. Loading a model takes
+    seconds, so the new one loads on its own thread and the running one keeps serving until it is
+    ready."""
+    current = getattr(ctx, attr) if ctx else None
+    if ctx is None or (current is not None and current.backend == "worker"):
+        return  # --worker-ip decides this node's model, not config
+    backend, options = module.settings_from_config(config, log)
+    if backend is None:
+        return
+    api_key = backends.openai_key(config) if backend == "openai" else None
+    if current is not None and current.signature == backends.signature(backend, options, api_key, None):
+        return
+    with _model_lock:
+        _model_generations[attr] += 1
+        generation = _model_generations[attr]
+
+    def _load():
+        try:
+            model = model_class(backend, options, api_key=api_key, log=log)
+        except Exception as e:
+            log(f"{kind}: failed to load {backend} {options}, keeping {current.describe() if current else 'none'}: {e}")
+            return
+        with _model_lock:
+            if generation != _model_generations[attr]:
+                return  # a later change is loading, or has loaded, its own
+            setattr(ctx, attr, model)
+        log(f"{kind} settings applied — {model.describe()}")
+
+    log(f"{kind}: loading {backend} {options}")
+    threading.Thread(target=_load, daemon=True).start()
+
+
+def apply_transcribe_settings(config: dict):
+    """Apply the [transcribe] settings without a restart."""
+    _apply_model_settings("transcribe_model", "transcribe", transcribe, transcribe.Transcribe, config)
+
+
+def apply_voice_settings(config: dict):
+    """Apply the [voice] settings without a restart."""
+    _apply_model_settings("voice_model", "voice", voice, voice.Voice, config)
+
+
 def list_llm_models(provider: str) -> list[str]:
     """Tool-calling chat models litellm knows for `provider`, as "provider/model" strings, for the
     settings ui to offer. The registry is the one bundled with litellm, so it is only as fresh as
@@ -2033,11 +2111,16 @@ def set_mute(muted: bool) -> str:
 def set_timer(name: str, seconds: int) -> str:
     def _fire(timer_name: str):
         log(f"timer fired: {timer_name}")
-        _play_oneshot_audio_file("sounds/midnight.wav")
-        if ctx is not None:
-            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
-                   f"{timer_name} timer done")
         _timers.remove(timer_name)
+        # only a name the user gave is worth saying — "timer timer done" is not
+        _alarms.ring(timer_name, announce=named)
+
+    name = name.strip()
+    named = bool(name) and name.lower() != UNNAMED_TIMER
+    if not named:
+        # unnamed timers get "timer", "timer 2"... so a second one doesn't replace the first
+        taken = set(_timers.keys()) | set(_alarms.keys())
+        name = next(n for n in (UNNAMED_TIMER if i == 1 else f"{UNNAMED_TIMER} {i}" for i in itertools.count(1)) if n not in taken)
 
     end_time = time.time() + seconds
     t = threading.Timer(seconds, _fire, args=(name,))
@@ -2047,10 +2130,12 @@ def set_timer(name: str, seconds: int) -> str:
 
     mins, secs = divmod(seconds, 60)
     duration = f"{mins}m {secs}s" if mins else f"{secs}s"
-    return f"{name} timer set for {duration}"
+    return f"{name + ' timer' if named else name} set for {duration}"
 
 
 def cancel_timer(name: str) -> str:
+    if _alarms.stop(name):
+        return f"{name} alarm stopped"
     entry = _timers.pop(name)
     if entry:
         entry[0].cancel()
@@ -2062,10 +2147,11 @@ def cancel_timer(name: str) -> str:
 
 
 def list_timers() -> str:
-    if not _timers:
+    ringing = _alarms.keys()
+    if not _timers and not ringing:
         return "no active timers"
     now = time.time()
-    parts = []
+    parts = [f"{name}: ringing" for name in ringing]
     for name, (_, end_time) in _timers.items():
         remaining = max(0, int(end_time - now))
         mins, secs = divmod(remaining, 60)
@@ -2136,8 +2222,7 @@ def update(target: str) -> str:
 
         log(f"update: done, restarting...")
         if ctx is not None:
-            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
-                   f"Updated to {target}. Restarting now.")
+            _speak(f"Updated to {target}. Restarting now.")
 
         def _restart():
             if "--service" in sys.argv:
@@ -2178,15 +2263,16 @@ def _speak_loop(ctx):
     transcribed_request = ""
     onset_remaining = ONSET_TIMEOUT
     followup = False  # a turn re-entered via follow_on or an interrupt already has full context
-    with dev.InputStream(samplerate=ctx.input_sample_rate, channels=1, dtype='int16', device=ctx.input_dev_index) as stream:
+    with dev.InputStream(samplerate=ctx.audio_context.input_sample_rate, channels=1, dtype='int16', device=ctx.audio_context.input_dev_index) as stream:
         while not ctx.shutdown.is_set():
             if ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
                 ring_startup_stop()  # no-op once the first wake loop has stopped it
                 ring_off(ctx)
+                _alarms.release()  # a turn that didn't stop it lets a held alarm ring on
                 wake_audio = _listen_for_wake(
                     ctx.wake_model,
                     stream,
-                    ctx.input_sample_rate,
+                    ctx.audio_context.input_sample_rate,
                     threshold=ctx.wake_threshold,
                     num_triggers=ctx.wake_triggers,
                     buffer_duration=buffer_duration
@@ -2200,6 +2286,7 @@ def _speak_loop(ctx):
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
+                    _alarms.hold()  # quiet while the user talks, so the request can be heard
                     ring_wake(ctx)
                     _play_oneshot_audio_file("sounds/wake.wav")
                     ctx.speaker_state = SpeakerState.RECORDING
@@ -2214,14 +2301,15 @@ def _speak_loop(ctx):
                 to_halfway = onset_remaining - ONSET_TIMEOUT / 2
                 nudge_after = to_halfway if to_halfway > 0 and not followup else None
                 audio_request, onset_elapsed = _record_until_silence(
-                    ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining, nudge_after=nudge_after)
+                    ctx.vad, stream, ctx.audio_context.input_sample_rate, onset_timeout=onset_remaining, nudge_after=nudge_after)
                 transcribed_request = ""
                 if audio_request is not None:
                     _perf_timer.lap("recorded")
                     mark("transcribe", "")
                     ring_transcribing(ctx)
-                    transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
-                    _perf_timer.lap("transcribed")
+                    transcribed_request = transcribe_audio(audio_request)
+                    model = ctx.transcribe_model
+                    _perf_timer.lap(f"transcribed ({model.describe() if model else 'no model'})")
                     mark("transcribed", transcribed_request.strip())
                 # nothing usable captured — keep listening on the remaining budget rather than dropping
                 # the turn, so a false onset or a discarded noise clip does not send us back to the wake word
@@ -2247,26 +2335,27 @@ def _speak_loop(ctx):
                 # let the user know they were heard — the first spoken sentence can be seconds away
                 ack = _play_random_sound(ACK_SOUND_DIR)
                 ctx.speaker_state = query_llm(transcribed_request, stream, followup=followup, speak_after=ack)
-                _perf_timer.lap("llm")
+                llm = _llm
+                _perf_timer.lap(f"llm ({llm.followup_model if followup else llm.model} {llm.effort})" if llm else "llm")
                 mark("llm-done", "")
                 if ctx.speaker_state == SpeakerState.RECORDING:
                     onset_remaining = ONSET_TIMEOUT
                     followup = True
-                    _flush_stream(stream, ctx.input_sample_rate)
+                    _flush_stream(stream, ctx.audio_context.input_sample_rate)
                     ctx.wake_model.reset()
                 else:
                     unduck_playback()
             elif ctx.speaker_state == SpeakerState.RESET:
-                _flush_stream(stream, ctx.input_sample_rate)
+                _flush_stream(stream, ctx.audio_context.input_sample_rate)
                 ctx.wake_model.reset()
                 ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 log("return to listen for wake")
             elif ctx.speaker_state == SpeakerState.VAD_RECORD:
                 ring_recording(ctx)
-                audio = _vad_record(ctx.vad, stream, ctx.input_sample_rate)
+                audio = _vad_record(ctx.vad, stream, ctx.audio_context.input_sample_rate)
                 filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                 log(f"caching {filepath}")
-                _write_wav(audio, ctx.input_sample_rate, filepath, gain=1.0)
+                _write_wav(audio, ctx.audio_context.input_sample_rate, filepath, gain=1.0)
 
 
 def _start_worker():
@@ -2277,26 +2366,14 @@ def _start_worker():
     log("oi! worker mode!!")
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
-    inf = config.get("inference", {})
-    device = inf.get("device", "cpu")
-    compute = "float16" if device == "cuda" else "int8"
-    whisper_model = WhisperModel(
-        inf.get("whisper_model", "small"),
-        device=device,
-        compute_type=inf.get("whisper_compute", compute),
-    )
-    piper_model = config.get("voice", {}).get("model", "models/piper/en_GB-northern_english_male-medium.onnx")
-    voice_model = PiperVoice.load(piper_model)
     ctx = SpeakerContext(
         system="",
-        voice_model=voice_model,
-        whisper_model=whisper_model,
+        voice_model=voice.create(config, log=log),
+        transcribe_model=transcribe.create(config, log=log),
         vad=None,
-        output_dev_index=0,
-        output_sample_rate=voice_model.config.sample_rate,
         wake_model=None,
-        input_dev_index=0,
-        input_sample_rate=16000,
+        # a worker does no audio i/o of its own
+        audio_context=AudioContext(0, TARGET_SAMPLE_RATE, 0, TARGET_SAMPLE_RATE),
         worker_mode=True,
     )
     log("worker ready")
@@ -2383,7 +2460,7 @@ def ring_recording(ctx):
 
 
 def ring_transcribing(ctx):
-    """Whisper is running on the captured audio."""
+    """Speech to text is running on the captured audio."""
     if ctx.ring is None:
         return
     _ring_call(ctx.ring.solid, RING_COLOR_TRANSCRIBING)
@@ -2446,12 +2523,8 @@ def start():
 
     apply_llm_settings(config)
 
-    # whisper / inference config
+    # vad / inference config
     inf = config.get("inference", {})
-    device = inf.get("device", "cpu")
-    compute = "int8"
-    if device == "cuda":
-        compute = "float16"
     vad_threshold = float(inf.get("vad_threshold", 0.5))
     vad_mic_gain = float(inf.get("vad_mic_gain", 1.0))
     vad_verbose = "--verbose" in sys.argv
@@ -2475,17 +2548,15 @@ def start():
             vad_threshold=0.5,
             enable_speex_noise_suppression=False
         ),
-        voice_model=PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx"),
-        whisper_model=WhisperModel(
-            inf.get("whisper_model", "small"),
-            device=device,
-            compute_type=inf.get("whisper_compute", compute)
-        ),
+        voice_model=voice.create(config, worker_url, log),
+        transcribe_model=transcribe.create(config, worker_url, log),
         vad=_SileroVAD(threshold=vad_threshold, mic_gain=vad_mic_gain, verbose=vad_verbose),
-        input_dev_index=int(input_dev_info['index']),
-        input_sample_rate=int(input_dev_info['default_samplerate']),
-        output_dev_index=int(output_dev_info['index']),
-        output_sample_rate=int(output_dev_info['default_samplerate']),
+        audio_context=AudioContext(
+            input_dev_index=int(input_dev_info['index']),
+            input_sample_rate=int(input_dev_info['default_samplerate']),
+            output_dev_index=int(output_dev_info['index']),
+            output_sample_rate=int(output_dev_info['default_samplerate']),
+        ),
         worker_url=worker_url,
         ring=ring,
     )

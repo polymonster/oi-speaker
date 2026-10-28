@@ -3,13 +3,58 @@ name = "living-room"
 port = 8000
 
 [inference]
-device = "cpu"
-whisper_model = "small"
 # seconds of continuous silence that end a recording. raise it if the speaker cuts you off
 # mid-sentence, lower it to shave latency off every turn
 silence_timeout = 1.6
 # silero speech probability above which a frame counts as speech. raise it in a noisy room
 vad_threshold = 0.5
+
+# Speech to text. backend is whisper, parakeet or openai — install the local ones with
+# pip install -e ".[whisper]" / ".[parakeet]". The settings tab only offers what is installed, and
+# lists the models, devices and compute types this machine supports. Ignored under --worker-ip.
+[transcribe]
+backend = "whisper"
+
+[transcribe.whisper]
+model = "small"
+device = "cpu"          # or "cuda"
+compute_type = "int8"   # "float16" on cuda
+
+[transcribe.parakeet]
+model = "nemo-parakeet-tdt-0.6b-v2"
+device = "cpu"
+quantization = "int8"   # or "none"
+
+# uses the openai key under [llm.keys]
+[transcribe.openai]
+model = "gpt-4o-mini-transcribe"
+
+# The voice, the same way. backend is piper, kokoro, chatterbox or openai — install the local ones
+# with pip install -e ".[piper]" / ".[kokoro]" / ".[chatterbox]". Ignored under --worker-ip.
+[voice]
+backend = "piper"
+
+[voice.piper]
+model = "models/piper/en_GB-northern_english_male-medium.onnx"
+device = "cpu"
+
+# the voice's first letter is its accent: a american, b british
+[voice.kokoro]
+model = "models/kokoro/kokoro-v1.0.onnx"
+voice = "bm_george"
+device = "cpu"
+
+# Chatterbox Turbo wants a gpu ("cuda", or "mps" on apple silicon)
+[voice.chatterbox]
+device = "cpu"
+# a 5s+ wav to clone the voice from, empty for chatterbox's built-in voice
+reference = ""
+
+# uses the openai key under [llm.keys]. instructions steers tone and accent (gpt-4o-mini-tts only)
+[voice.openai]
+model = "gpt-4o-mini-tts"
+voice = "ash"
+instructions = ""
 
 [audio]
 input_device = "your-input-device"

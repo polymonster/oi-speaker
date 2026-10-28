@@ -22,12 +22,21 @@ from pydantic import BaseModel
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
+import backends
 import speaker as spk
+import transcribe
+import voice
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONFIG_PATH = Path("config.toml")
 
 _MDNS_TYPE = "_oi-speaker._tcp.local."
+
+# swappable models: config section -> (module, ctx attribute)
+_MODEL_KINDS = {
+    "transcribe": (transcribe, "transcribe_model"),
+    "voice": (voice, "voice_model"),
+}
 
 
 class SpeakRequest(BaseModel):
@@ -182,6 +191,8 @@ async def get_settings():
         cfg = tomllib.load(f)
     # also fills meta.confidential with the vendor key paths
     spk.migrate_llm_config(cfg)
+    transcribe.migrate_config(cfg)
+    voice.migrate_config(cfg)
     audio = cfg.setdefault("audio", {})
     for key, default in _AUDIO_DEFAULTS.items():
         audio.setdefault(key, default)
@@ -191,10 +202,14 @@ async def get_settings():
 @app.post("/settings")
 async def update_settings(settings: dict[str, Any] = Body(...)):
     spk.migrate_llm_config(settings)
+    transcribe.migrate_config(settings)
+    voice.migrate_config(settings)
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(settings).encode())
     spk.apply_audio_settings(settings)
     spk.apply_llm_settings(settings)
+    spk.apply_transcribe_settings(settings)
+    spk.apply_voice_settings(settings)
     return {"ok": True}
 
 
@@ -223,6 +238,34 @@ async def llm_test(req: LlmTestRequest):
     loop = asyncio.get_event_loop()
     error = await loop.run_in_executor(None, spk.test_llm, req.provider, req.model, req.api_key, req.api_base)
     return {"ok": error is None, "error": error}
+
+
+@app.get("/backends/{kind}")
+async def model_backends(kind: str, backend: str = ""):
+    """Installed backends for transcribe or voice, and the options `backend` (default: the
+    configured one) supports on this machine — the choices depend on what is installed and whether
+    there is a gpu."""
+    if kind not in _MODEL_KINDS:
+        raise HTTPException(status_code=404, detail=f"no model kind '{kind}'")
+    module, attr = _MODEL_KINDS[kind]
+    with open(CONFIG_PATH, "rb") as f:
+        cfg = module.migrate_config(tomllib.load(f))
+    backend = backend or cfg[kind]["backend"]
+    installed = backends.installed(module.BACKENDS)
+    model = getattr(spk.ctx, attr) if spk.ctx else None
+    options = []
+    if backend in installed:
+        loop = asyncio.get_event_loop()
+        # openai lists its models over the network, the others probe the gpu
+        options = await loop.run_in_executor(None, module.backend_options, backend, backends.openai_key(cfg))
+    return {
+        "backends": {name: {"label": b["label"], "extra": b["extra"], "available": name in installed}
+                     for name, b in module.BACKENDS.items()},
+        "backend": backend,
+        "options": options,
+        "active": model.describe() if model else None,
+        "worker_url": model.worker_url if model else None,
+    }
 
 
 @app.post("/stop")
@@ -330,7 +373,7 @@ async def rpc_transcribe(audio: UploadFile = File(...)):
         import soxr
         audio_array = (soxr.resample(audio_array.astype(np.float32) / 32767.0, sr, 16000) * 32767).astype(np.int16)
     loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, spk._transcribe_audio, spk.ctx.whisper_model, audio_array, spk.ctx.worker_url)
+    text = await loop.run_in_executor(None, spk.transcribe_audio, audio_array)
     return {"text": text.strip()}
 
 
@@ -341,17 +384,20 @@ async def rpc_speak(req: SpeakRequest):
         raise HTTPException(status_code=503, detail="speaker not ready")
     spk.log(f"rpc: speaking for remote caller: {req.text[:60]}")
     voice_model = spk.ctx.voice_model
+    if voice_model is None or voice_model.sample_rate is None:
+        raise HTTPException(status_code=503, detail="no voice model loaded")
     text = spk._strip_markdown(req.text)
 
     def generate():
-        yield _wav_header(voice_model.config.sample_rate)
-        for chunk in voice_model.synthesize(text):
-            yield chunk.audio_int16_bytes
+        yield _wav_header(voice_model.sample_rate)
+        for chunk in voice_model.stream(text):
+            yield chunk.tobytes()
 
     return StreamingResponse(generate(), media_type="audio/wav")
 
 
-_LOCAL_ONLY_SECTIONS = {"audio", "network"}
+# transcribe and voice too: which backends are installed, and whether there is a gpu, differs per box
+_LOCAL_ONLY_SECTIONS = {"audio", "network", "transcribe", "voice"}
 
 @app.post("/rpc/sync-config")
 async def rpc_sync_config(req: SyncConfigRequest):
@@ -365,7 +411,8 @@ async def rpc_sync_config(req: SyncConfigRequest):
         resp.raise_for_status()
     remote_cfg: dict = resp.json()
     with open(CONFIG_PATH, "rb") as f:
-        local_cfg = tomllib.load(f)
+        # migrated first, or whisper settings still under [inference] are lost with the remote's copy
+        local_cfg = voice.migrate_config(transcribe.migrate_config(tomllib.load(f)))
     for section in _LOCAL_ONLY_SECTIONS:
         if section in local_cfg:
             remote_cfg[section] = local_cfg[section]

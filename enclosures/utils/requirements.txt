@@ -1,0 +1,7 @@
+ezdxf
+manifold3d
+matplotlib
+numpy
+scipy
+shapely
+trimesh

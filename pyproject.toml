@@ -9,11 +9,9 @@ requires-python = ">= 3.10"
 dependencies = [
     "sounddevice",
     "openwakeword @ git+https://github.com/dscripka/openWakeWord.git",
-    "faster-whisper",
     "setuptools<71; sys_platform == 'darwin'",
     "litellm",
     "ddgs",
-    "piper-tts",
     "yt-dlp",
     "python-mpv",
     "speexdsp-ns; sys_platform == 'linux'",
@@ -28,7 +26,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# speech to text backends: install one or more, the settings ui offers whichever are present.
+# the openai cloud backend needs no extra (litellm already brings the openai sdk)
+whisper = ["faster-whisper"]
+parakeet = ["onnx-asr[hub]"]
+# text to speech backends, the same way. openai needs no extra here either
+piper = ["piper-tts"]
+kokoro = ["kokoro-onnx"]
+chatterbox = ["chatterbox-tts", "setuptools<81"]  # its watermarker still imports pkg_resources
 training = [
+    "piper-tts",  # generate-positives synthesises wake word samples with piper
     "scipy",
     "scikit-learn",
     "torch",
@@ -47,10 +54,10 @@ cuda = [
 [project.scripts]
 speaker = "speaker:main"
 xvf3800 = "xvf3800:main"
-tts = "tts:main"
+tts-record = "tts_record:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/tts.py", "src/static"]
+packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/tts_record.py", "src/backends.py", "src/transcribe.py", "src/voice.py", "src/static"]

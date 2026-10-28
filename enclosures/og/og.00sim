@@ -1,0 +1,177 @@
+{
+  "kind": "00sim-project",
+  "schemaVersion": 1,
+  "createdWith": {
+    "app": "simulator.00aud.io",
+    "appVersion": "1.9.0"
+  },
+  "project": {
+    "enclosures": [
+      {
+        "id": "1778699246347-ksuu7zj",
+        "name": "Enclosure A",
+        "type": "passive-radiator",
+        "chamberSystem": {
+          "topology": "direct-radiator",
+          "rear": {
+            "volumeM3": 0.0022,
+            "loading": {
+              "kind": "passive-radiator",
+              "componentId": "bits-pr:cd4d3770-10cf-4442-885a-a075038a4d82",
+              "count": 1,
+              "addedMassKgEach": 0
+            }
+          }
+        },
+        "color": "#3b82f6",
+        "visible": true,
+        "volume": 0.0022,
+        "tuningFrequency": 40,
+        "portDiameter": 0.076,
+        "portHeight": 0.076,
+        "numPorts": 1,
+        "portShape": "circular",
+        "endCorrectionInside": 0.85,
+        "endCorrectionOutside": 0.6,
+        "passiveRadiatorId": "bits-pr:cd4d3770-10cf-4442-885a-a075038a4d82",
+        "passiveRadiatorCount": 1,
+        "passiveRadiatorAddedMass": 0,
+        "configuration": {
+          "id": "1778699246347-c8dcdoo",
+          "driverId": "bits:2ade2d3c-fa53-4941-9c5b-124c991451c0",
+          "driverCount": 1,
+          "inputPower": 30,
+          "seriesResistance": 0.1
+        },
+        "configurations": [
+          {
+            "id": "1778699246347-c8dcdoo",
+            "driverId": "bits:2ade2d3c-fa53-4941-9c5b-124c991451c0",
+            "driverCount": 1,
+            "inputPower": 30,
+            "seriesResistance": 0.1
+          }
+        ]
+      }
+    ],
+    "environment": {
+      "radiationSpace": "half-space",
+      "listeningDistance": 1,
+      "headroom": {
+        "targetAverageSplDb": 85,
+        "crestFactorDb": 12,
+        "targetMode": "per-enclosure",
+        "perEnclosureTargets": {
+          "1778699246347-ksuu7zj": {
+            "targetAverageSplDb": 99,
+            "crestFactorDb": 12
+          }
+        },
+        "powerTargetLinked": true,
+        "listeningDistance": 1,
+        "distanceUnit": "m",
+        "thermalPowerTargetRatio": 0.5,
+        "thermalPowerMaxRatio": 1,
+        "driverExcursionTargetRatio": 1,
+        "driverExcursionMaxRatio": 1.125,
+        "portVelocityTarget": 17,
+        "portVelocityMax": 30,
+        "prExcursionTargetRatio": 1,
+        "prExcursionMaxRatio": 1.25
+      }
+    },
+    "library": {
+      "drivers": [
+        {
+          "id": "bits:2ade2d3c-fa53-4941-9c5b-124c991451c0",
+          "brand": "Dayton Audio",
+          "model": "RS100-8",
+          "params": {
+            "brand": "Dayton Audio",
+            "model": "RS100-8",
+            "comment": "https://www.daytonaudio.com/product/90/rs100-8-4-reference-full-range-driver-8-ohm",
+            "nominalSize": 4,
+            "frequencyHigh": 20000,
+            "Re": 6.4,
+            "Le": 0.0005,
+            "Znom": 8,
+            "Bl": 4.2,
+            "Mms": 0.00363,
+            "Cms": 0.00082,
+            "Rms": 0.887765043505914,
+            "Qms": 2.37,
+            "Qes": 0.76,
+            "Qts": 0.58,
+            "Sd": 0.00353,
+            "Xmax": 0.0035,
+            "Dd": 0.06704129766729701,
+            "Fs": 92.2,
+            "Vas": 0.00143,
+            "Vd": 0.000012355,
+            "Pe": 30
+          },
+          "isCustom": false,
+          "notes": "https://www.daytonaudio.com/product/90/rs100-8-4-reference-full-range-driver-8-ohm"
+        }
+      ],
+      "passiveRadiators": [
+        {
+          "id": "bits-pr:cd4d3770-10cf-4442-885a-a075038a4d82",
+          "brand": "Dayton Audio",
+          "model": "ND90-PR",
+          "params": {
+            "brand": "Dayton Audio",
+            "model": "ND90-PR",
+            "nominalSize": 3.5,
+            "Mms": 0.0081,
+            "Cms": 0.00109,
+            "Rms": 0.4432555118161336,
+            "Qms": 6.15,
+            "Sd": 0.00312,
+            "Xmax": 0.009,
+            "Dd": 0.0630278301988392,
+            "Fs": 53.8,
+            "Vas": 0.0015,
+            "Vd": 0.00002808
+          },
+          "isCustom": false
+        }
+      ]
+    },
+    "ui": {
+      "layout": {
+        "leftSidebarCollapsed": false,
+        "rightSidebarCollapsed": false,
+        "panelDockLeft": [
+          "left-sidebar",
+          "right-sidebar"
+        ],
+        "panelDockRight": []
+      },
+      "units": {
+        "unitSystem": "metric",
+        "lengthUnit": "mm",
+        "volumeUnit": "L"
+      },
+      "meta": {
+        "customCompareConfig": {
+          "leftMetricId": "excursion",
+          "rightMetricId": "group-delay"
+        }
+      },
+      "graphs": [
+        {
+          "type": "spl",
+          "position": 0,
+          "expanded": true,
+          "x": 0,
+          "y": 0,
+          "w": 4,
+          "h": 4
+        }
+      ],
+      "selectedEnclosureId": "1778699246347-ksuu7zj",
+      "selectedConfigId": "1778699246347-c8dcdoo"
+    }
+  }
+}

@@ -348,6 +348,14 @@ async function loadSettings() {
   form.appendChild(llmContainer);
   await renderLlm(llmContainer);
 
+  backendInfo = {};  // installed backends or the openai key may have changed since last load
+  for (const kind of BACKEND_KINDS) {
+    const container = document.createElement('div');
+    container.id = `${kind}-container`;
+    form.appendChild(container);
+    await renderBackends(kind, container);
+  }
+
   renderObj(form, settingsData, []);
 
   // Hints — always rendered explicitly so it's never silently skipped
@@ -374,8 +382,8 @@ async function loadSettings() {
 
 function renderObj(container, obj, path) {
   for (const [key, val] of Object.entries(obj)) {
-    if (key === 'hints' || key === 'meta' || (key === 'llm' && path.length === 0)) {
-      continue; // hints and llm rendered explicitly; meta is internal
+    if (key === 'hints' || key === 'meta' || ((key === 'llm' || BACKEND_KINDS.includes(key)) && path.length === 0)) {
+      continue; // hints, llm, transcribe and voice rendered explicitly; meta is internal
     } else if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
       continue; // other arrays of objects — skip
     } else if (typeof val === 'object' && !Array.isArray(val)) {
@@ -577,6 +585,92 @@ async function testLlm(container, out) {
   } catch (e) {
     out.className = 'llm-test-result err';
     out.textContent = String(e);
+  }
+}
+
+// transcribe and voice — a backend and its options each. the choices come from the box itself
+// (which backends are installed, whether there is a gpu), so they are fetched per backend rather
+// than read from config
+const BACKEND_KINDS = ['transcribe', 'voice'];
+let backendInfo = {};  // kind -> /backends/<kind> for the backend currently shown
+
+async function renderBackends(kind, container) {
+  const cfg = settingsData[kind];
+  if (!backendInfo[kind] || backendInfo[kind].backend !== cfg.backend) {
+    try { backendInfo[kind] = await fetch(`/backends/${kind}?backend=${encodeURIComponent(cfg.backend)}`).then(r => r.json()); }
+    catch (e) { container.textContent = `Error loading ${kind} backends: ` + e; return; }
+  }
+  const info = backendInfo[kind];
+  container.innerHTML = '';
+
+  const header = document.createElement('div');
+  header.className = 'section-header';
+  header.textContent = kind;
+  container.appendChild(header);
+
+  if (info.active) {
+    container.appendChild(settingRow('running', Object.assign(document.createElement('input'), { value: info.active, disabled: true })));
+  }
+  // --worker-ip hands every request to the worker, so this box's own choice does not apply
+  if (info.worker_url) return;
+
+  const backend = document.createElement('select');
+  backend.dataset.path = `${kind}.backend`;
+  for (const [name, b] of Object.entries(info.backends)) {
+    if (!b.available && name !== cfg.backend) continue;
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = b.label + (b.available ? '' : '  (not installed)');
+    backend.appendChild(opt);
+  }
+  backend.value = cfg.backend;
+  backend.onchange = () => {
+    collectPaths(container);
+    cfg.backend = backend.value;
+    renderBackends(kind, container);
+    markDirty();
+  };
+  container.appendChild(settingRow('backend', backend));
+
+  const spec = info.backends[cfg.backend];
+  if (spec && !spec.available) {
+    const note = spec.extra ? `pip install -e ".[${spec.extra}]"` : 'not installed';
+    container.appendChild(settingRow('install', Object.assign(document.createElement('input'), { value: note, disabled: true })));
+    return;
+  }
+
+  const section = cfg[cfg.backend] ??= {};
+  const parents = new Set(info.options.map(o => o.depends_on).filter(Boolean));
+  for (const o of info.options) {
+    // a dependent option's choices are keyed by its parent's value — compute types per device
+    const choices = o.depends_on ? (o.choices[section[o.depends_on]] || []) : o.choices;
+    const fallback = o.depends_on ? o.default[section[o.depends_on]] : o.default;
+    let value = section[o.key] ?? fallback;
+    if (o.depends_on && !choices.includes(value)) value = fallback;  // float16 does not survive a move to cpu
+    section[o.key] = value;
+    const path = `${kind}.${cfg.backend}.${o.key}`;
+    const label = o.key.replace(/_/g, ' ');
+
+    if (o.free_text) {
+      // the list suggests, but a model name it does not know can still be typed in
+      const list = document.createElement('datalist');
+      list.id = `${kind}-${o.key}`;
+      for (const c of choices) list.appendChild(Object.assign(document.createElement('option'), { value: c }));
+      container.appendChild(list);
+      const input = pathInput(path, value, { placeholder: '(default)' });
+      input.setAttribute('list', list.id);
+      container.appendChild(settingRow(label, input));
+      continue;
+    }
+    const sel = document.createElement('select');
+    sel.dataset.path = path;
+    const values = choices.includes(value) ? choices : [...choices, value];  // a hand-set value survives
+    for (const c of values) sel.appendChild(Object.assign(document.createElement('option'), { value: c, textContent: c || '(default)' }));
+    sel.value = value;
+    if (parents.has(o.key)) {
+      sel.onchange = () => { collectPaths(container); renderBackends(kind, container); markDirty(); };
+    }
+    container.appendChild(settingRow(label, sel));
   }
 }
 

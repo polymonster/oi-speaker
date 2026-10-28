@@ -72,9 +72,62 @@ Python deps are configured as part of the `pyproject.toml` setup your Python env
 ```bash
 python3.11 -m venv ~/oi-speaker-env
 source ~/oi-speaker-env/bin/activate
-pip install -e .
+pip install -e ".[whisper,piper]"
 # optional cuda
-pip install -e ".[cuda]"
+pip install -e ".[whisper,piper,cuda]"
+```
+
+Speech to text and the voice are both pluggable: install the backends you want as extras, then pick
+one of each per box in the web ui settings (or `[transcribe]` / `[voice]` in `config.toml`).
+Changes apply on save, with no restart. Only installed backends are offered, and their options
+(model, device, compute type...) are listed from what the machine actually supports. Models
+download on first use.
+
+### Speech to text
+
+| backend | install | notes |
+|---|---|---|
+| `whisper` | `pip install -e ".[whisper]"` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), cpu or cuda |
+| `parakeet` | `pip install -e ".[parakeet]"` | NVIDIA parakeet via [onnx-asr](https://github.com/istupakov/onnx-asr), no torch needed. cuda needs `onnxruntime-gpu` in place of `onnxruntime` |
+| `openai` | nothing extra | cloud api, uses the openai key from `[llm.keys]` (or `OPENAI_API_KEY`) |
+
+### Voice (text to speech)
+
+| backend | install | notes |
+|---|---|---|
+| `piper` | `pip install -e ".[piper]"` | [piper](https://github.com/OHF-Voice/piper1-gpl), fast on cpu, voices are `.onnx` files in `models/piper/` (see [Downloading Models](#downloading-models)) |
+| `kokoro` | `pip install -e ".[kokoro]"` | [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) 82M on onnxruntime, close to piper's speed and noticeably more natural, ~50 built-in voices (`bm_george`, `bf_emma`... the first letter is the accent). Model and voices files go in `models/kokoro/` (see [Downloading Models](#downloading-models)) |
+| `chatterbox` | `pip install -e ".[chatterbox]"` | [Chatterbox Turbo](https://github.com/resemble-ai/chatterbox), pulls in torch. Needs a gpu (cuda or apple `mps`) to keep up: on cpu a sentence takes ~2-5x its own length to synthesise. For cuda, install a cuda build of torch |
+| `openai` | nothing extra | cloud api (`gpt-4o-mini-tts`, `tts-1`...), uses the openai key from `[llm.keys]`. `instructions` steers tone and accent on `gpt-4o-mini-tts` |
+
+Chatterbox speaks in its built-in voice by default. To clone another, drop a clean recording of at
+least 5 seconds into `models/chatterbox/` and pick it as the `reference` in settings.
+
+### What to install where
+
+A plain `pip install -e .` installs no local backend for either, only `openai` (litellm already
+brings the openai sdk). With the default `whisper` and `piper` backends missing, the speaker logs it
+and falls back to openai, so it needs an openai key in that case.
+
+Extras combine. Everything, for a big node (a gpu box serving as a worker):
+
+```bash
+pip install -e ".[whisper,parakeet,piper,kokoro,chatterbox,cuda]"
+```
+
+Without a gpu, drop `cuda` (and `chatterbox`, which is too slow on cpu):
+`pip install -e ".[whisper,parakeet,piper,kokoro]"`. A satellite started with `--worker-ip` hands both
+transcription and speech to the worker and needs no backend installed, so `pip install -e .` is
+enough there.
+
+### Recording canned lines
+
+`tts-record` renders a line with the configured voice, for the clips in `sounds/`:
+
+```bash
+tts-record sounds/nudge/whats_up.wav "What's up?"
+tts-record out.wav "Hello" --backend openai
+tts-record out.wav "Hello" --voice models/piper/other-voice.onnx
 ```
 
 ## LED Ring (reSpeaker XVF3800)
@@ -133,9 +186,19 @@ The openWakeWord download is required even though a custom wake word model ships
 
 ```bash
 python -c "import openwakeword; openwakeword.utils.download_models()"
+# piper voice, only with the piper backend installed
 python -m piper.download --voice en_GB-northern_english_male-medium
 # or
 python -m piper.download_voices en_GB-northern_english_male-medium
+```
+
+Kokoro, only with the kokoro backend installed. `kokoro-v1.0.int8.onnx` (88MB) is also there for
+small disks, though on cpu it ran ~3.5x slower than the full model:
+
+```bash
+mkdir -p models/kokoro
+curl -L -o models/kokoro/kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -L -o models/kokoro/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 ```
 
 ## Language Model
