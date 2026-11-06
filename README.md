@@ -137,7 +137,8 @@ pip install -e ".[whisper,parakeet,piper,kokoro,chatterbox,cuda]"
 Without a gpu, drop `cuda` (and `chatterbox`, which is too slow on cpu):
 `pip install -e ".[whisper,parakeet,piper,kokoro]"`. A satellite started with `--worker-ip` hands both
 transcription and speech to the worker and needs no backend installed, so `pip install -e .` is
-enough there.
+enough there. One started with `--offload` still needs a backend, as its fallback when no worker
+answers (see [Sharing the work between speakers](#sharing-the-work-between-speakers)).
 
 ### Recording canned lines
 
@@ -291,6 +292,36 @@ or shuffled. A copy of an album in several folders is only played and offered on
 speaker
 ```
 
+### Sharing the work between speakers
+
+Transcription and speech can run on a faster box instead of the speaker that heard you, either
+pinned to one or chosen automatically:
+
+```bash
+speaker --worker-ip 192.168.1.247:8000   # always this worker; nothing loaded locally
+speaker --offload                        # the fastest speaker on the network, else this one
+```
+
+With `--offload`, every speaker and worker found on the network (the same ones the speakers tab
+lists) is asked for its score every 30 seconds — a request each, in the background, so choosing a
+worker costs nothing per turn. Each call goes to the highest scoring node that beats this one; if
+it fails (a connection that doesn't open within 1.5s, an error), the next is tried, and finally this
+speaker's own model, which `--offload` still loads for exactly that. A node that failed is skipped
+until the next poll. The settings tab shows the current order under transcribe and voice.
+
+A node's score is per service. By default it is 1000 for a model on a gpu (`cuda` or `mps`) plus the
+number of cpu cores, so a gpu box beats every Pi and a desktop's cpu beats a Pi's. Set it by hand
+in `config.toml` to override that, for both services:
+
+```toml
+[network]
+score = 1000
+```
+
+A node only serves what it runs itself: a `--worker-ip` satellite scores 0, and a call that
+reaches a node is never passed on to another, so offloading can't go round in circles. Any node
+answers, not only `--worker` ones, so a speaker on the gpu box serves the others too.
+
 ## Running as a Service (Linux)
 
 The service is an instantiated systemd template so it works for any user without editing the file.
@@ -301,9 +332,11 @@ bash install-service.sh
 
 This copies `setup/oi-speaker@.service` to `/etc/systemd/system/`, enables and starts `oi-speaker@<your-username>`.
 
-Any args passed to the installer are appended to the speaker command line, so to offload inference to a worker:
+Any args passed to the installer are appended to the speaker command line, so to offload inference:
 
 ```bash
+bash install-service.sh --offload
+# or pinned to one worker
 bash install-service.sh --worker-ip 192.168.1.247:8000
 ```
 

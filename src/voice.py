@@ -124,9 +124,7 @@ class Voice:
         if self.backend == "worker":
             self.log(f"delegating speak to worker: {self.worker_url} — {text[:60]}")
             try:
-                resp = requests.post(f"{self.worker_url}/rpc/speak", json={"text": text}, timeout=WORKER_TIMEOUT)
-                resp.raise_for_status()
-                return backends.read_wav(resp.content)
+                return remote(self.worker_url, text)
             except Exception as e:
                 self.log(f"worker speak error: {e}")
                 return np.array([], dtype=np.int16), 16000
@@ -137,6 +135,17 @@ class Voice:
             chunks = []
         audio = np.concatenate(chunks) if chunks else np.array([], dtype=np.int16)
         return audio, self.sample_rate
+
+
+def remote(worker_url: str, text: str) -> tuple[np.ndarray, int]:
+    """Have the node at `worker_url` synthesise `text`, as int16 audio and its sample rate. Raises on
+    any failure, so the caller can try elsewhere."""
+    resp = requests.post(f"{worker_url}/rpc/speak", json={"text": text}, timeout=(backends.CONNECT_TIMEOUT, WORKER_TIMEOUT))
+    resp.raise_for_status()
+    audio, rate = backends.read_wav(resp.content)
+    if not len(audio):
+        raise RuntimeError("worker sent no audio")
+    return audio, rate
 
 
 def _openai_models(api_key: str | None) -> list[str]:

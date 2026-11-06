@@ -42,6 +42,7 @@ from enum import Enum, auto
 import alarms
 import backends
 import library
+import offload
 import transcribe
 import voice
 
@@ -802,6 +803,9 @@ _timers = _Timers()
 _alarms = _Alarms()
 _clock: alarms.AlarmClock | None = None  # the saved clock alarms, built in start()
 _library: library.Library | None = None  # music on the local disk, built in start()
+_offload: offload.Offload | None = None  # faster nodes to hand transcribe and voice to, under --offload
+_node_name: str = "oi-speaker"  # [network] name, how other nodes know this one
+_offload_score: int | None = None  # [network] score set by hand, else derived from the models' devices
 _log = _Log()
 _levels = _Levels()
 _voice_probe = _VoiceProbe()
@@ -1081,14 +1085,22 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
 
 
 
-def transcribe_audio(audio: np.ndarray) -> str:
-    """Transcribe int16 16kHz audio with whichever model is loaded — read once, so a settings
-    change swapping the model mid-turn can't split one request across two."""
+def transcribe_audio(audio: np.ndarray, use_offload: bool = True) -> tuple[str, str]:
+    """Transcribe int16 16kHz audio on the best offload worker, falling back to whichever model is
+    loaded here — read once, so a settings change swapping the model mid-turn can't split one request
+    across two. Returns the text and what transcribed it, for the timing log. An rpc call from another
+    node passes use_offload=False, so a request is never passed along twice."""
+    if use_offload and _offload is not None:
+        for url in _offload.candidates("transcribe"):
+            try:
+                return transcribe.remote(url, audio), f"offload {_offload.name_of(url)}"
+            except Exception as e:
+                _offload.failed(url, e)
     model = ctx.transcribe_model if ctx else None
     if model is None:
         log("transcribe: no model loaded, dropping request")
-        return ""
-    return model.transcribe(audio)
+        return "", "no model"
+    return model.transcribe(audio), model.describe()
 
 
 def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState | None]:
@@ -1502,16 +1514,62 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def _synthesize(text: str) -> tuple[np.ndarray, int]:
+    """`text` as int16 audio and its rate, from the best offload worker or else the voice model here."""
+    if _offload is not None:
+        for url in _offload.candidates("voice"):
+            try:
+                return voice.remote(url, text)
+            except Exception as e:
+                _offload.failed(url, e)
+    model = ctx.voice_model  # read once, so a settings swap mid-sentence can't split it
+    if model is None:
+        log(f"voice: no model loaded, not speaking: {text[:60]}")
+        return np.array([], dtype=np.int16), TARGET_SAMPLE_RATE
+    return model.synthesize(text)
+
+
+def offload_scores() -> dict[str, int]:
+    """How fast this node is at each service, for nodes choosing where to offload: 0 for a service
+    it cannot serve itself (no model, or a --worker-ip satellite's borrowed one)."""
+    scores = {}
+    for service, attr in (("transcribe", "transcribe_model"), ("voice", "voice_model")):
+        model = getattr(ctx, attr) if ctx else None
+        if model is None or model.backend == "worker":
+            scores[service] = 0
+        elif _offload_score is not None:
+            scores[service] = _offload_score
+        else:
+            scores[service] = offload.derive_score(model.options.get("device", "cpu"))
+    return scores
+
+
+def capabilities() -> dict:
+    """What /rpc/capabilities tells the nodes polling it."""
+    out = {"name": _node_name, "scores": offload_scores()}
+    for service, attr in (("transcribe", "transcribe_model"), ("voice", "voice_model")):
+        model = getattr(ctx, attr) if ctx else None
+        out[service] = model.describe() if model else None
+    return out
+
+
+def apply_network_settings(config: dict):
+    """Take up a [network] score changed in settings; polling nodes see it on their next poll."""
+    global _offload_score
+    score = config.get("network", {}).get("score")
+    try:
+        _offload_score = int(score) if score not in (None, "") else None
+    except (TypeError, ValueError):
+        log(f"network: score '{score}' is not a number, deriving it instead")
+        _offload_score = None
+
+
 def _speak(text: str):
     """Synthesise `text` with the voice model and play it, stopping early if interrupted."""
     text = _strip_markdown(text)
     if not text or ctx is None or ctx.interrupt.is_set():
         return
-    model = ctx.voice_model  # read once, so a settings swap mid-sentence can't split it
-    if model is None:
-        log(f"voice: no model loaded, not speaking: {text[:60]}")
-        return
-    audio, voice_rate = model.synthesize(text)
+    audio, voice_rate = _synthesize(text)
     if not len(audio):
         return
     out = ctx.audio_context
@@ -2595,9 +2653,8 @@ def _speak_loop(ctx):
                     _perf_timer.lap("recorded")
                     mark("transcribe", "")
                     ring_transcribing(ctx)
-                    transcribed_request = transcribe_audio(audio_request)
-                    model = ctx.transcribe_model
-                    _perf_timer.lap(f"transcribed ({model.describe() if model else 'no model'})")
+                    transcribed_request, transcribed_by = transcribe_audio(audio_request)
+                    _perf_timer.lap(f"transcribed ({transcribed_by})")
                     mark("transcribed", transcribed_request.strip())
                 # nothing usable captured — keep listening on the remaining budget rather than dropping
                 # the turn, so a false onset or a discarded noise clip does not send us back to the wake word
@@ -2655,6 +2712,9 @@ def _start_worker():
     log("oi! worker mode!!")
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
+    global _node_name
+    _node_name = config.get("network", {}).get("name", _node_name)
+    apply_network_settings(config)
     ctx = SpeakerContext(
         system="",
         voice_model=voice.create(config, log=log),
@@ -2762,8 +2822,9 @@ def ring_llm_agent(ctx):
     _ring_call(ctx.ring.breathe, RING_COLOR_LLM, 1)
 
 
-def start():
-    """Initialise all models and devices from config.toml and launch the background threads."""
+def start(peers=None):
+    """Initialise all models and devices from config.toml and launch the background threads.
+    `peers()` lists the nodes mdns has found, for --offload to choose workers from."""
     global ctx
 
     # Derive from sys.argv directly — immune to the double-import problem where
@@ -2868,6 +2929,20 @@ def start():
     global _library
     _library = library.Library(config.get("library", {}).get("paths", []), log=log)
     _library.start()
+
+    global _node_name, _offload
+    _node_name = config.get("network", {}).get("name", _node_name)
+    apply_network_settings(config)
+    if "--offload" in sys.argv:
+        if worker_url:
+            log("--offload ignored: --worker-ip already sends everything to one worker")
+        elif peers is None:
+            log("--offload needs the web server's peer discovery, not starting it")
+        else:
+            # the models here are still loaded: they are the last fallback when every worker fails
+            _offload = offload.Offload(_node_name, offload_scores, peers, log=log)
+            _offload.start()
+            log(f"offload: on, this node scores {offload_scores()}")
 
 
 

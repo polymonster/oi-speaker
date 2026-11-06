@@ -6,6 +6,8 @@ import wave
 
 import numpy as np
 
+CONNECT_TIMEOUT = 1.5  # a worker that has gone away fails fast, not after the whole read timeout
+
 
 def option(key: str, choices, default, free_text: bool = False, depends_on: str | None = None) -> dict:
     """One setting of a backend, as the settings ui renders it."""

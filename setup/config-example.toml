@@ -1,6 +1,9 @@
 [network]
 name = "living-room"
 port = 8000
+# How fast this node is, for nodes started with --offload choosing where to send transcription and
+# speech. Leave out to derive it: 1000 for a model on a gpu, plus the number of cpu cores.
+# score = 1000
 
 [inference]
 # seconds of continuous silence that end a recording. raise it if the speaker cuts you off

@@ -80,6 +80,11 @@ def _local_ip() -> str:
         return "unknown"
 
 
+def _peer_list() -> list[dict]:
+    with _peers_lock:
+        return [dict(p) for p in _peers.values()]
+
+
 class _PeerListener:
     """AsyncServiceBrowser callback handler."""
 
@@ -132,7 +137,7 @@ async def lifespan(app: FastAPI):
     await _zeroconf.async_register_service(info)
     _browser = AsyncServiceBrowser(_zeroconf.zeroconf, _MDNS_TYPE, _PeerListener())
 
-    spk.start()
+    spk.start(peers=_peer_list)
     yield
 
     spk.shutdown()
@@ -215,6 +220,7 @@ async def update_settings(settings: dict[str, Any] = Body(...)):
     spk.apply_transcribe_settings(settings)
     spk.apply_voice_settings(settings)
     spk.apply_library_settings(settings)
+    spk.apply_network_settings(settings)
     return {"ok": True}
 
 
@@ -270,6 +276,8 @@ async def model_backends(kind: str, backend: str = ""):
         "options": options,
         "active": model.describe() if model else None,
         "worker_url": model.worker_url if model else None,
+        # under --offload, where calls go in order: the workers that outscore this node, then itself
+        "offload": spk._offload.status()[kind] if spk._offload else None,
     }
 
 
@@ -411,8 +419,15 @@ async def rpc_transcribe(audio: UploadFile = File(...)):
         import soxr
         audio_array = (soxr.resample(audio_array.astype(np.float32) / 32767.0, sr, 16000) * 32767).astype(np.int16)
     loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, spk.transcribe_audio, audio_array)
+    # this node's own model: the caller already chose us, passing it on could go round in a loop
+    text, _ = await loop.run_in_executor(None, spk.transcribe_audio, audio_array, False)
     return {"text": text.strip()}
+
+
+@app.get("/rpc/capabilities")
+async def rpc_capabilities():
+    """This node's name, models and per-service scores, polled by nodes running --offload."""
+    return spk.capabilities()
 
 
 @app.post("/rpc/speak")

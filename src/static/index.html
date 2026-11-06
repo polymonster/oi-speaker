@@ -839,6 +839,10 @@ async function renderBackends(kind, container) {
   if (info.active) {
     container.appendChild(settingRow('running', Object.assign(document.createElement('input'), { value: info.active, disabled: true })));
   }
+  if (info.offload) {
+    const order = info.offload.map(n => `${n.name} (${n.score})`).join(' → ');
+    container.appendChild(settingRow('offload', Object.assign(document.createElement('input'), { value: order, disabled: true })));
+  }
   // --worker-ip hands every request to the worker, so this box's own choice does not apply
   if (info.worker_url) return;
 

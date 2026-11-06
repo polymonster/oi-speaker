@@ -79,13 +79,7 @@ class Transcribe:
         if self.backend == "worker":
             self.log(f"delegating transcribe to worker: {self.worker_url}")
             try:
-                resp = requests.post(
-                    f"{self.worker_url}/rpc/transcribe",
-                    files={"audio": ("audio.wav", backends.wav_bytes(audio, SAMPLE_RATE), "audio/wav")},
-                    timeout=WORKER_TIMEOUT,
-                )
-                resp.raise_for_status()
-                return resp.json().get("text", "")
+                return remote(self.worker_url, audio)
             except Exception as e:
                 self.log(f"worker transcribe error: {e}")
                 return ""
@@ -123,6 +117,18 @@ class Transcribe:
                 return ""
 
         return ""
+
+
+def remote(worker_url: str, audio: np.ndarray) -> str:
+    """Have the node at `worker_url` transcribe int16 16kHz audio. Raises on any failure, so the
+    caller can tell a worker that is down from one that heard nothing."""
+    resp = requests.post(
+        f"{worker_url}/rpc/transcribe",
+        files={"audio": ("audio.wav", backends.wav_bytes(audio, SAMPLE_RATE), "audio/wav")},
+        timeout=(backends.CONNECT_TIMEOUT, WORKER_TIMEOUT),
+    )
+    resp.raise_for_status()
+    return resp.json().get("text", "")
 
 
 def _openai_models(api_key: str | None) -> list[str]:
