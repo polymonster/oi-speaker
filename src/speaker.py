@@ -11,24 +11,40 @@ import sounddevice as dev
 import numpy as np
 import time
 import math
-import faster_whisper
-import anthropic
+import random
+import itertools
 import tomllib
 import json
-import requests
 import wave
 import uvicorn
 import os
 import urllib.request
 import urllib.error
 
+# litellm fetches its model registry from github on import unless told otherwise — a network round
+# trip on every start, and a hang on a box with no route out. the bundled copy is what we want
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+import litellm
+import openai  # litellm raises openai's exception types, whichever vendor is behind the call
+import warnings
 
+# litellm stores openai responses-api usage as a plain dict (with its own cost added) where its
+# pydantic model expects ResponseAPIUsage, so every openai turn warns on serialise. harmless noise
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings", category=UserWarning)
+
+
+from datetime import datetime
 from pathlib import Path
-from piper.voice import PiperVoice
 from openwakeword.model import Model
-from faster_whisper import WhisperModel
 from dataclasses import dataclass, field
 from enum import Enum, auto
+
+import alarms
+import backends
+import library
+import offload
+import transcribe
+import voice
 
 TARGET_SAMPLE_RATE = 16000 # 16khz
 WAKE_CHUNK = 1280 # 80ms at 16khz
@@ -36,7 +52,20 @@ VAD_CHUNK = 512 # 32ms at 16kHz (Silero VAD frame size)
 VAD_ONSET_FRAMES = 3 # consecutive speech frames required before onset is accepted (~96ms)
 VAD_PREROLL_FRAMES = 10 # frames kept from before onset so the first phoneme survives (~320ms)
 VAD_MIN_SPEECH = 0.35 # a recording holding less speech than this is noise, not a request
-NO_SPEECH_PROB_LIMIT = 0.6 # whisper segments above this are hallucinations on near-silence
+ONSET_TIMEOUT = 8.0 # seconds after a wake to start speaking before the turn is dropped
+
+ACK_SOUND_DIR = "sounds/aknowledge" # one played at random as a request goes to the llm
+NUDGE_SOUND_DIR = "sounds/nudge" # one played at random when half the onset budget passes in silence
+# a request made only of these words, with at least one from STOP_CORE ("stop", "stop the alarm",
+# "ok snooze", "turn it off"), skips the acknowledgement — the silence it brings is answer enough
+STOP_CORE = {"stop", "snooze", "pause", "quiet", "shut", "enough", "off", "silence"}
+STOP_WORDS = STOP_CORE | {
+    "it", "that", "this", "the", "alarm", "alarms", "timer", "timers", "music", "song", "audio", "playing",
+    "now", "please", "up", "be", "turn", "ok", "okay", "oi", "just", "thanks", "thank", "you", "cheers", "mate",
+}
+SOUND_EXTENSIONS = (".wav", ".mp3", ".m4a", ".ogg", ".flac")
+ALARM_RING_MAX = 600.0 # a timer or alarm nobody stops gives up after this many seconds
+UNNAMED_TIMER = "timer" # what an unnamed timer is filed as, and a name the llm passes to mean none
 
 LEVEL_BUFFER_FRAMES = 2000 # ~64s at 31Hz (recording), ~160s at 12.5Hz (wake listen)
 MARKER_BUFFER_LEN = 200 # pipeline events kept alongside the level frames
@@ -47,13 +76,74 @@ PLAY_HISTORY_PATH = HISTORY_DIR / "plays.jsonl"
 HISTORY_LOAD_LIMIT = 30  # messages loaded into context on startup
 API_HISTORY_LIMIT = 20  # api-format messages kept in the rolling context window
 MAX_TOOL_ROUNDS = 8  # backstop on the agent loop so no stop_reason can spin it forever
-TERMINAL_TOOLS = ("play_url", "stop", "follow_on")  # tools that end the turn once they succeed
+TERMINAL_TOOLS = ("play_url", "play_library", "skip", "stop", "follow_on")  # tools that end the turn once they succeed
+LLM_MAX_TOKENS = 4096  # thinking shares this budget, so it needs more room than the reply
+WEB_SEARCH_RESULTS = 5  # results returned by the local web_search fallback
+VOLUME_STEPS = 16  # notches from silent to full for change_volume, as on iOS
+
+# Vendors offered in the web ui. Models are litellm "provider/model" strings. native_search means the
+# vendor's own search can run alongside our function tools — only Anthropic's can: Gemini drops
+# googleSearch when function declarations are present, and OpenAI chat models reject
+# web_search_options outright. Everyone else gets the local web_search tool instead.
+PROVIDERS = {
+    "anthropic": {
+        "label": "Anthropic",
+        "default_model": "anthropic/claude-opus-5",
+        "default_followup": "anthropic/claude-sonnet-5",
+        "needs_key": True,
+        "needs_api_base": False,
+        "native_search": True,
+    },
+    "openai": {
+        "label": "OpenAI",
+        "default_model": "openai/gpt-5.5",
+        "default_followup": "openai/gpt-5.4-mini",
+        "needs_key": True,
+        "needs_api_base": False,
+        "native_search": False,
+    },
+    "gemini": {
+        "label": "Gemini",
+        "default_model": "gemini/gemini-3.1-pro-preview",
+        "default_followup": "gemini/gemini-3.5-flash",
+        "needs_key": True,
+        "needs_api_base": False,
+        "native_search": False,
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "default_model": "openrouter/anthropic/claude-opus-5",
+        "default_followup": "openrouter/anthropic/claude-sonnet-5",
+        "needs_key": True,
+        "needs_api_base": False,
+        "native_search": False,
+    },
+    "ollama": {
+        "label": "Ollama (local)",
+        "default_model": "ollama_chat/qwen3",
+        "default_followup": "ollama_chat/qwen3",
+        "default_api_base": "http://localhost:11434",
+        "needs_key": False,
+        "needs_api_base": True,
+        "native_search": False,
+    },
+}
+DEFAULT_PROVIDER = "anthropic"
+LLM_EFFORTS = ("low", "medium", "high")
+# chat-mode registry entries that cannot hold a spoken conversation with tools
+LLM_MODEL_EXCLUDE = ("audio", "realtime", "tts", "image", "live", "transcribe", "search", "robotics", "computer-use")
 
 # YouTube rejects player clients unpredictably — one that worked an hour ago starts returning 403 —
 # so resolution tries each in turn. "" means yt-dlp's own default client chain.
 YTDLP_CLIENTS = ("tv_embedded", "", "android_vr")
 YTDLP_TIMEOUT = 60.0
 PROBE_BYTES = 2048  # a resolved URL can still 403 on first read; find out before mpv does
+# the probe is not enough — youtube serves the first small range and 403s the reads after it. so
+# play_url holds the turn until this much audio has actually played, or mpv gives up
+PLAYBACK_CONFIRM_SECONDS = 2.0
+PLAYBACK_CONFIRM_TIMEOUT = 20.0  # slow buffering is not a failure — past this, assume it is playing
+MPV_END_FILE_ERROR = 4  # mpv_end_file_reason MPV_END_FILE_REASON_ERROR
+_HTTP_ERROR = re.compile(r"HTTP error (\d{3})|(\d{3}) Forbidden")
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
@@ -89,7 +179,7 @@ TOOLS = [
     },
     {
         "name": "play_url",
-        "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions). Returns 'playing' on success, or 'playback failed: ...' when the source rejected the request — YouTube does this intermittently. On failure, call this again with the next candidate from the search results rather than reporting defeat; only tell the user if several have failed.",
+        "description": "Stream audio from a URL via mpv. Use start_time to resume from a saved position (check play history for saved positions). Returns 'playing' once audio is actually flowing, or 'playback failed: ...' when the source rejected the request — YouTube does this intermittently. On failure, call this again with the next candidate from the search results rather than reporting defeat; only tell the user if several have failed.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -107,16 +197,28 @@ TOOLS = [
     },
     {
         "name": "stop",
-        "description": "Stop any in-progress audio playback.",
+        "description": "Stop a ringing timer or alarm if there is one, otherwise any in-progress audio playback.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
-        "type": "web_search_20260209",
-        "name": "web_search"
+        "name": "skip",
+        "description": "Skip to the next track, or back to a previous one, in what is playing from the music library. For 'play something else' search again instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "steps": {"type": "integer", "description": "1 for the next track, -1 for the previous one"}
+            },
+            "required": ["steps"]
+        }
+    },
+    {
+        "name": "now_playing",
+        "description": "What is playing right now — title, artist and album where known, and how far through. Use when the user asks what this is.",
+        "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name": "set_volume",
-        "description": "Set the system output volume. Use 0 to mute, 1-100 for a percentage level.",
+        "description": "Set the system output volume to an exact percentage. Only use this when the user names a level ('volume 40', 'half volume'); for 'turn it up/down' use change_volume, for 'mute' use set_mute.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -126,15 +228,42 @@ TOOLS = [
         }
     },
     {
-        "name": "set_timer",
-        "description": "Set a named countdown timer. When it fires it plays an alarm and announces the name.",
+        "name": "change_volume",
+        "description": "Turn the volume up or down in steps, like pressing a volume button. There are 16 steps from silent to full. Use 1 or -1 for 'turn it up/down', 2-3 for 'a bit more', 4 or more for 'a lot'. Turning it up also unmutes.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "A short name for the timer, e.g. 'pasta'"},
+                "steps": {"type": "integer", "description": "Positive to turn up, negative to turn down"}
+            },
+            "required": ["steps"]
+        }
+    },
+    {
+        "name": "get_volume",
+        "description": "Read the current output volume and whether it is muted. Use when the user asks what the volume is, or before a relative change phrased as a target ('turn it up to about half').",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "set_mute",
+        "description": "Mute or unmute the output. Unmuting restores the volume it had before.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "muted": {"type": "boolean", "description": "true to mute, false to unmute"}
+            },
+            "required": ["muted"]
+        }
+    },
+    {
+        "name": "set_timer",
+        "description": "Set a countdown timer. When it fires an alarm rings until the user says stop, and a named timer is announced by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "A short name for the timer, e.g. 'pasta'. Only when the user gave one — leave it out otherwise"},
                 "seconds": {"type": "integer", "description": "Duration in seconds"}
             },
-            "required": ["name", "seconds"]
+            "required": ["seconds"]
         }
     },
     {
@@ -151,6 +280,44 @@ TOOLS = [
     {
         "name": "list_timers",
         "description": "List all active timers and their remaining time.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "set_alarm",
+        "description": "Set an alarm for a time of day, which rings until the user says stop or snooze. For 'in 20 minutes' use set_timer instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "time": {"type": "string", "description": "24 hour time, e.g. '07:00' or '18:30'"},
+                "label": {"type": "string", "description": "What it is for, e.g. 'gym'. Only when the user gave one"},
+                "days": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Days it repeats on: 'mon'..'sun', 'weekdays', 'weekends' or 'daily'. Leave out for a one-off alarm, which rings at the next occurrence of the time"
+                }
+            },
+            "required": ["time"]
+        }
+    },
+    {
+        "name": "cancel_alarm",
+        "description": "Delete an alarm, found by its time or label.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "match": {"type": "string", "description": "The alarm's 24 hour time, e.g. '07:00', or its label"}
+            },
+            "required": ["match"]
+        }
+    },
+    {
+        "name": "list_alarms",
+        "description": "List the alarms, with the current time and day.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "snooze",
+        "description": f"Snooze a ringing alarm or timer for {alarms.SNOOZE_MINUTES} minutes.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
@@ -183,6 +350,50 @@ TOOLS = [
     }
 ]
 
+# offered only when a music folder is configured, so a box without one never searches an empty library
+LIBRARY_TOOLS = [
+    {
+        "name": "search_library",
+        "description": "Search the user's own music collection on the local disk. Try this first whenever they ask to play music — it is their music, and it plays instantly and never fails like a stream can. Returns matching artists, albums, tracks, genres and folders, each with an id for play_library. Search with names only ('burial untrue', 'dub techno'), not words like 'play' or 'album'. If it has nothing suitable, use search_youtube or search_soundcloud instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Artist, album, track, genre or folder name, or a mix like 'nirvana nevermind'"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "play_library",
+        "description": "Play from the local music collection by the ids search_library returned. An artist, genre or folder id plays everything in it; an album id plays it in order. Pass several ids to queue them. Leave ids out with shuffle on to shuffle the whole collection ('play some music', 'play anything').",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "Ids from search_library, played in the order given"},
+                "shuffle": {"type": "boolean", "description": "Shuffle the tracks. Default off for an album or track, on is usual for an artist, genre or folder"}
+            }
+        }
+    },
+]
+
+# Anthropic's server-side search. Passed through litellm untouched — its own web_search_options
+# would map to an older tool version
+ANTHROPIC_WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search"}
+SERVER_TOOL_ID_PREFIX = "srvtoolu_"  # calls Anthropic ran itself, which litellm lists among ours
+
+# run by the speaker itself, for vendors with no native search that coexists with our tools
+LOCAL_WEB_SEARCH_TOOL = {
+    "name": "web_search",
+    "description": "Search the web for current information — news, weather, scores, facts you are unsure of. Returns titles, urls and snippets.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query"}
+        },
+        "required": ["query"]
+    }
+}
+
 
 class _PerfTimer:
     """Lap timer that prints interval and accumulated time at each named step."""
@@ -214,23 +425,25 @@ class SpeakerState(Enum):
 
 
 @dataclass
-class SpeakerContext:
-    llm_client: any
-    system: any  # str, or cache-controlled content blocks
-    voice_model: any
-    whisper_model: any
-    vad: any
-    output_dev_index: int
-    output_sample_rate: int
-    wake_model: any
+class AudioContext:
+    """The mic and speaker devices, at their native sample rates."""
     input_dev_index: int
     input_sample_rate: int
+    output_dev_index: int
+    output_sample_rate: int
+
+
+@dataclass
+class SpeakerContext:
+    system: str
+    voice_model: voice.Voice | None  # None when no backend is installed
+    transcribe_model: transcribe.Transcribe | None
+    vad: any
+    wake_model: any
+    audio_context: AudioContext
     worker_mode: bool = False
     worker_url: str | None = None
     ring: any = None  # XVF3800 LED ring, None on platforms/boxes without one
-    model: str = "claude-opus-5"
-    followup_model: str = "claude-opus-5"  # set equal to `model` to keep one prompt cache
-    effort: str = "low"
     wake_threshold: float = 0.4
     wake_triggers: int = 1
     speaker_state: SpeakerState = SpeakerState.LISTEN_FOR_WAKE
@@ -238,11 +451,45 @@ class SpeakerContext:
     shutdown: threading.Event = field(default_factory=threading.Event)
 
 
+@dataclass(frozen=True)
+class _LLM:
+    """The vendor, models and key in use. Replaced whole by apply_llm_settings rather than mutated,
+    so a turn already in flight finishes on the settings it started with."""
+    provider: str
+    model: str
+    followup_model: str  # set equal to `model` to keep one prompt cache
+    effort: str
+    api_key: str | None
+    api_base: str | None
+
+
+class _PlaybackWatch:
+    """One stream handed to mpv, followed from mpv's event thread so a failure has somewhere to go.
+
+    `settled` is set once the stream has either played PLAYBACK_CONFIRM_SECONDS of audio or failed
+    — play_url waits on it so a rejection reaches the agent inside the turn. A failure after that is
+    late, and is retried or reported by _on_late_playback_failure."""
+
+    def __init__(self, url: str, start_time: float, title: str | None, retry: bool = False, local: bool = False):
+        self.url = url  # what the user asked for, not the resolved stream
+        self.start_time = start_time
+        self.title = title
+        self.retry = retry  # already a second attempt — a further failure is reported, not retried
+        self.local = local  # files off the disk: mpv moves past a bad one itself, so no failure is ours to handle
+        self.first_position: float | None = None
+        self.position: float | None = None
+        self.http_error: str | None = None
+        self.failure: str | None = None
+        self.settled = threading.Event()
+        self.cancelled = False  # stopped or replaced on purpose — what mpv reports next is no failure
+
+
 class _Player:
     def __init__(self):
         self.cmd_queue: queue.Queue = queue.Queue()
         self.active: bool = False
         self.current_url: str | None = None
+        self.mpv: mpv.MPV | None = None  # the playing instance, read for now_playing — only the loop writes it
 
 
 class _Timers:
@@ -276,6 +523,114 @@ class _Timers:
     def __bool__(self):
         with self._lock:
             return bool(self._store)
+
+
+@dataclass
+class _Ring:
+    """One ringing timer or alarm: what it plays and says, and its own player, so stopping or
+    holding it cuts it off mid-ring."""
+    sound: str
+    announce: str | None  # said once, after the first time through the sound
+    snooze: bool
+    stop: threading.Event
+    player: mpv.MPV
+
+
+class _Alarms:
+    """Timers and clock alarms that have fired, each looping its sound on its own thread until
+    stopped or snoozed. Held off while the user is talking, so the alarm does not drown out the
+    request that stops it."""
+    def __init__(self):
+        self._ringing: dict[str, _Ring] = {}
+        self._lock = threading.Lock()
+        self._allowed = threading.Event()
+        self._allowed.set()
+
+    def ring(self, name: str, sound: str, announce: str | None = None, snooze: bool = True):
+        player = mpv.MPV(vid=False, terminal=False, audio_channels="mono" if _mono_output else "auto-safe")
+        ring = _Ring(sound, announce, snooze, threading.Event(), player)
+        with self._lock:
+            existing = self._ringing.pop(name, None)
+            self._ringing[name] = ring
+        if existing:
+            existing.stop.set()
+            existing.player.stop()
+        threading.Thread(target=self._ring, args=(name, ring), daemon=True).start()
+
+    def _ring(self, name: str, ring: _Ring):
+        give_up = threading.Timer(ALARM_RING_MAX, self._give_up, args=(name, ring))
+        give_up.daemon = True
+        give_up.start()
+        announce = ring.announce
+        while not ring.stop.is_set():
+            if not self._allowed.wait(timeout=0.5) or ring.stop.is_set():
+                continue
+            # once through before the announcement, then mpv loops it sample-exact until stopped.
+            # a gap between plays is the alarm stuttering, not a pause
+            ring.player.loop_file = "no" if announce else "inf"
+            ring.player.play(ring.sound)
+            if not self._allowed.is_set():  # held between the check above and the play
+                ring.player.stop()
+            ring.player.wait_for_playback()
+            if announce and not ring.stop.is_set() and self._allowed.is_set():
+                _speak(announce)
+                announce = None
+        give_up.cancel()
+        try:
+            ring.player.terminate()
+        except Exception:
+            pass
+
+    def _give_up(self, name: str, ring: _Ring):
+        with self._lock:
+            if self._ringing.get(name) is ring:
+                del self._ringing[name]
+        log(f"alarm gave up, nobody stopped it: {name}")
+        ring.stop.set()
+        ring.player.stop()
+
+    def stop(self, name: str | None = None) -> list[str]:
+        """Stop the alarm for `name`, or every alarm. Returns the names stopped."""
+        with self._lock:
+            names = [name] if name in self._ringing else [] if name else list(self._ringing)
+            stopped = [self._ringing.pop(n) for n in names]
+        for ring in stopped:
+            ring.stop.set()
+            ring.player.stop()
+        return names
+
+    def snooze(self) -> tuple[list[str], list[str]]:
+        """Stop everything ringing and ring each again in SNOOZE_MINUTES, filed with the timers so
+        it can be listed and cancelled like one. An alarm with snooze off keeps ringing. Returns
+        the names snoozed and the names that can't be."""
+        with self._lock:
+            snoozed = {n: r for n, r in self._ringing.items() if r.snooze}
+            refused = [n for n, r in self._ringing.items() if not r.snooze]
+        for name, ring in snoozed.items():
+            self.stop(name)
+            again = threading.Timer(alarms.SNOOZE_MINUTES * 60, self._unsnooze, args=(name, ring))
+            again.daemon = True
+            _timers.set(name, again, time.time() + alarms.SNOOZE_MINUTES * 60)
+            again.start()
+        return list(snoozed), refused
+
+    def _unsnooze(self, name: str, ring: _Ring):
+        _timers.remove(name)
+        self.ring(name, ring.sound, ring.announce, ring.snooze)
+
+    def hold(self):
+        self._allowed.clear()
+        with self._lock:
+            players = [ring.player for ring in self._ringing.values()]
+        for player in players:
+            player.stop()  # the loop waits at the top until release
+
+    def release(self):
+        self._allowed.set()
+
+    def keys(self):
+        with self._lock:
+            return list(self._ringing)
 
 
 class _SileroVAD:
@@ -437,17 +792,28 @@ chat_history: list[dict] = []
 # The conversation as the API sees it — content blocks, tool_use and tool_result included. Distinct
 # from chat_history, which is flattened text for the web UI and .history/chat.jsonl.
 api_messages: list[dict] = []
+_llm: _LLM | None = None
 _player = _Player()
+_context_notes: list[str] = []  # things that happened between turns, handed to the next llm turn
 _duck_volume: int = 0
 _mono_output: bool = False # downmix mpv playback to mono, for devices with a single speaker
 _silence_timeout: float = 1.6 # continuous silence that ends a recording, overridable from config
 _perf_timer = _PerfTimer()
 _timers = _Timers()
+_alarms = _Alarms()
+_clock: alarms.AlarmClock | None = None  # the saved clock alarms, built in start()
+_library: library.Library | None = None  # music on the local disk, built in start()
+_offload: offload.Offload | None = None  # faster nodes to hand transcribe and voice to, under --offload
+_node_name: str = "oi-speaker"  # [network] name, how other nodes know this one
+_offload_score: int | None = None  # [network] score set by hand, else derived from the models' devices
 _log = _Log()
 _levels = _Levels()
 _voice_probe = _VoiceProbe()
 _ring_startup_thread: threading.Thread | None = None
 _ring_startup_stop = threading.Event()
+# bumped per settings change, so only the newest background load of each model is swapped in
+_model_generations = {"transcribe_model": 0, "voice_model": 0}
+_model_lock = threading.Lock()
 
 
 def log(text: str):
@@ -551,7 +917,7 @@ def _read_audio(stream, chunk_size16: int, sample_rate: int) -> np.ndarray:
     else:
         # read the exact native span that maps onto chunk_size16 samples. reading ceil(rate/16k) * chunk
         # and truncating loses 8% of every chunk at 44.1 kHz, which both mangles the audio handed to
-        # whisper and breaks the frame continuity silero's LSTM state depends on
+        # speech to text and breaks the frame continuity silero's LSTM state depends on
         native_frames = int(round(chunk_size16 * sample_rate / TARGET_SAMPLE_RATE))
         audio, _ = stream.read(native_frames)
         flat = _resample_audio(np.squeeze(audio), sample_rate, TARGET_SAMPLE_RATE, target_length=chunk_size16)
@@ -589,10 +955,28 @@ def _vad_record(vad, stream, sample_rate: int, silence_timeout: float = 1.5) -> 
     return np.concatenate(raw_chunks)
 
 
-def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float | None = None, onset_timeout: float=8.0) -> tuple[np.ndarray | None, float]:
+def _play_nudge(stream, sample_rate: int) -> float:
+    """Prompt a user who woke the speaker but has not spoken, and return the seconds it took.
+
+    Waits for the clip to finish and then flushes the mic: a nudge is speech, and left in the buffer
+    the VAD would take it for the user's request and the speaker would transcribe itself."""
+    start = time.monotonic()
+    clip = _play_random_sound(NUDGE_SOUND_DIR)
+    if clip is None:
+        return 0.0
+    log("no speech yet, nudging")
+    mark("nudge", "")
+    clip.join()
+    _flush_stream(stream, sample_rate)
+    return time.monotonic() - start
+
+
+def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float | None = None, onset_timeout: float=8.0,
+                          nudge_after: float | None = None) -> tuple[np.ndarray | None, float]:
     """Wait for sustained speech onset then record until `silence_timeout` seconds of continuous silence.
     Returns (audio, onset_elapsed). audio is None if no speech begins within `onset_timeout` seconds, or if
-    what was captured holds too little speech to be a request."""
+    what was captured holds too little speech to be a request. If `nudge_after` seconds pass with no
+    onset, a nudge clip plays once."""
     silence_timeout = _silence_timeout if silence_timeout is None else silence_timeout
     vad.reset()  # silero is stateful — carrying the previous turn's LSTM state in skews early frames
     preroll = deque(maxlen=VAD_PREROLL_FRAMES)
@@ -624,6 +1008,13 @@ def _record_until_silence(vad, stream, sample_rate: int, silence_timeout: float 
                 log_limiter = int(onset_elapsed)
                 log(f"waiting for onset: {log_limiter}s")
             onset_elapsed += chunk_duration
+            if nudge_after is not None and onset_elapsed >= nudge_after:
+                nudge_after = None
+                onset_elapsed += _play_nudge(stream, sample_rate)
+                # start the onset search clean — nothing heard during the nudge belongs to the request
+                vad.reset()
+                preroll.clear()
+                onset_run = 0
             if onset_elapsed >= onset_timeout:
                 log("no speech detected, returning to wake listen")
                 mark("warn", f"no speech within {onset_timeout:.1f}s onset budget")
@@ -694,44 +1085,22 @@ def _write_wav(audio: np.ndarray, sample_rate: int, filepath: str, gain: float =
 
 
 
-def _transcribe_audio(whisper_model, audio: np.ndarray, worker_url: str | None = None) -> str:
-    """Transcribe int16 audio to English text using Whisper, or delegate to worker."""
-    if worker_url:
-        log(f"delegating transcribe to worker: {worker_url}")
-        import io as _io
-        buf = _io.BytesIO()
-        with wave.open(buf, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio.tobytes())
-        try:
-            resp = requests.post(
-                f"{worker_url}/rpc/transcribe",
-                files={"audio": ("audio.wav", buf.getvalue(), "audio/wav")},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            return resp.json().get("text", "")
-        except Exception as e:
-            log(f"worker transcribe error: {e}")
-            return ""
-    audio_float = audio.astype(np.float32) / 32768.0
-    segments, _ = whisper_model.transcribe(
-        audio_float,
-        language="en",
-        beam_size=1,
-        # whisper invents filler ("yeah", "bye", "thanks for watching") on near-silence, and by default
-        # feeds each turn's text forward as a prompt so one invention seeds the next
-        condition_on_previous_text=False,
-    )
-    kept = []
-    for segment in segments:
-        if segment.no_speech_prob > NO_SPEECH_PROB_LIMIT:
-            log(f"dropping hallucinated segment (no_speech={segment.no_speech_prob:.2f}): {segment.text.strip()!r}")
-            continue
-        kept.append(segment.text)
-    return " ".join(kept)
+def transcribe_audio(audio: np.ndarray, use_offload: bool = True) -> tuple[str, str]:
+    """Transcribe int16 16kHz audio on the best offload worker, falling back to whichever model is
+    loaded here — read once, so a settings change swapping the model mid-turn can't split one request
+    across two. Returns the text and what transcribed it, for the timing log. An rpc call from another
+    node passes use_offload=False, so a request is never passed along twice."""
+    if use_offload and _offload is not None:
+        for url in _offload.candidates("transcribe"):
+            try:
+                return transcribe.remote(url, audio), f"offload {_offload.name_of(url)}"
+            except Exception as e:
+                _offload.failed(url, e)
+    model = ctx.transcribe_model if ctx else None
+    if model is None:
+        log("transcribe: no model loaded, dropping request")
+        return "", "no model"
+    return model.transcribe(audio), model.describe()
 
 
 def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState | None]:
@@ -740,13 +1109,28 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
         return search_youtube(tool_input["query"]), None
     elif tool_name == "search_soundcloud":
         return search_soundcloud(tool_input["query"]), None
+    elif tool_name == "web_search":
+        return web_search(tool_input["query"]), None
     elif tool_name == "play_url":
         result = play_url(tool_input["url"], tool_input.get("headers"), tool_input.get("start_time", 0.0), tool_input.get("title"))
         if result != "playing":
             # Returning no state keeps the turn alive so the agent can try another candidate.
             return f"playback failed: {result}", None
         return "playing", SpeakerState.RESET
+    elif tool_name == "search_library":
+        return search_library(tool_input["query"]), None
+    elif tool_name == "play_library":
+        result = play_library(tool_input.get("ids") or [], bool(tool_input.get("shuffle", False)))
+        return result, SpeakerState.RESET if result.startswith("playing") else None
+    elif tool_name == "skip":
+        return skip(int(tool_input.get("steps", 1))), SpeakerState.RESET
+    elif tool_name == "now_playing":
+        return now_playing(), None
     elif tool_name == "stop":
+        # a ringing alarm is what "stop" means while there is one — the music carries on under it
+        ringing = _alarms.stop()
+        if ringing:
+            return f"stopped alarm: {', '.join(ringing)}", SpeakerState.RESET
         active_timers = _timers.keys()
         if active_timers:
             for name in active_timers:
@@ -760,12 +1144,32 @@ def _execute_tool(tool_name: str, tool_input: dict) -> tuple[str, SpeakerState |
         return "listening", SpeakerState.RECORDING
     elif tool_name == "set_volume":
         return set_volume(tool_input["level"]), None
+    elif tool_name == "change_volume":
+        return change_volume(tool_input["steps"]), None
+    elif tool_name == "set_mute":
+        return set_mute(tool_input["muted"]), None
+    elif tool_name == "get_volume":
+        return get_volume(), None
     elif tool_name == "set_timer":
-        return set_timer(tool_input["name"], tool_input["seconds"]), None
+        return set_timer(tool_input.get("name", ""), tool_input["seconds"]), None
     elif tool_name == "cancel_timer":
         return cancel_timer(tool_input["name"]), None
     elif tool_name == "list_timers":
         return list_timers(), None
+    elif tool_name == "set_alarm":
+        return set_alarm(tool_input["time"], tool_input.get("label", ""), tool_input.get("days")), None
+    elif tool_name == "cancel_alarm":
+        return cancel_alarm(tool_input["match"]), None
+    elif tool_name == "list_alarms":
+        return list_alarms(), None
+    elif tool_name == "snooze":
+        snoozed, refused = _alarms.snooze()
+        if not snoozed and not refused:
+            return "nothing is ringing", None
+        result = f"snoozed for {alarms.SNOOZE_MINUTES} minutes: {', '.join(snoozed)}" if snoozed else ""
+        if refused:
+            result += f"{'; ' if result else ''}snooze is off for {', '.join(refused)}, still ringing — tell the user to say stop"
+        return result, SpeakerState.RESET if snoozed and not refused else None
     elif tool_name == "get_history":
         return get_history(tool_input["type"], tool_input.get("limit", 20)), None
     elif tool_name == "update":
@@ -802,8 +1206,88 @@ def _trim_api_messages():
     # No safe cut point in the window — the tail is one long tool exchange, so keep it whole.
 
 
-def query_llm(llm_client, system, text: str, mic_stream=None, followup: bool = False) -> SpeakerState:
-    """Send `text` to the LLM, stream TTS as sentences arrive, handle tool calls, and return the next state."""
+def _to_openai_tool(tool: dict) -> dict:
+    """Wrap one of our tool definitions in the OpenAI function shape litellm takes."""
+    return {
+        "type": "function",
+        "function": {"name": tool["name"], "description": tool["description"], "parameters": tool["input_schema"]},
+    }
+
+
+def _model_supports(check, model: str) -> bool:
+    """Ask litellm's registry about a capability. A model it has never heard of — any local ollama
+    model — can raise rather than answer, and that is a no."""
+    try:
+        return bool(check(model=model))
+    except Exception:
+        return False
+
+
+def _llm_request(llm: _LLM, model: str, system: str, messages: list[dict]) -> dict:
+    """Arguments for one streamed completion, shaped for the vendor in `llm`."""
+    tools = [_to_openai_tool(t) for t in TOOLS]
+    if _library is not None and _library.roots:
+        tools += [_to_openai_tool(t) for t in LIBRARY_TOOLS]
+    if PROVIDERS.get(llm.provider, {}).get("native_search"):
+        tools.append(ANTHROPIC_WEB_SEARCH_TOOL)
+    else:
+        tools.append(_to_openai_tool(LOCAL_WEB_SEARCH_TOOL))
+    # the vendor and model change from settings, so the model cannot know which one it is unless told.
+    # prompt caches are per model anyway, so naming it here never splits a cache
+    system = (f"{system}\n\n# About you\n\nYou are running on the {model.split('/')[-1]} model from "
+              f"{PROVIDERS.get(llm.provider, {}).get('label', llm.provider)}. If asked which model or AI "
+              f"you are, say so plainly, reading the name the way a person would.")
+    if llm.provider == "anthropic":
+        # Tools render before system, so one breakpoint here caches the whole stable prefix. Everything
+        # that varies per turn lives in messages, after it. Other vendors cache prefixes unprompted
+        system_content = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+    else:
+        system_content = system
+    request = {
+        "model": model,
+        "messages": [{"role": "system", "content": system_content}, *messages],
+        "tools": tools,
+        "max_tokens": LLM_MAX_TOKENS,
+        "api_key": llm.api_key,
+        "api_base": llm.api_base,
+        "stream": True,
+        # a param one vendor lacks is dropped rather than failing the turn
+        "drop_params": True,
+    }
+    if _model_supports(litellm.supports_reasoning, model):
+        # Thinking stays ON deliberately. Disabling it on Opus 5 can make the model write a tool call
+        # as plain text instead of a tool_use block — the turn looks fine and the call silently never
+        # runs. effort=low buys the latency back safely. On Anthropic litellm maps this to adaptive
+        # thinking plus output_config.effort
+        request["reasoning_effort"] = llm.effort
+    return request
+
+
+def _assistant_message(message) -> dict:
+    """The assistant turn as it goes back into history. thinking_blocks and provider_specific_fields
+    carry what a vendor needs replayed alongside a tool call — Anthropic's thinking signatures,
+    Gemini's thought signatures — so they stay. reasoning_content is display text, and strict
+    openai-compatible endpoints reject it on the way back in."""
+    entry = {"role": "assistant", "content": message.content or None}
+    dumped = message.model_dump(exclude_none=True)
+    for key in ("tool_calls", "thinking_blocks", "provider_specific_fields"):
+        if dumped.get(key):
+            entry[key] = dumped[key]
+    return entry
+
+
+def _parse_tool_input(arguments: str | None) -> dict | None:
+    """Tool call arguments arrive as a JSON string. Smaller models get it wrong now and then."""
+    try:
+        parsed = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def query_llm(text: str, mic_stream=None, followup: bool = False, speak_after: threading.Thread | None = None) -> SpeakerState:
+    """Send `text` to the LLM, stream TTS as sentences arrive, handle tool calls, and return the next state.
+    Speech waits for `speak_after` (the acknowledge clip) to finish, so a quick reply does not talk over it."""
     ctx.interrupt.clear()
 
     _history_start = len(chat_history)
@@ -813,7 +1297,7 @@ def query_llm(llm_client, system, text: str, mic_stream=None, followup: bool = F
         ctx.wake_model.reset()  # clear residual activation from the wake that triggered this session
         wake_thread = threading.Thread(
             target=_interrupt_wake_listen,
-            args=(ctx.wake_model, mic_stream, ctx.input_sample_rate, stop_flag, ctx.interrupt, ctx.wake_threshold, ctx.wake_triggers),
+            args=(ctx.wake_model, mic_stream, ctx.audio_context.input_sample_rate, stop_flag, ctx.interrupt, ctx.wake_threshold, ctx.wake_triggers),
             daemon=True
         )
         wake_thread.start()
@@ -827,8 +1311,10 @@ def query_llm(llm_client, system, text: str, mic_stream=None, followup: bool = F
             if sentence is None:
                 tts_queue.task_done()
                 break
+            if speak_after is not None:
+                speak_after.join()
             if not ctx.interrupt.is_set():
-                _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model, sentence)
+                _speak(sentence)
             tts_queue.task_done()
 
     tts_thread = threading.Thread(target=_tts_worker, daemon=True)
@@ -862,31 +1348,31 @@ def query_llm(llm_client, system, text: str, mic_stream=None, followup: bool = F
         # The rolling conversation is the whole point: without it the model cannot resolve "that one"
         # or remember the search results it just described.
         _trim_api_messages()
+        if _context_notes:
+            # events from between turns ride on the user's message — no turn of their own to sit in
+            notes = "\n".join(f"[{note}]" for note in _context_notes)
+            _context_notes.clear()
+            text = f"{notes}\n{text}"
         api_messages.append({"role": "user", "content": text})
         messages = api_messages
-        model = ctx.followup_model if followup else ctx.model
+        llm = _llm  # held for the whole turn, so a settings save mid-turn cannot split it across vendors
+        model = llm.followup_model if followup else llm.model
         next_state = SpeakerState.RESET
 
         for _round in range(MAX_TOOL_ROUNDS):
             accumulated_text = ""
             sentence_buffer = ""
             _live_entry = None  # mutable chat_history entry updated live during streaming
+            chunks = []
 
-            with llm_client.messages.stream(
-                model=model,
-                max_tokens=4096,  # thinking shares this budget, so it needs more room than the reply
-                # Adaptive thinking stays ON deliberately. Disabling it on Opus 5 can make the model
-                # write a tool call as plain text instead of a tool_use block — the turn looks fine
-                # and the call silently never runs. effort=low buys the latency back safely.
-                thinking={"type": "adaptive"},
-                output_config={"effort": ctx.effort},
-                system=system,
-                tools=TOOLS,
-                messages=messages
-            ) as stream:
-                for delta in stream.text_stream:
+            try:
+                for chunk in litellm.completion(**_llm_request(llm, model, ctx.system, messages)):
                     if ctx.interrupt.is_set():
                         break
+                    chunks.append(chunk)
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                    if not delta:
+                        continue
                     sentence_buffer += delta
                     accumulated_text += delta
                     # Update chat_history live so web UI polls see the response during TTS
@@ -899,80 +1385,97 @@ def query_llm(llm_client, system, text: str, mic_stream=None, followup: bool = F
                     for s in sentences:
                         if s.strip():
                             tts_queue.put(s)
-
-                if ctx.interrupt.is_set():
-                    _discard_tts()
-                    _record_partial(accumulated_text)
-                    return SpeakerState.RECORDING
-
-                if sentence_buffer.strip():
-                    tts_queue.put(sentence_buffer)
-
-                # Wait for all queued sentences to finish playing before acting on stop_reason
-                tts_queue.join()
-
-                if ctx.interrupt.is_set():
-                    _record_partial(accumulated_text)
-                    return SpeakerState.RECORDING
-
-                final_message = stream.get_final_message()
-
-            if final_message.stop_reason == "end_turn":
-                # Remove live entry if nothing was streamed
-                if _live_entry is not None and not accumulated_text.strip():
-                    chat_history.remove(_live_entry)
-                messages.append({"role": "assistant", "content": final_message.content})
+            except openai.APIError as e:
+                # litellm raises openai's exception types whatever the vendor. Without this a bad key
+                # or a retired model kills the speak loop, and the speaker goes deaf until a restart
+                log(f"llm error: {type(e).__name__}: {e}")
+                _discard_tts()
+                if isinstance(e, (openai.AuthenticationError, openai.PermissionDeniedError)):
+                    _speak_now("I can't reach the language model. Check the API key in settings.")
+                elif isinstance(e, openai.NotFoundError):
+                    _speak_now("The language model in settings wasn't found.")
+                else:
+                    _speak_now("Sorry, I couldn't reach the language model.")
                 return next_state
 
-            if final_message.stop_reason == "pause_turn":
-                # server-side tool (web search) hit iteration limit — re-send to continue
-                messages.append({"role": "assistant", "content": final_message.content})
-                continue
+            if ctx.interrupt.is_set():
+                _discard_tts()
+                _record_partial(accumulated_text)
+                return SpeakerState.RECORDING
 
-            if final_message.stop_reason == "tool_use":
-                if _live_entry is not None and not accumulated_text.strip():
-                    chat_history.remove(_live_entry)
-                messages.append({"role": "assistant", "content": final_message.content})
-                tool_results = []
+            if sentence_buffer.strip():
+                tts_queue.put(sentence_buffer)
+
+            # Wait for all queued sentences to finish playing before acting on finish_reason
+            tts_queue.join()
+
+            if ctx.interrupt.is_set():
+                _record_partial(accumulated_text)
+                return SpeakerState.RECORDING
+
+            response = litellm.stream_chunk_builder(chunks) if chunks else None
+            if response is None:
+                log("llm returned an empty stream")
+                return next_state
+            choice = response.choices[0]
+            message = choice.message
+            if _live_entry is not None and not accumulated_text.strip():
+                chat_history.remove(_live_entry)
+
+            if choice.finish_reason == "length":
+                # Checked before tool calls: a truncated call has truncated arguments, and replaying a
+                # call with no result alongside it gets the next request rejected.
+                log("llm hit max_tokens")
+                _record_partial(accumulated_text)
+                _speak_now("Sorry, I lost my thread there.")
+                return next_state
+
+            # Anthropic's web search (and the code execution it filters results with) already ran
+            # server-side — litellm reports those as tool calls too, but answering one is rejected.
+            # They stay in the assistant message, which litellm replays with their results.
+            client_calls = [c for c in message.tool_calls or [] if not c.id.startswith(SERVER_TOOL_ID_PREFIX)]
+
+            # Keyed on the calls rather than finish_reason — ollama and some gemini models report
+            # "stop" on a turn that carries tool calls.
+            if client_calls:
+                messages.append(_assistant_message(message))
                 terminal = False
-                for block in final_message.content:
-                    if block.type == "tool_use":
-                        log(f"\ttool: {block.name} {block.input}")
-                        _perf_timer.lap(block.name, indent="\t")
-                        result, state = _execute_tool(block.name, block.input)
-                        if state is not None:
-                            next_state = state
-                            # A terminal tool only ends the turn if it actually worked — a failed
-                            # play_url returns no state, so the agent gets a round to try another.
-                            terminal = terminal or block.name in TERMINAL_TOOLS
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result
-                        })
-                messages.append({"role": "user", "content": tool_results})
+                for call in client_calls:
+                    tool_input = _parse_tool_input(call.function.arguments)
+                    log(f"\ttool: {call.function.name} {tool_input}")
+                    _perf_timer.lap(call.function.name, indent="\t")
+                    if tool_input is None:
+                        result, state = "invalid arguments: expected a JSON object", None
+                    else:
+                        try:
+                            result, state = _execute_tool(call.function.name, tool_input)
+                        except (KeyError, TypeError) as e:
+                            result, state = f"invalid arguments: {e}", None
+                    if state is not None:
+                        next_state = state
+                        # A terminal tool only ends the turn if it actually worked — a failed
+                        # play_url returns no state, so the agent gets a round to try another.
+                        terminal = terminal or call.function.name in TERMINAL_TOOLS
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
 
                 # Terminal actions don't need another LLM round-trip
                 if terminal:
                     return next_state
                 continue
 
-            # Anything else must return. Falling through the loop re-sends an identical request and
-            # gets an identical answer, so an unhandled stop_reason is an infinite spin.
-            if _live_entry is not None and not accumulated_text.strip():
-                chat_history.remove(_live_entry)
-            if final_message.stop_reason == "refusal":
+            if choice.finish_reason == "content_filter":
                 log("llm refused the request")
-                # A refusal carries no usable content, so stand the spoken line in as the turn —
-                # an empty assistant message would be rejected on the next request.
+                # A refusal carries no usable content, so stand the spoken line in as the turn.
                 _speak_now("Sorry, I can't help with that one.")
                 api_messages.append({"role": "assistant", "content": "Sorry, I can't help with that one."})
-            elif final_message.stop_reason == "max_tokens":
-                log("llm hit max_tokens")
-                messages.append({"role": "assistant", "content": final_message.content})
-                _speak_now("Sorry, I lost my thread there.")
-            else:
-                log(f"unexpected stop_reason: {final_message.stop_reason}")
+                return next_state
+
+            if choice.finish_reason != "stop":
+                log(f"unexpected finish_reason: {choice.finish_reason}")
+            # A turn with nothing in it (thinking alone) stays out of history — an empty assistant
+            # message is rejected on the next request.
+            if message.content or message.tool_calls or getattr(message, "thinking_blocks", None):
+                messages.append(_assistant_message(message))
             return next_state
 
         log(f"tool loop hit {MAX_TOOL_ROUNDS} rounds, giving up")
@@ -1011,55 +1514,73 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _speak(dev, dev_index, sample_rate, voice_model, text: str):
-    """Synthesise `text` to audio and play it, stopping early if interrupted."""
+def _synthesize(text: str) -> tuple[np.ndarray, int]:
+    """`text` as int16 audio and its rate, from the best offload worker or else the voice model here."""
+    if _offload is not None:
+        for url in _offload.candidates("voice"):
+            try:
+                return voice.remote(url, text)
+            except Exception as e:
+                _offload.failed(url, e)
+    model = ctx.voice_model  # read once, so a settings swap mid-sentence can't split it
+    if model is None:
+        log(f"voice: no model loaded, not speaking: {text[:60]}")
+        return np.array([], dtype=np.int16), TARGET_SAMPLE_RATE
+    return model.synthesize(text)
+
+
+def offload_scores() -> dict[str, int]:
+    """How fast this node is at each service, for nodes choosing where to offload: 0 for a service
+    it cannot serve itself (no model, or a --worker-ip satellite's borrowed one)."""
+    scores = {}
+    for service, attr in (("transcribe", "transcribe_model"), ("voice", "voice_model")):
+        model = getattr(ctx, attr) if ctx else None
+        if model is None or model.backend == "worker":
+            scores[service] = 0
+        elif _offload_score is not None:
+            scores[service] = _offload_score
+        else:
+            scores[service] = offload.derive_score(model.options.get("device", "cpu"))
+    return scores
+
+
+def capabilities() -> dict:
+    """What /rpc/capabilities tells the nodes polling it."""
+    out = {"name": _node_name, "scores": offload_scores()}
+    for service, attr in (("transcribe", "transcribe_model"), ("voice", "voice_model")):
+        model = getattr(ctx, attr) if ctx else None
+        out[service] = model.describe() if model else None
+    return out
+
+
+def apply_network_settings(config: dict):
+    """Take up a [network] score changed in settings; polling nodes see it on their next poll."""
+    global _offload_score
+    score = config.get("network", {}).get("score")
+    try:
+        _offload_score = int(score) if score not in (None, "") else None
+    except (TypeError, ValueError):
+        log(f"network: score '{score}' is not a number, deriving it instead")
+        _offload_score = None
+
+
+def _speak(text: str):
+    """Synthesise `text` with the voice model and play it, stopping early if interrupted."""
     text = _strip_markdown(text)
-    if not text:
+    if not text or ctx is None or ctx.interrupt.is_set():
         return
-    if ctx is not None and ctx.interrupt.is_set():
+    audio, voice_rate = _synthesize(text)
+    if not len(audio):
         return
-    worker_url = ctx.worker_url if ctx else None
-    if worker_url:
-        log(f"delegating speak to worker: {worker_url} — {text[:60]}")
-        import io as _io
-        try:
-            resp = requests.post(
-                f"{worker_url}/rpc/speak",
-                json={"text": text},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            buf = _io.BytesIO(resp.content)
-            with wave.open(buf, 'rb') as wf:
-                sr = wf.getframerate()
-                raw = wf.readframes(wf.getnframes())
-            audio_int16 = np.frombuffer(raw, dtype=np.int16)
-        except Exception as e:
-            log(f"worker speak error: {e}")
+    out = ctx.audio_context
+    resampled = _resample_audio(audio, voice_rate, out.output_sample_rate)
+    dev.play(resampled, samplerate=out.output_sample_rate, device=out.output_dev_index)
+    done = threading.Event()
+    threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
+    while not done.wait(timeout=0.05):
+        if ctx.interrupt.is_set():
+            dev.stop()
             return
-        resampled = _resample_audio(audio_int16, sr, sample_rate)
-        dev.play(resampled, samplerate=sample_rate, device=dev_index)
-        done = threading.Event()
-        threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
-        while not done.wait(timeout=0.05):
-            if ctx is not None and ctx.interrupt.is_set():
-                dev.stop()
-                return
-        return
-    chunks = []
-    for audio_chunk in voice_model.synthesize(text):
-        int_data = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
-        chunks.append(int_data)
-    if chunks:
-        full_audio = np.concatenate(chunks)
-        resampled = _resample_audio(full_audio, voice_model.config.sample_rate, sample_rate)
-        dev.play(resampled, samplerate=sample_rate, device=dev_index)
-        done = threading.Event()
-        threading.Thread(target=lambda: (dev.wait(), done.set()), daemon=True).start()
-        while not done.wait(timeout=0.05):
-            if ctx is not None and ctx.interrupt.is_set():
-                dev.stop()
-                return
 
 
 def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag: threading.Event, interrupt: threading.Event,
@@ -1079,21 +1600,97 @@ def _interrupt_wake_listen(wake_model, stream, input_sample_rate: int, stop_flag
                 return
 
 
+def _watch_mpv_log(watch: _PlaybackWatch, level: str, component: str, message: str):
+    print(f"[mpv/{component}] {level}: {message}")
+    match = _HTTP_ERROR.search(message)
+    if match:
+        watch.http_error = f"HTTP {match.group(1) or match.group(2)}"
+
+
+def _watch_position(watch: _PlaybackWatch, position: float | None):
+    if position is None or watch.cancelled:
+        return
+    if watch.first_position is None:
+        watch.first_position = position
+    watch.position = position
+    if position - watch.first_position >= PLAYBACK_CONFIRM_SECONDS:
+        watch.settled.set()
+
+
+def _watch_end_file(watch: _PlaybackWatch, event):
+    """mpv finished the file. A failure if mpv says so, or if an HTTP error was logged on the way —
+    a stream cut off by a 403 often ends as a plain EOF, so the reason alone misses it."""
+    if watch.cancelled or watch.local:
+        return
+    data = getattr(event, "data", None)
+    reason = getattr(data, "reason", None)
+    if reason is None and isinstance(event, dict):  # python-mpv before 1.0 hands over a dict
+        reason = event.get("event", {}).get("reason")
+    if reason not in (MPV_END_FILE_ERROR, "error") and not watch.http_error:
+        return  # the track simply ended
+    watch.failure = watch.http_error or "the stream stopped with an error"
+    if watch.settled.is_set():
+        threading.Thread(target=_on_late_playback_failure, args=(watch,), daemon=True).start()
+    else:
+        watch.settled.set()  # play_url is still waiting, and will report it to the agent
+
+
+def _describe_failure(reason: str) -> str:
+    if "403" in reason:
+        return "the source refused the stream"
+    return reason
+
+
+def _on_late_playback_failure(watch: _PlaybackWatch):
+    """A stream that started fine and died later — after the turn that started it had ended, so no
+    agent is waiting to hear about it. Try once more from where it stopped (a fresh resolve usually
+    gets a URL that works), and if that fails too, say so rather than leave the room in silence."""
+    position = watch.position or watch.start_time
+    log(f"playback of {watch.url} failed at {position:.0f}s: {watch.failure}")
+    if not watch.retry:
+        log("retrying playback from the same position")
+        result = _play(watch.url, None, position, watch.title, retry=True)
+        if result == "playing":
+            return
+        watch.failure = result
+    _report_playback_failure(watch.title or "that track", _describe_failure(watch.failure))
+
+
+def _report_playback_failure(title: str, reason: str):
+    line = f"Sorry, {title} stopped playing. {reason[0].upper()}{reason[1:]}."
+    # into the next turn's context, so "try another one" or "what happened" makes sense to the llm
+    _context_notes.append(f"Playback of '{title}' failed after it had started: {reason}. The user was told.")
+    entry = {"role": "assistant", "text": line}
+    chat_history.append(entry)
+    _save_history(CHAT_HISTORY_PATH, entry)
+    # only speak into an idle room — mid-turn, the note above carries it instead
+    if ctx is not None and ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
+        _speak(line)
+    else:
+        log(f"not speaking playback failure mid-turn: {line}")
+
+
 def _player_loop():
     """Background thread: consume commands from `_player.cmd_queue` and drive the mpv player."""
     log("oi!! player! loop!!")
 
     player: mpv.MPV | None = None
     cleanup_dir: str | None = None
+    watch: _PlaybackWatch | None = None
 
     def _stop():
-        nonlocal player, cleanup_dir
+        nonlocal player, cleanup_dir, watch
+        if watch is not None:
+            watch.cancelled = True  # terminating mpv ends the file — that is not a failure
+            watch.settled.set()
+            watch = None
         if player is not None:
             try:
                 player.terminate()
             except Exception:
                 pass
             player = None
+            _player.mpv = None
             _player.current_url = None
         if cleanup_dir is not None:
             try:
@@ -1112,8 +1709,12 @@ def _player_loop():
 
         if cmd == 'play':
             _stop()
-            url, headers, start_time, original_url = args[0], args[1], args[2], args[3]
-            log(f"play_url: {url[:80]}...")
+            url, headers, start_time, original_url, watch = args[0], args[1], args[2], args[3], args[4]
+            # a list is a playlist off the disk: the first plays now, the rest queue behind it
+            urls = url if isinstance(url, list) else [url]
+            url = urls[0]
+            log(f"play_url: {url[:80]}..." + (f" (+{len(urls) - 1} queued)" if len(urls) > 1 else ""))
+            current = watch  # bound now — the callbacks must not see a later play's watch
             player = mpv.MPV(vid=False, terminal=False,
                              user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                              cache=True,
@@ -1121,14 +1722,19 @@ def _player_loop():
                              audio_buffer=2,
                              demuxer_max_bytes="50MiB",
                              audio_channels="mono" if _mono_output else "auto-safe",
-                             log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
+                             log_handler=lambda level, component, message: _watch_mpv_log(current, level, component, message),
                              loglevel="warn")
+            player.observe_property("time-pos", lambda _name, value: _watch_position(current, value))
+            player.event_callback("end-file")(lambda event: _watch_end_file(current, event))
             if headers:
                 for header in headers:
                     player.command("change-list", "http-header-fields", "append", header)
             if start_time:
                 player['start'] = str(int(start_time))
             player.play(url)
+            for queued in urls[1:]:
+                player.playlist_append(queued)
+            _player.mpv = player
             _player.current_url = original_url
             _player.active = True
 
@@ -1141,10 +1747,19 @@ def _player_loop():
                              log_handler=lambda level, component, message: print(f"[mpv/{component}] {level}: {message}"),
                              loglevel="warn")
             player.play(path)
+            _player.mpv = player
             _player.active = True
 
         elif cmd == 'stop':
             _stop()
+
+        elif cmd == 'skip':
+            if player is not None:
+                try:
+                    for _ in range(abs(args[0])):
+                        player.command("playlist-next" if args[0] > 0 else "playlist-prev")
+                except Exception:
+                    pass  # mpv refuses to step past either end of the playlist
 
         elif cmd == 'pause':
             if player is not None:
@@ -1242,7 +1857,7 @@ def _resolve_youtube_stream(url: str) -> tuple[str, str, str]:
     return "", "", "; ".join(problems)
 
 
-def _resolve_soundcloud_and_play(url: str, start_time: float = 0.0, title: str | None = None) -> str:
+def _resolve_soundcloud_and_play(url: str, start_time: float, watch: _PlaybackWatch) -> str:
     """Resolve a SoundCloud URL and enqueue it for playback. Returns "" on success, else the reason.
 
     No player-client fallback here — that is a YouTube concept, and SoundCloud needs no API key:
@@ -1259,32 +1874,26 @@ def _resolve_soundcloud_and_play(url: str, start_time: float = 0.0, title: str |
         return error
     lines = result.stdout.strip().splitlines()
     stream_url = lines[0]
-    if title is None and len(lines) > 1:
-        title = lines[1]
-    entry: dict = {"url": url, "start_time": start_time}
-    if title:
-        entry["title"] = title
-    _save_history(PLAY_HISTORY_PATH, entry)
+    if watch.title is None and len(lines) > 1:
+        watch.title = lines[1]
+    _save_play_history(url, start_time, watch.title)
     log(f"streaming: {stream_url[:80]}...")
-    _player.cmd_queue.put(('play', stream_url, None, start_time, url))
+    _player.cmd_queue.put(('play', stream_url, None, start_time, url, watch))
     return ""
 
 
-def _resolve_youtube_and_play(url: str, start_time: float = 0.0, title: str | None = None) -> str:
+def _resolve_youtube_and_play(url: str, start_time: float, watch: _PlaybackWatch) -> str:
     """Resolve a YouTube URL and enqueue it for playback. Returns "" on success, else the reason."""
     log("resolving youtube stream url...")
     stream_url, resolved_title, error = _resolve_youtube_stream(url)
     if error:
         log(f"yt-dlp could not resolve {url}: {error}")
         return error
-    if title is None and resolved_title:
-        title = resolved_title
-    entry: dict = {"url": url, "start_time": start_time}
-    if title:
-        entry["title"] = title
-    _save_history(PLAY_HISTORY_PATH, entry)
+    if watch.title is None and resolved_title:
+        watch.title = resolved_title
+    _save_play_history(url, start_time, watch.title)
     log(f"streaming: {stream_url[:80]}...")
-    _player.cmd_queue.put(('play', stream_url, None, start_time, url))
+    _player.cmd_queue.put(('play', stream_url, None, start_time, url, watch))
     return ""
 
 
@@ -1307,8 +1916,9 @@ def _download_youtube_and_play(url: str):
     _player.cmd_queue.put(('play_file', audio_file, tmpdir))
 
 
-def _play_oneshot_audio_file(path: str):
-    """Play a local audio file once in a background thread without affecting the main player."""
+def _play_oneshot_audio_file(path: str) -> threading.Thread:
+    """Play a local audio file once in a background thread without affecting the main player.
+    Returns the thread, so a caller that must not talk over it can join it."""
     def _run():
         player = mpv.MPV(vid=False, terminal=False,
                          audio_channels="mono" if _mono_output else "auto-safe")
@@ -1318,7 +1928,21 @@ def _play_oneshot_audio_file(path: str):
             player.terminate()
         except Exception:
             pass
-    threading.Thread(target=_run, daemon=True).start()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return thread
+
+
+def _play_random_sound(directory: str) -> threading.Thread | None:
+    """Play one audio file picked at random from `directory`. Read on every call, so clips can be
+    added or removed without a restart. None if the directory is missing or holds no audio."""
+    try:
+        clips = [f for f in os.listdir(directory) if f.lower().endswith(SOUND_EXTENSIONS)]
+    except FileNotFoundError:
+        return None
+    if not clips:
+        return None
+    return _play_oneshot_audio_file(os.path.join(directory, clips[random.randrange(len(clips))]))
 
 
 def stop_playback():
@@ -1355,6 +1979,146 @@ def apply_audio_settings(config: dict):
     log(f"audio settings applied — duck_volume={_duck_volume} mono_output={_mono_output}")
 
 
+def llm_key_paths() -> list[str]:
+    """Config paths of every vendor key, for the confidential list the web ui masks."""
+    return [f"llm.keys.{name}" for name, spec in PROVIDERS.items() if spec["needs_key"]]
+
+
+def migrate_llm_config(config: dict) -> dict:
+    """Bring an [llm] block from before vendor choice up to date, in place: the lone anthropic key
+    moves under [llm.keys] and bare claude model names gain their vendor prefix. Idempotent, so it
+    runs on every load rather than rewriting anyone's config file. Returns `config`."""
+    llm_cfg = config.setdefault("llm", {})
+    keys = llm_cfg.setdefault("keys", {})
+    legacy_key = llm_cfg.pop("anthropic_api_key", None)
+    if legacy_key and not keys.get("anthropic"):
+        keys["anthropic"] = legacy_key
+    for name, spec in PROVIDERS.items():
+        if spec["needs_key"]:
+            keys.setdefault(name, "")
+    llm_cfg.setdefault("provider", DEFAULT_PROVIDER)
+    for field_name in ("model", "followup_model"):
+        model = llm_cfg.get(field_name, "")
+        if model.startswith("claude-"):
+            llm_cfg[field_name] = f"anthropic/{model}"
+    # an existing confidential list only names the old key — without this the new ones show in clear
+    confidential = config.setdefault("meta", {}).setdefault("confidential", [])
+    if "llm.anthropic_api_key" in confidential:
+        confidential.remove("llm.anthropic_api_key")
+    for path in llm_key_paths():
+        if path not in confidential:
+            confidential.append(path)
+    return config
+
+
+def apply_llm_settings(config: dict):
+    """Apply the [llm] settings, so a vendor, model or key change takes effect without a restart."""
+    global _llm
+    llm_cfg = migrate_llm_config(config)["llm"]
+    provider = llm_cfg["provider"]
+    spec = PROVIDERS.get(provider, {})  # any other litellm provider works from config alone
+    model = llm_cfg.get("model") or spec.get("default_model")
+    if not model:
+        log(f"llm settings: no model set for provider '{provider}'")
+        return
+    previous = _llm
+    _llm = _LLM(
+        provider=provider,
+        model=model,
+        followup_model=llm_cfg.get("followup_model") or model,
+        effort=llm_cfg.get("effort", "low"),
+        # empty falls through to litellm's own env lookup (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...)
+        api_key=llm_cfg["keys"].get(provider) or None,
+        api_base=llm_cfg.get("api_base") or spec.get("default_api_base"),
+    )
+    if previous is not None and previous.provider != provider and api_messages:
+        # another vendor cannot read this one's thinking blocks or tool call ids
+        api_messages.clear()
+        log("llm vendor changed — conversation context cleared")
+    log(f"llm settings applied — provider={provider} model={_llm.model} followup_model={_llm.followup_model} effort={_llm.effort}")
+
+
+def _apply_model_settings(attr: str, kind: str, module, model_class, config: dict):
+    """Swap ctx.<attr> for the model config asks for, without a restart. Loading a model takes
+    seconds, so the new one loads on its own thread and the running one keeps serving until it is
+    ready."""
+    current = getattr(ctx, attr) if ctx else None
+    if ctx is None or (current is not None and current.backend == "worker"):
+        return  # --worker-ip decides this node's model, not config
+    backend, options = module.settings_from_config(config, log)
+    if backend is None:
+        return
+    api_key = backends.openai_key(config) if backend == "openai" else None
+    if current is not None and current.signature == backends.signature(backend, options, api_key, None):
+        return
+    with _model_lock:
+        _model_generations[attr] += 1
+        generation = _model_generations[attr]
+
+    def _load():
+        try:
+            model = model_class(backend, options, api_key=api_key, log=log)
+        except Exception as e:
+            log(f"{kind}: failed to load {backend} {options}, keeping {current.describe() if current else 'none'}: {e}")
+            return
+        with _model_lock:
+            if generation != _model_generations[attr]:
+                return  # a later change is loading, or has loaded, its own
+            setattr(ctx, attr, model)
+        log(f"{kind} settings applied — {model.describe()}")
+
+    log(f"{kind}: loading {backend} {options}")
+    threading.Thread(target=_load, daemon=True).start()
+
+
+def apply_transcribe_settings(config: dict):
+    """Apply the [transcribe] settings without a restart."""
+    _apply_model_settings("transcribe_model", "transcribe", transcribe, transcribe.Transcribe, config)
+
+
+def apply_voice_settings(config: dict):
+    """Apply the [voice] settings without a restart."""
+    _apply_model_settings("voice_model", "voice", voice, voice.Voice, config)
+
+
+def apply_library_settings(config: dict):
+    """Rescan when the music folders change. No-op on a worker, which has no library."""
+    if _library is not None:
+        _library.set_roots(config.get("library", {}).get("paths", []))
+
+
+def list_llm_models(provider: str) -> list[str]:
+    """Tool-calling chat models litellm knows for `provider`, as "provider/model" strings, for the
+    settings ui to offer. The registry is the one bundled with litellm, so it is only as fresh as
+    the installed version — the ui still takes any name typed in."""
+    models = []
+    for name in litellm.models_by_provider.get(provider, []):
+        info = litellm.model_cost.get(name, {})
+        if info.get("mode") != "chat" or not info.get("supports_function_calling"):
+            continue
+        if any(word in name for word in LLM_MODEL_EXCLUDE):
+            continue
+        models.append(name if name.startswith(f"{provider}/") else f"{provider}/{name}")
+    return sorted(models)
+
+
+def test_llm(provider: str, model: str, api_key: str, api_base: str) -> str | None:
+    """One tiny completion to prove a key and model work, behind the settings test button. Returns
+    the error text, or None when the model answered."""
+    try:
+        litellm.completion(
+            model=model,
+            messages=[{"role": "user", "content": "Say ok."}],
+            max_tokens=16,
+            api_key=api_key or None,
+            api_base=api_base or PROVIDERS.get(provider, {}).get("default_api_base"),
+            drop_params=True,
+        )
+    except Exception as e:  # anything at all is worth showing the user here
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 def duck_playback():
     """Reduce mpv player volume to _duck_volume (0 = silent, 100 = full)."""
     _player.cmd_queue.put(('duck', _duck_volume))
@@ -1375,26 +2139,45 @@ def resolve_url(url: str) -> str:
     return stream_url
 
 
-def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0, title: str | None = None) -> str:
-    """Stream audio from `url`. Returns "playing" or a failure reason.
-
-    YouTube resolution runs inline rather than in a background thread so a rejection reaches the
-    caller — resolving off-thread meant a 403 produced silence that nothing in the system noticed."""
-    is_youtube = "youtube.com" in url or "youtu.be" in url
-    if is_youtube:
-        _player.cmd_queue.put(('stop',))
-        error = _resolve_youtube_and_play(url, start_time, title)
-        return error or "playing"
-    if "soundcloud.com" in url:
-        _player.cmd_queue.put(('stop',))
-        error = _resolve_soundcloud_and_play(url, start_time, title)
-        return error or "playing"
+def _save_play_history(url: str, start_time: float, title: str | None):
     entry: dict = {"url": url, "start_time": start_time}
     if title:
         entry["title"] = title
     _save_history(PLAY_HISTORY_PATH, entry)
-    _player.cmd_queue.put(('play', url, headers, start_time, url))
+
+
+def _play(url: str, headers: list[str] | None, start_time: float, title: str | None, retry: bool = False) -> str:
+    """Resolve and start `url`, then wait until audio is actually flowing. Returns "playing" or the
+    reason it failed.
+
+    YouTube resolution runs inline rather than in a background thread so a rejection reaches the
+    caller — resolving off-thread meant a 403 produced silence that nothing in the system noticed.
+    The wait after it is for the same reason: a stream can pass the probe and still be refused
+    a moment later, once mpv asks for more."""
+    watch = _PlaybackWatch(url, start_time, title, retry=retry)
+    if "youtube.com" in url or "youtu.be" in url:
+        _player.cmd_queue.put(('stop',))
+        error = _resolve_youtube_and_play(url, start_time, watch)
+    elif "soundcloud.com" in url:
+        _player.cmd_queue.put(('stop',))
+        error = _resolve_soundcloud_and_play(url, start_time, watch)
+    else:
+        _save_play_history(url, start_time, title)
+        _player.cmd_queue.put(('play', url, headers, start_time, url, watch))
+        error = ""
+    if error:
+        return error
+    if not watch.settled.wait(PLAYBACK_CONFIRM_TIMEOUT):
+        log(f"playback not confirmed within {PLAYBACK_CONFIRM_TIMEOUT:.0f}s, assuming it is buffering")
+    if watch.failure:
+        log(f"playback failed on start: {watch.failure}")
+        return watch.failure
     return "playing"
+
+
+def play_url(url: str, headers: list[str] | None = None, start_time: float = 0.0, title: str | None = None) -> str:
+    """Stream audio from `url`. Returns "playing" once audio is flowing, or a failure reason."""
+    return _play(url, headers, start_time, title)
 
 
 def _search(search_spec: str, url_template: str) -> str:
@@ -1432,48 +2215,213 @@ def search_soundcloud(query: str, max_results: int = 5) -> str:
     return _search(f"scsearch{max_results}:{query}", "https://soundcloud.com/{id}")
 
 
+def search_library(query: str) -> str:
+    """Search the local music collection and return a JSON object of artists/albums/tracks/genres/folders."""
+    if _library is None or not _library.roots:
+        return "no music library is set up"
+    status = _library.status()
+    if status["missing"] and not status["tracks"]:
+        return "the music drive is not connected"
+    results = _library.search(query)
+    if not results:
+        if status["scanning"] and not status["tracks"]:
+            return f"the music library is still being indexed ({status['progress']} tracks so far), try again shortly"
+        return "nothing in the library matches"
+    return json.dumps(results)
+
+
+def play_library(ids: list[str], shuffle: bool = False) -> str:
+    """Queue tracks from the local library by id (or all of it, shuffled, for no ids) and play them."""
+    if _library is None or not _library.roots:
+        return "no music library is set up"
+    paths, unknown = _library.resolve(ids, shuffle)
+    if unknown:
+        return f"unknown ids: {', '.join(unknown)} — search_library again for current ones"
+    if not paths:
+        return "the library is empty"
+    if not os.path.exists(paths[0]):
+        return "the music drive is not connected"
+    title = _library.title(ids)
+    _save_history(PLAY_HISTORY_PATH, {"library_ids": ids, "shuffle": shuffle, "title": title})
+    watch = _PlaybackWatch(paths[0], 0.0, title, local=True)
+    _player.cmd_queue.put(('play', paths, None, 0.0, paths[0], watch))
+    if not watch.settled.wait(PLAYBACK_CONFIRM_TIMEOUT):
+        log("library playback not confirmed, assuming it is playing")
+    return f"playing {len(paths)} tracks" if len(paths) > 1 else "playing"
+
+
+def skip(steps: int) -> str:
+    if not _player.active:
+        return "nothing is playing"
+    _player.cmd_queue.put(('skip', steps or 1))
+    return "skipped"
+
+
+def now_playing() -> str:
+    """What mpv is playing: the library's tags for a file off the disk, mpv's own idea of the title
+    for a stream, plus the position and the place in the queue."""
+    player = _player.mpv
+    if player is None or not _player.active:
+        return "nothing is playing"
+    try:
+        path = player.path
+        info = (_library.describe(os.path.normpath(path)) if _library and path else None) or {"title": player.media_title}
+        info.pop("id", None)
+        position, duration = player.time_pos, player.duration
+        count, index = player.playlist_count, player.playlist_pos
+    except Exception as e:
+        return f"could not read the player: {e}"
+    if position is not None:
+        info["position"] = int(position)
+    if duration:
+        info["duration"] = int(duration)
+    if count and count > 1 and index is not None:
+        info["queue"] = f"track {index + 1} of {count}"
+    return json.dumps(info)
+
+
+def web_search(query: str, max_results: int = WEB_SEARCH_RESULTS) -> str:
+    """Search the web via DuckDuckGo and return a JSON list of title/url/snippet results. The
+    fallback for vendors whose own search cannot run alongside our tools — needs no key."""
+    from ddgs import DDGS  # only the fallback path pays for the import
+    try:
+        hits = DDGS().text(query, max_results=max_results)
+    except Exception as e:
+        return f"search failed: {e}"
+    if not hits:
+        return "no results found"
+    return json.dumps([{"title": h.get("title"), "url": h.get("href"), "snippet": h.get("body")} for h in hits])
+
+
+def _run_output(cmd: list[str]) -> str:
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _windows_volume_endpoint():
+    from pycaw.pycaw import AudioUtilities
+    speakers = AudioUtilities.GetSpeakers()
+    # pycaw 2024+ wraps the device and hands the interface over directly; older releases return the
+    # raw COM device, which has to be activated by hand
+    if hasattr(speakers, "EndpointVolume"):
+        return speakers.EndpointVolume
+    from ctypes import POINTER, cast
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import IAudioEndpointVolume
+    interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    return cast(interface, POINTER(IAudioEndpointVolume))
+
+
+def _get_system_volume() -> tuple[int, bool]:
+    """The default output's level (0-100) and whether it is muted."""
+    if sys.platform == "linux":
+        # "Volume: front-left: 29491 /  45% / -20.81 dB, ..." — channels move together, first will do
+        level = int(re.search(r"(\d+)%", _run_output(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])).group(1))
+        muted = _run_output(["pactl", "get-sink-mute", "@DEFAULT_SINK@"]).endswith("yes")
+    elif sys.platform == "darwin":
+        level = int(_run_output(["osascript", "-e", "output volume of (get volume settings)"]))
+        muted = _run_output(["osascript", "-e", "output muted of (get volume settings)"]) == "true"
+    elif sys.platform == "win32":
+        endpoint = _windows_volume_endpoint()
+        level = round(endpoint.GetMasterVolumeLevelScalar() * 100)
+        muted = bool(endpoint.GetMute())
+    else:
+        raise RuntimeError(f"volume control is not supported on {sys.platform}")
+    return max(0, min(100, level)), muted
+
+
+def _set_system_volume(level: int | None = None, muted: bool | None = None):
+    """Set the default output's level, mute state, or both. Mute is kept apart from the level so
+    unmuting brings back the volume from before, rather than whatever 'mute' had set it to."""
+    if sys.platform == "linux":
+        if level is not None:
+            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{level}%"], check=True)
+        if muted is not None:
+            subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1" if muted else "0"], check=True)
+    elif sys.platform == "darwin":
+        if level is not None:
+            subprocess.run(["osascript", "-e", f"set volume output volume {level}"], check=True)
+        if muted is not None:
+            subprocess.run(["osascript", "-e", f"set volume output muted {'true' if muted else 'false'}"], check=True)
+    elif sys.platform == "win32":
+        endpoint = _windows_volume_endpoint()
+        if level is not None:
+            endpoint.SetMasterVolumeLevelScalar(level / 100, None)
+        if muted is not None:
+            endpoint.SetMute(1 if muted else 0, None)
+    else:
+        raise RuntimeError(f"volume control is not supported on {sys.platform}")
+
+
+def _describe_volume(level: int, muted: bool) -> str:
+    step = round(level / 100 * VOLUME_STEPS)
+    return f"volume {step} of {VOLUME_STEPS} ({level}%)" + (", muted" if muted else "")
+
+
+def get_volume() -> str:
+    try:
+        return _describe_volume(*_get_system_volume())
+    except Exception as e:
+        log(f"get_volume error: {e}")
+        return f"error reading volume: {e}"
+
+
 def set_volume(level: int) -> str:
+    """Set an exact percentage. 0 mutes rather than zeroing the level, so unmute has one to restore."""
     level = max(0, min(100, level))
     try:
-        if sys.platform == "linux":
-            if level == 0:
-                subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"], check=True)
-            else:
-                subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], check=True)
-                subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{level}%"], check=True)
-        elif sys.platform == "darwin":
-            subprocess.run(["osascript", "-e", f"set volume output volume {level}"], check=True)
-        elif sys.platform == "win32":
-            # Use nircmd if available, otherwise ctypes
-            result = subprocess.run(["nircmd", "setsysvolume", str(int(level / 100 * 65535))],
-                                    capture_output=True)
-            if result.returncode != 0:
-                import ctypes
-                from ctypes import POINTER, cast
-                from comtypes import CLSCTX_ALL
-                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-                devices = AudioUtilities.GetSpeakers()
-                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                volume = cast(interface, POINTER(IAudioEndpointVolume))
-                if level == 0:
-                    volume.SetMute(1, None)
-                else:
-                    volume.SetMute(0, None)
-                    volume.SetMasterVolumeLevelScalar(level / 100, None)
-        return f"volume set to {level}"
+        if level == 0:
+            _set_system_volume(muted=True)
+        else:
+            _set_system_volume(level=level, muted=False)
+        return _describe_volume(*_get_system_volume())
     except Exception as e:
         log(f"set_volume error: {e}")
         return f"error setting volume: {e}"
 
 
+def change_volume(steps: int) -> str:
+    """Move the level by `steps` notches of the VOLUME_STEPS grid, like a volume button. A level set
+    by percentage snaps to the nearest notch first, so up then down lands back on a notch."""
+    try:
+        level, muted = _get_system_volume()
+        notch = max(0, min(VOLUME_STEPS, round(level / 100 * VOLUME_STEPS) + steps))
+        new_level = round(notch * 100 / VOLUME_STEPS)
+        # turning it up unmutes, as on a phone — turning it down leaves a mute alone
+        _set_system_volume(level=new_level, muted=False if steps > 0 else None)
+        return _describe_volume(*_get_system_volume())
+    except Exception as e:
+        log(f"change_volume error: {e}")
+        return f"error changing volume: {e}"
+
+
+def set_mute(muted: bool) -> str:
+    try:
+        level, _ = _get_system_volume()
+        if not muted and level == 0:
+            # unmuting into silence would sound like it failed
+            _set_system_volume(level=round(100 / VOLUME_STEPS), muted=False)
+        else:
+            _set_system_volume(muted=muted)
+        return _describe_volume(*_get_system_volume())
+    except Exception as e:
+        log(f"set_mute error: {e}")
+        return f"error setting mute: {e}"
+
+
 def set_timer(name: str, seconds: int) -> str:
     def _fire(timer_name: str):
         log(f"timer fired: {timer_name}")
-        _play_oneshot_audio_file("sounds/midnight.wav")
-        if ctx is not None:
-            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
-                   f"{timer_name} timer done")
         _timers.remove(timer_name)
+        # only a name the user gave is worth saying — "timer timer done" is not
+        sound = _clock.timer_sound() if _clock else alarms.DEFAULT_SOUND
+        _alarms.ring(timer_name, sound, announce=f"{timer_name} timer done" if named else None)
+
+    name = name.strip()
+    named = bool(name) and name.lower() != UNNAMED_TIMER
+    if not named:
+        # unnamed timers get "timer", "timer 2"... so a second one doesn't replace the first
+        taken = set(_timers.keys()) | set(_alarms.keys())
+        name = next(n for n in (UNNAMED_TIMER if i == 1 else f"{UNNAMED_TIMER} {i}" for i in itertools.count(1)) if n not in taken)
 
     end_time = time.time() + seconds
     t = threading.Timer(seconds, _fire, args=(name,))
@@ -1483,10 +2431,12 @@ def set_timer(name: str, seconds: int) -> str:
 
     mins, secs = divmod(seconds, 60)
     duration = f"{mins}m {secs}s" if mins else f"{secs}s"
-    return f"{name} timer set for {duration}"
+    return f"{name + ' timer' if named else name} set for {duration}"
 
 
 def cancel_timer(name: str) -> str:
+    if _alarms.stop(name):
+        return f"{name} alarm stopped"
     entry = _timers.pop(name)
     if entry:
         entry[0].cancel()
@@ -1497,11 +2447,51 @@ def cancel_timer(name: str) -> str:
     return f"no timer named '{name}'"
 
 
+def _spoken_time(hhmm: str) -> str:
+    """'07:00' as '7 o'clock' and '07:30' as '7:30', for the voice — it reads a leading zero out."""
+    hour, minute = hhmm.split(":")
+    return f"{int(hour)} o'clock" if minute == "00" else f"{int(hour)}:{minute}"
+
+
+def _fire_alarm(alarm: dict):
+    """AlarmClock callback: ring a clock alarm that has come due."""
+    name = alarm["label"] or f"{alarm['time']} alarm"
+    announce = f"It's {_spoken_time(alarm['time'])}. {alarm['label']}." if alarm["label"] else None
+    _alarms.ring(name, alarm["sound"], announce=announce, snooze=alarm["snooze"])
+
+
+def set_alarm(time_text: str, label: str = "", days=None) -> str:
+    if _clock is None:
+        return "alarms are not available on this speaker"
+    if alarms.parse_time(time_text) is None:
+        return f"'{time_text}' is not a 24 hour time like 07:00"
+    alarm = _clock.add(time_text, label, alarms.parse_days(days))
+    return f"alarm set: {alarms.describe(alarm)}"
+
+
+def cancel_alarm(match: str) -> str:
+    if _clock is None:
+        return "alarms are not available on this speaker"
+    gone = _clock.remove(match)
+    if gone:
+        return f"deleted: {'; '.join(alarms.describe(a) for a in gone)}"
+    return f"no alarm matching '{match}'. {list_alarms()}"
+
+
+def list_alarms() -> str:
+    now = datetime.now().strftime("%A %H:%M")
+    saved = _clock.data()["alarms"] if _clock else []
+    if not saved:
+        return f"no alarms (it is {now})"
+    return f"it is {now}. alarms: {'; '.join(alarms.describe(a) for a in saved)}"
+
+
 def list_timers() -> str:
-    if not _timers:
+    ringing = _alarms.keys()
+    if not _timers and not ringing:
         return "no active timers"
     now = time.time()
-    parts = []
+    parts = [f"{name}: ringing" for name in ringing]
     for name, (_, end_time) in _timers.items():
         remaining = max(0, int(end_time - now))
         mins, secs = divmod(remaining, 60)
@@ -1572,8 +2562,7 @@ def update(target: str) -> str:
 
         log(f"update: done, restarting...")
         if ctx is not None:
-            _speak(dev, ctx.output_dev_index, ctx.output_sample_rate, ctx.voice_model,
-                   f"Updated to {target}. Restarting now.")
+            _speak(f"Updated to {target}. Restarting now.")
 
         def _restart():
             if "--service" in sys.argv:
@@ -1588,6 +2577,12 @@ def update(target: str) -> str:
         err = e.stderr.decode() if e.stderr else str(e)
         log(f"update error: {err}")
         return f"update failed: {err}"
+
+
+def _is_stop_request(text: str) -> bool:
+    """A short bare command to stop, pause or snooze, as opposed to a request with content."""
+    words = re.findall(r"[a-z]+", text.lower())
+    return bool(words) and set(words) <= STOP_WORDS and bool(set(words) & STOP_CORE)
 
 
 def _speak_loop(ctx):
@@ -1610,21 +2605,20 @@ def _speak_loop(ctx):
         ctx.speaker_state = SpeakerState.VAD_RECORD
         os.makedirs(record_dir, exist_ok=True)
 
-    ONSET_TIMEOUT = 8.0
-
     # the loop
     transcribed_request = ""
     onset_remaining = ONSET_TIMEOUT
     followup = False  # a turn re-entered via follow_on or an interrupt already has full context
-    with dev.InputStream(samplerate=ctx.input_sample_rate, channels=1, dtype='int16', device=ctx.input_dev_index) as stream:
+    with dev.InputStream(samplerate=ctx.audio_context.input_sample_rate, channels=1, dtype='int16', device=ctx.audio_context.input_dev_index) as stream:
         while not ctx.shutdown.is_set():
             if ctx.speaker_state == SpeakerState.LISTEN_FOR_WAKE:
                 ring_startup_stop()  # no-op once the first wake loop has stopped it
                 ring_off(ctx)
+                _alarms.release()  # a turn that didn't stop it lets a held alarm ring on
                 wake_audio = _listen_for_wake(
                     ctx.wake_model,
                     stream,
-                    ctx.input_sample_rate,
+                    ctx.audio_context.input_sample_rate,
                     threshold=ctx.wake_threshold,
                     num_triggers=ctx.wake_triggers,
                     buffer_duration=buffer_duration
@@ -1638,6 +2632,7 @@ def _speak_loop(ctx):
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
+                    _alarms.hold()  # quiet while the user talks, so the request can be heard
                     ring_wake(ctx)
                     _play_oneshot_audio_file("sounds/wake.wav")
                     ctx.speaker_state = SpeakerState.RECORDING
@@ -1646,14 +2641,20 @@ def _speak_loop(ctx):
                 mark("record", f"onset budget {onset_remaining:.1f}s")
                 ring_recording(ctx)
                 duck_playback()
-                audio_request, onset_elapsed = _record_until_silence(ctx.vad, stream, ctx.input_sample_rate, onset_timeout=onset_remaining)
+                # nudge once, halfway through a wake's onset budget. the budget only shrinks — across
+                # false onsets too — so once past halfway this stays None. not on a follow-up: the
+                # assistant has just asked its own question
+                to_halfway = onset_remaining - ONSET_TIMEOUT / 2
+                nudge_after = to_halfway if to_halfway > 0 and not followup else None
+                audio_request, onset_elapsed = _record_until_silence(
+                    ctx.vad, stream, ctx.audio_context.input_sample_rate, onset_timeout=onset_remaining, nudge_after=nudge_after)
                 transcribed_request = ""
                 if audio_request is not None:
                     _perf_timer.lap("recorded")
                     mark("transcribe", "")
                     ring_transcribing(ctx)
-                    transcribed_request = _transcribe_audio(ctx.whisper_model, audio_request, ctx.worker_url)
-                    _perf_timer.lap("transcribed")
+                    transcribed_request, transcribed_by = transcribe_audio(audio_request)
+                    _perf_timer.lap(f"transcribed ({transcribed_by})")
                     mark("transcribed", transcribed_request.strip())
                 # nothing usable captured — keep listening on the remaining budget rather than dropping
                 # the turn, so a false onset or a discarded noise clip does not send us back to the wake word
@@ -1676,27 +2677,31 @@ def _speak_loop(ctx):
             elif ctx.speaker_state == SpeakerState.LLM_AGENT:
                 mark("llm", transcribed_request.strip())
                 ring_llm_agent(ctx)
-                ctx.speaker_state = query_llm(ctx.llm_client, ctx.system, transcribed_request, stream, followup=followup)
-                _perf_timer.lap("llm")
+                # let the user know they were heard — the first spoken sentence can be seconds away.
+                # not for a bare stop, which the alarm or music going quiet already answers
+                ack = None if _is_stop_request(transcribed_request) else _play_random_sound(ACK_SOUND_DIR)
+                ctx.speaker_state = query_llm(transcribed_request, stream, followup=followup, speak_after=ack)
+                llm = _llm
+                _perf_timer.lap(f"llm ({llm.followup_model if followup else llm.model} {llm.effort})" if llm else "llm")
                 mark("llm-done", "")
                 if ctx.speaker_state == SpeakerState.RECORDING:
                     onset_remaining = ONSET_TIMEOUT
                     followup = True
-                    _flush_stream(stream, ctx.input_sample_rate)
+                    _flush_stream(stream, ctx.audio_context.input_sample_rate)
                     ctx.wake_model.reset()
                 else:
                     unduck_playback()
             elif ctx.speaker_state == SpeakerState.RESET:
-                _flush_stream(stream, ctx.input_sample_rate)
+                _flush_stream(stream, ctx.audio_context.input_sample_rate)
                 ctx.wake_model.reset()
                 ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 log("return to listen for wake")
             elif ctx.speaker_state == SpeakerState.VAD_RECORD:
                 ring_recording(ctx)
-                audio = _vad_record(ctx.vad, stream, ctx.input_sample_rate)
+                audio = _vad_record(ctx.vad, stream, ctx.audio_context.input_sample_rate)
                 filepath = f"{record_dir}/{int(time.time() * 1000)}.wav"
                 log(f"caching {filepath}")
-                _write_wav(audio, ctx.input_sample_rate, filepath, gain=1.0)
+                _write_wav(audio, ctx.audio_context.input_sample_rate, filepath, gain=1.0)
 
 
 def _start_worker():
@@ -1707,27 +2712,17 @@ def _start_worker():
     log("oi! worker mode!!")
     with open("config.toml", "rb") as f:
         config = tomllib.load(f)
-    inf = config.get("inference", {})
-    device = inf.get("device", "cpu")
-    compute = "float16" if device == "cuda" else "int8"
-    whisper_model = WhisperModel(
-        inf.get("whisper_model", "small"),
-        device=device,
-        compute_type=inf.get("whisper_compute", compute),
-    )
-    piper_model = config.get("voice", {}).get("model", "models/piper/en_GB-northern_english_male-medium.onnx")
-    voice_model = PiperVoice.load(piper_model)
+    global _node_name
+    _node_name = config.get("network", {}).get("name", _node_name)
+    apply_network_settings(config)
     ctx = SpeakerContext(
-        llm_client=None,
         system="",
-        voice_model=voice_model,
-        whisper_model=whisper_model,
+        voice_model=voice.create(config, log=log),
+        transcribe_model=transcribe.create(config, log=log),
         vad=None,
-        output_dev_index=0,
-        output_sample_rate=voice_model.config.sample_rate,
         wake_model=None,
-        input_dev_index=0,
-        input_sample_rate=16000,
+        # a worker does no audio i/o of its own
+        audio_context=AudioContext(0, TARGET_SAMPLE_RATE, 0, TARGET_SAMPLE_RATE),
         worker_mode=True,
     )
     log("worker ready")
@@ -1814,7 +2809,7 @@ def ring_recording(ctx):
 
 
 def ring_transcribing(ctx):
-    """Whisper is running on the captured audio."""
+    """Speech to text is running on the captured audio."""
     if ctx.ring is None:
         return
     _ring_call(ctx.ring.solid, RING_COLOR_TRANSCRIBING)
@@ -1827,8 +2822,9 @@ def ring_llm_agent(ctx):
     _ring_call(ctx.ring.breathe, RING_COLOR_LLM, 1)
 
 
-def start():
-    """Initialise all models and devices from config.toml and launch the background threads."""
+def start(peers=None):
+    """Initialise all models and devices from config.toml and launch the background threads.
+    `peers()` lists the nodes mdns has found, for --offload to choose workers from."""
     global ctx
 
     # Derive from sys.argv directly — immune to the double-import problem where
@@ -1875,22 +2871,10 @@ def start():
             suffix = f" ({extra})" if extra else ""
             system += f"- [{hint['category']}] {hint['name']}: {value}{suffix}\n"
 
-    # Tools render before system, so one breakpoint here caches the whole stable prefix. Everything
-    # that varies per turn lives in messages, after it.
-    system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+    apply_llm_settings(config)
 
-    # llm config
-    llm_cfg = config["llm"]
-    model = llm_cfg.get("model", "claude-opus-5")
-    followup_model = llm_cfg.get("followup_model", model)
-    effort = llm_cfg.get("effort", "low")
-
-    # whisper / inference config
+    # vad / inference config
     inf = config.get("inference", {})
-    device = inf.get("device", "cpu")
-    compute = "int8"
-    if device == "cuda":
-        compute = "float16"
     vad_threshold = float(inf.get("vad_threshold", 0.5))
     vad_mic_gain = float(inf.get("vad_mic_gain", 1.0))
     vad_verbose = "--verbose" in sys.argv
@@ -1907,7 +2891,6 @@ def start():
     output_dev_info = _get_audio_device_index(audio_cfg["output_device"])
 
     ctx = SpeakerContext(
-        llm_client=anthropic.Anthropic(api_key=config["llm"]["anthropic_api_key"]),
         system=system,
         wake_model=Model(
             inference_framework="onnx",
@@ -1915,20 +2898,15 @@ def start():
             vad_threshold=0.5,
             enable_speex_noise_suppression=False
         ),
-        voice_model=PiperVoice.load("models/piper/en_GB-northern_english_male-medium.onnx"),
-        whisper_model=WhisperModel(
-            inf.get("whisper_model", "small"),
-            device=device,
-            compute_type=inf.get("whisper_compute", compute)
-        ),
+        voice_model=voice.create(config, worker_url, log),
+        transcribe_model=transcribe.create(config, worker_url, log),
         vad=_SileroVAD(threshold=vad_threshold, mic_gain=vad_mic_gain, verbose=vad_verbose),
-        model=model,
-        followup_model=followup_model,
-        effort=effort,
-        input_dev_index=int(input_dev_info['index']),
-        input_sample_rate=int(input_dev_info['default_samplerate']),
-        output_dev_index=int(output_dev_info['index']),
-        output_sample_rate=int(output_dev_info['default_samplerate']),
+        audio_context=AudioContext(
+            input_dev_index=int(input_dev_info['index']),
+            input_sample_rate=int(input_dev_info['default_samplerate']),
+            output_dev_index=int(output_dev_info['index']),
+            output_sample_rate=int(output_dev_info['default_samplerate']),
+        ),
         worker_url=worker_url,
         ring=ring,
     )
@@ -1943,6 +2921,28 @@ def start():
         args=(ctx,),
         daemon=True
     ).start()
+
+    global _clock
+    _clock = alarms.AlarmClock(on_fire=_fire_alarm, log=log)
+    _clock.start()
+
+    global _library
+    _library = library.Library(config.get("library", {}).get("paths", []), log=log)
+    _library.start()
+
+    global _node_name, _offload
+    _node_name = config.get("network", {}).get("name", _node_name)
+    apply_network_settings(config)
+    if "--offload" in sys.argv:
+        if worker_url:
+            log("--offload ignored: --worker-ip already sends everything to one worker")
+        elif peers is None:
+            log("--offload needs the web server's peer discovery, not starting it")
+        else:
+            # the models here are still loaded: they are the last fallback when every worker fails
+            _offload = offload.Offload(_node_name, offload_scores, peers, log=log)
+            _offload.start()
+            log(f"offload: on, this node scores {offload_scores()}")
 
 
 

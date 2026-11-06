@@ -72,9 +72,82 @@ Python deps are configured as part of the `pyproject.toml` setup your Python env
 ```bash
 python3.11 -m venv ~/oi-speaker-env
 source ~/oi-speaker-env/bin/activate
-pip install -e .
+pip install -e ".[whisper,piper]"
 # optional cuda
-pip install -e ".[cuda]"
+pip install -e ".[whisper,piper,cuda]"
+```
+
+Speech to text and the voice are both pluggable: install the backends you want as extras, then pick
+one of each per box in the web ui settings (or `[transcribe]` / `[voice]` in `config.toml`).
+Changes apply on save, with no restart. Only installed backends are offered, and their options
+(model, device, compute type...) are listed from what the machine actually supports. Models
+download on first use.
+
+### Speech to text
+
+| backend | install | notes |
+|---|---|---|
+| `whisper` | `pip install -e ".[whisper]"` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), cpu or cuda |
+| `parakeet` | `pip install -e ".[parakeet]"` | NVIDIA parakeet via [onnx-asr](https://github.com/istupakov/onnx-asr), no torch needed. cuda needs `onnxruntime-gpu` in place of `onnxruntime` |
+| `openai` | nothing extra | cloud api, uses the openai key from `[llm.keys]` (or `OPENAI_API_KEY`) |
+
+### Voice (text to speech)
+
+| backend | install | notes |
+|---|---|---|
+| `piper` | `pip install -e ".[piper]"` | [piper](https://github.com/OHF-Voice/piper1-gpl), fast on cpu, voices are `.onnx` files in `models/piper/` (see [Downloading Models](#downloading-models)) |
+| `kokoro` | `pip install -e ".[kokoro]"` | [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) 82M on onnxruntime, close to piper's speed and noticeably more natural, ~50 built-in voices (`bm_george`, `bf_emma`... the first letter is the accent). Model and voices files go in `models/kokoro/` (see [Downloading Models](#downloading-models)) |
+| `chatterbox` | `pip install -e ".[chatterbox]"` | [Chatterbox Turbo](https://github.com/resemble-ai/chatterbox), pulls in torch. Needs a gpu (cuda or apple `mps`) to keep up: on cpu a sentence takes ~2-5x its own length to synthesise. For cuda, install a cuda build of torch |
+| `openai` | nothing extra | cloud api (`gpt-4o-mini-tts`, `tts-1`...), uses the openai key from `[llm.keys]`. `instructions` steers tone and accent on `gpt-4o-mini-tts` |
+
+#### Kokoro voices
+
+Kokoro ships 54 voices in one file, `models/kokoro/voices-v1.0.bin`, and the model is the same for
+all of them. Pick one with `voice` under the kokoro backend in the settings tab (or
+`[voice.kokoro] voice` in `config.toml`); it applies on save, with no restart. The name says what
+it is:
+
+- first letter, the accent: `a` American, `b` British (also `e` Spanish, `f` French, `h` Hindi,
+  `i` Italian, `j` Japanese, `p` Portuguese, `z` Mandarin)
+- second letter: `f` female, `m` male
+
+| | female | male |
+|---|---|---|
+| British | `bf_alice` `bf_emma` `bf_isabella` `bf_lily` | `bm_daniel` `bm_fable` `bm_george` `bm_lewis` |
+| American | `af_alloy` `af_aoede` `af_bella` `af_heart` `af_jessica` `af_kore` `af_nicole` `af_nova` `af_river` `af_sarah` `af_sky` | `am_adam` `am_echo` `am_eric` `am_fenrir` `am_liam` `am_michael` `am_onyx` `am_puck` `am_santa` |
+
+The default is `bm_george`. Use the full `kokoro-v1.0.onnx` model rather than the int8 one: on cpu
+the int8 model ran ~3.5x slower.
+
+Chatterbox speaks in its built-in voice by default. To clone another, drop a clean recording of at
+least 5 seconds into `models/chatterbox/` and pick it as the `reference` in settings.
+
+### What to install where
+
+A plain `pip install -e .` installs no local backend for either, only `openai` (litellm already
+brings the openai sdk). With the default `whisper` and `piper` backends missing, the speaker logs it
+and falls back to openai, so it needs an openai key in that case.
+
+Extras combine. Everything, for a big node (a gpu box serving as a worker):
+
+```bash
+pip install -e ".[whisper,parakeet,piper,kokoro,chatterbox,cuda]"
+```
+
+Without a gpu, drop `cuda` (and `chatterbox`, which is too slow on cpu):
+`pip install -e ".[whisper,parakeet,piper,kokoro]"`. A satellite started with `--worker-ip` hands both
+transcription and speech to the worker and needs no backend installed, so `pip install -e .` is
+enough there. One started with `--offload` still needs a backend, as its fallback when no worker
+answers (see [Sharing the work between speakers](#sharing-the-work-between-speakers)).
+
+### Recording canned lines
+
+`tts-record` renders a line with the configured voice, for the clips in `sounds/`:
+
+```bash
+tts-record sounds/nudge/whats_up.wav "What's up?"
+tts-record out.wav "Hello" --backend openai
+tts-record out.wav "Hello" --voice models/piper/other-voice.onnx
 ```
 
 ## LED Ring (reSpeaker XVF3800)
@@ -133,16 +206,121 @@ The openWakeWord download is required even though a custom wake word model ships
 
 ```bash
 python -c "import openwakeword; openwakeword.utils.download_models()"
+# piper voice, only with the piper backend installed
 python -m piper.download --voice en_GB-northern_english_male-medium
 # or
 python -m piper.download_voices en_GB-northern_english_male-medium
 ```
+
+Kokoro, only with the kokoro backend installed. `kokoro-v1.0.int8.onnx` (88MB) is also there for
+small disks, though on cpu it ran ~3.5x slower than the full model:
+
+```bash
+mkdir -p models/kokoro
+curl -L -o models/kokoro/kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -L -o models/kokoro/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+```
+
+## Language Model
+
+The assistant talks to its LLM through [LiteLLM](https://docs.litellm.ai/docs/providers), so any vendor works. Pick one in the **settings** tab of the web ui under **llm**: choose the vendor, paste its API key, pick a model and a follow-up model, then hit **test**. Changes apply on save, with no restart.
+
+The web ui offers Anthropic, OpenAI, Gemini, OpenRouter and Ollama. Any other LiteLLM provider works if you set it by hand in `config.toml`:
+
+```toml
+[llm]
+provider = "anthropic"
+model = "anthropic/claude-opus-5"
+followup_model = "anthropic/claude-sonnet-5"
+effort = "low"
+
+[llm.keys]
+anthropic = "sk-ant-..."
+openai = ""
+```
+
+- Model names are LiteLLM `vendor/model` strings, e.g. `openai/gpt-5.5`, `gemini/gemini-3.5-flash`, `ollama_chat/qwen3`.
+- Keys are stored per vendor, so you can switch back and forth. An empty key falls back to the vendor's usual environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...).
+- For **Ollama**, set `api_base` (default `http://localhost:11434`) and choose a model that supports tool calling. The model list in the web ui comes from the models you have pulled.
+- **Web search** uses Anthropic's built-in search on Anthropic. Other vendors get a local DuckDuckGo search tool that needs no key.
+- Configs from before this change (with a single `anthropic_api_key`) are migrated automatically when loaded.
+
+## Timers and Alarms
+
+Ask for either by voice: "set a pasta timer for ten minutes", "wake me at seven on weekdays",
+"what alarms have I got", "cancel the gym alarm". When one goes off it rings until you say the
+wake word and **stop** or **snooze** (9 minutes). Saying the wake word quiets it while you talk, so
+the request can be heard; if you ask for something else it rings on once the turn is over. "Stop"
+silences the alarm only, any music playing keeps going. A named timer or labelled alarm is
+announced by name after the first ring, and anything left ringing gives up after 10 minutes.
+
+The **alarms** tab of the web ui is the alarm clock: add alarms, set the time, a label, the days
+they repeat on (none for a one-off, which turns itself off once it has rung), the sound and whether
+snooze is allowed, and pick the sound timers ring with. Each sound can be previewed in the
+browser, and everything saves as you change it.
+
+Alarms are kept in `alarms.json` next to `config.toml`, per speaker. The sounds are whatever is in
+`sounds/alarms/`; drop in a `.wav`, `.mp3`, `.m4a`, `.ogg` or `.flac` and it is offered straight
+away. They loop gaplessly, so a clip that loops cleanly in an audio editor loops cleanly here.
+
+## Music Library
+
+Music on a local disk (a USB drive, a folder of mp3s) can be searched and played by voice: "play
+some dub techno", "put on Nevermind", "play the wedding folder", "shuffle my music", "next track",
+"what's this?". Point the speaker at it in `config.toml`, or the settings tab of the web ui:
+
+```toml
+[library]
+paths = ["/media/usb"]   # one or more folders, e.g. ["F:/"] on Windows
+```
+
+The folders are indexed on start: the tags are read with mutagen (artist, album, title, genre,
+year), with the folder layout filling any gaps (`Artist - Album/04 - Title.mp3`). The first scan of
+a big drive takes a while, ~90s for 14k tracks over USB; after that the index is cached in
+`.library.json` and only new or changed files are read again, so a rescan is a second or two. It
+rescans on its own when a folder appears or disappears (a drive plugged in or pulled out) and every
+hour otherwise; `POST /library/rescan` does it now, and `GET /library` shows how many tracks it has.
+
+The LLM searches the library first when asked for music, and falls back to YouTube and SoundCloud
+when nothing matches. It can play an artist, album, track, genre or any folder on the drive, in order
+or shuffled. A copy of an album in several folders is only played and offered once. With no
+`[library]` paths set the library tools are not offered to the LLM at all.
 
 ## Running
 
 ```bash
 speaker
 ```
+
+### Sharing the work between speakers
+
+Transcription and speech can run on a faster box instead of the speaker that heard you, either
+pinned to one or chosen automatically:
+
+```bash
+speaker --worker-ip 192.168.1.247:8000   # always this worker; nothing loaded locally
+speaker --offload                        # the fastest speaker on the network, else this one
+```
+
+With `--offload`, every speaker and worker found on the network (the same ones the speakers tab
+lists) is asked for its score every 30 seconds — a request each, in the background, so choosing a
+worker costs nothing per turn. Each call goes to the highest scoring node that beats this one; if
+it fails (a connection that doesn't open within 1.5s, an error), the next is tried, and finally this
+speaker's own model, which `--offload` still loads for exactly that. A node that failed is skipped
+until the next poll. The settings tab shows the current order under transcribe and voice.
+
+A node's score is per service. By default it is 1000 for a model on a gpu (`cuda` or `mps`) plus the
+number of cpu cores, so a gpu box beats every Pi and a desktop's cpu beats a Pi's. Set it by hand
+in `config.toml` to override that, for both services:
+
+```toml
+[network]
+score = 1000
+```
+
+A node only serves what it runs itself: a `--worker-ip` satellite scores 0, and a call that
+reaches a node is never passed on to another, so offloading can't go round in circles. Any node
+answers, not only `--worker` ones, so a speaker on the gpu box serves the others too.
 
 ## Running as a Service (Linux)
 
@@ -154,9 +332,11 @@ bash install-service.sh
 
 This copies `setup/oi-speaker@.service` to `/etc/systemd/system/`, enables and starts `oi-speaker@<your-username>`.
 
-Any args passed to the installer are appended to the speaker command line, so to offload inference to a worker:
+Any args passed to the installer are appended to the speaker command line, so to offload inference:
 
 ```bash
+bash install-service.sh --offload
+# or pinned to one worker
 bash install-service.sh --worker-ip 192.168.1.247:8000
 ```
 

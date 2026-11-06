@@ -22,12 +22,22 @@ from pydantic import BaseModel
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
+import alarms
+import backends
 import speaker as spk
+import transcribe
+import voice
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONFIG_PATH = Path("config.toml")
 
 _MDNS_TYPE = "_oi-speaker._tcp.local."
+
+# swappable models: config section -> (module, ctx attribute)
+_MODEL_KINDS = {
+    "transcribe": (transcribe, "transcribe_model"),
+    "voice": (voice, "voice_model"),
+}
 
 
 class SpeakRequest(BaseModel):
@@ -46,6 +56,13 @@ class LevelsEnableRequest(BaseModel):
     enabled: bool
 
 
+class LlmTestRequest(BaseModel):
+    provider: str
+    model: str
+    api_key: str = ""
+    api_base: str = ""
+
+
 _peers_lock = threading.Lock()
 _peers: dict[str, dict] = {}  # keyed by room name
 _zeroconf: AsyncZeroconf | None = None
@@ -61,6 +78,11 @@ def _local_ip() -> str:
         return ip
     except Exception:
         return "unknown"
+
+
+def _peer_list() -> list[dict]:
+    with _peers_lock:
+        return [dict(p) for p in _peers.values()]
 
 
 class _PeerListener:
@@ -115,7 +137,7 @@ async def lifespan(app: FastAPI):
     await _zeroconf.async_register_service(info)
     _browser = AsyncServiceBrowser(_zeroconf.zeroconf, _MDNS_TYPE, _PeerListener())
 
-    spk.start()
+    spk.start(peers=_peer_list)
     yield
 
     spk.shutdown()
@@ -126,6 +148,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# so the alarms page can preview a sound in the browser
+app.mount("/sounds/alarms", StaticFiles(directory=alarms.ALARM_SOUND_DIR, check_dir=False), name="alarm-sounds")
 
 
 class ChatRequest(BaseModel):
@@ -144,7 +168,7 @@ async def chat(req: ChatRequest):
     spk._save_history(spk.CHAT_HISTORY_PATH, entry)
     spk.start_perf_timer()
     loop = asyncio.get_event_loop()
-    state = await loop.run_in_executor(None, spk.query_llm, spk.ctx.llm_client, spk.ctx.system, req.text)
+    state = await loop.run_in_executor(None, spk.query_llm, req.text)
     return {"response": f"[{state.value}]"}
 
 
@@ -163,8 +187,6 @@ async def audio_devices():
     return spk.enumerate_audio_devices()
 
 
-_DEFAULT_CONFIDENTIAL = ["llm.anthropic_api_key"]
-
 # the settings form is generated from whatever keys config.toml happens to hold, so a runtime-tunable
 # key added after a box was set up is unreachable from the web UI — the only place to add it is the
 # config file the UI exists to avoid editing. surface these whether or not they are on disk; saving
@@ -175,19 +197,120 @@ _AUDIO_DEFAULTS = {"duck_volume": 0, "mono_output": False}
 async def get_settings():
     with open(CONFIG_PATH, "rb") as f:
         cfg = tomllib.load(f)
-    meta = cfg.setdefault("meta", {})
-    meta.setdefault("confidential", _DEFAULT_CONFIDENTIAL)
+    # also fills meta.confidential with the vendor key paths
+    spk.migrate_llm_config(cfg)
+    transcribe.migrate_config(cfg)
+    voice.migrate_config(cfg)
     audio = cfg.setdefault("audio", {})
     for key, default in _AUDIO_DEFAULTS.items():
         audio.setdefault(key, default)
+    cfg.setdefault("library", {}).setdefault("paths", [])
     return cfg
 
 
 @app.post("/settings")
 async def update_settings(settings: dict[str, Any] = Body(...)):
+    spk.migrate_llm_config(settings)
+    transcribe.migrate_config(settings)
+    voice.migrate_config(settings)
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(settings).encode())
     spk.apply_audio_settings(settings)
+    spk.apply_llm_settings(settings)
+    spk.apply_transcribe_settings(settings)
+    spk.apply_voice_settings(settings)
+    spk.apply_library_settings(settings)
+    spk.apply_network_settings(settings)
+    return {"ok": True}
+
+
+@app.get("/llm/providers")
+async def llm_providers():
+    return {"providers": spk.PROVIDERS, "efforts": spk.LLM_EFFORTS}
+
+
+@app.get("/llm/models")
+async def llm_models(provider: str, api_base: str = ""):
+    if provider != "ollama":
+        return spk.list_llm_models(provider)
+    # local models are whatever has been pulled, which no registry can know
+    base = (api_base or spk.PROVIDERS["ollama"]["default_api_base"]).rstrip("/")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{base}/api/tags", timeout=5.0)
+            resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"ollama unreachable at {base}: {e}")
+    return [f"ollama_chat/{m['name']}" for m in resp.json().get("models", [])]
+
+
+@app.post("/llm/test")
+async def llm_test(req: LlmTestRequest):
+    loop = asyncio.get_event_loop()
+    error = await loop.run_in_executor(None, spk.test_llm, req.provider, req.model, req.api_key, req.api_base)
+    return {"ok": error is None, "error": error}
+
+
+@app.get("/backends/{kind}")
+async def model_backends(kind: str, backend: str = ""):
+    """Installed backends for transcribe or voice, and the options `backend` (default: the
+    configured one) supports on this machine — the choices depend on what is installed and whether
+    there is a gpu."""
+    if kind not in _MODEL_KINDS:
+        raise HTTPException(status_code=404, detail=f"no model kind '{kind}'")
+    module, attr = _MODEL_KINDS[kind]
+    with open(CONFIG_PATH, "rb") as f:
+        cfg = module.migrate_config(tomllib.load(f))
+    backend = backend or cfg[kind]["backend"]
+    installed = backends.installed(module.BACKENDS)
+    model = getattr(spk.ctx, attr) if spk.ctx else None
+    options = []
+    if backend in installed:
+        loop = asyncio.get_event_loop()
+        # openai lists its models over the network, the others probe the gpu
+        options = await loop.run_in_executor(None, module.backend_options, backend, backends.openai_key(cfg))
+    return {
+        "backends": {name: {"label": b["label"], "extra": b["extra"], "available": name in installed}
+                     for name, b in module.BACKENDS.items()},
+        "backend": backend,
+        "options": options,
+        "active": model.describe() if model else None,
+        "worker_url": model.worker_url if model else None,
+        # under --offload, where calls go in order: the workers that outscore this node, then itself
+        "offload": spk._offload.status()[kind] if spk._offload else None,
+    }
+
+
+def _clock() -> alarms.AlarmClock:
+    if spk._clock is None:
+        raise HTTPException(status_code=503, detail="no alarms on a worker")
+    return spk._clock
+
+
+@app.get("/alarms")
+async def get_alarms():
+    return {**_clock().data(), "sounds": alarms.list_sounds(), "snooze_minutes": alarms.SNOOZE_MINUTES}
+
+
+@app.post("/alarms")
+async def update_alarms(data: dict[str, Any] = Body(...)):
+    """The whole list as the alarms page edited it. Returns it as stored, with ids filled in."""
+    return _clock().replace(data)
+
+
+@app.get("/library")
+async def library_status():
+    if spk._library is None:
+        raise HTTPException(status_code=503, detail="no library on a worker")
+    return spk._library.status()
+
+
+@app.post("/library/rescan")
+async def library_rescan():
+    """Walk the music folders now, for files added since the last scan."""
+    if spk._library is None:
+        raise HTTPException(status_code=503, detail="no library on a worker")
+    spk._library.rescan()
     return {"ok": True}
 
 
@@ -296,8 +419,15 @@ async def rpc_transcribe(audio: UploadFile = File(...)):
         import soxr
         audio_array = (soxr.resample(audio_array.astype(np.float32) / 32767.0, sr, 16000) * 32767).astype(np.int16)
     loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, spk._transcribe_audio, spk.ctx.whisper_model, audio_array, spk.ctx.worker_url)
+    # this node's own model: the caller already chose us, passing it on could go round in a loop
+    text, _ = await loop.run_in_executor(None, spk.transcribe_audio, audio_array, False)
     return {"text": text.strip()}
+
+
+@app.get("/rpc/capabilities")
+async def rpc_capabilities():
+    """This node's name, models and per-service scores, polled by nodes running --offload."""
+    return spk.capabilities()
 
 
 @app.post("/rpc/speak")
@@ -307,17 +437,20 @@ async def rpc_speak(req: SpeakRequest):
         raise HTTPException(status_code=503, detail="speaker not ready")
     spk.log(f"rpc: speaking for remote caller: {req.text[:60]}")
     voice_model = spk.ctx.voice_model
+    if voice_model is None or voice_model.sample_rate is None:
+        raise HTTPException(status_code=503, detail="no voice model loaded")
     text = spk._strip_markdown(req.text)
 
     def generate():
-        yield _wav_header(voice_model.config.sample_rate)
-        for chunk in voice_model.synthesize(text):
-            yield chunk.audio_int16_bytes
+        yield _wav_header(voice_model.sample_rate)
+        for chunk in voice_model.stream(text):
+            yield chunk.tobytes()
 
     return StreamingResponse(generate(), media_type="audio/wav")
 
 
-_LOCAL_ONLY_SECTIONS = {"audio", "network"}
+# transcribe and voice too: which backends are installed, and whether there is a gpu, differs per box
+_LOCAL_ONLY_SECTIONS = {"audio", "network", "transcribe", "voice", "library"}
 
 @app.post("/rpc/sync-config")
 async def rpc_sync_config(req: SyncConfigRequest):
@@ -331,12 +464,14 @@ async def rpc_sync_config(req: SyncConfigRequest):
         resp.raise_for_status()
     remote_cfg: dict = resp.json()
     with open(CONFIG_PATH, "rb") as f:
-        local_cfg = tomllib.load(f)
+        # migrated first, or whisper settings still under [inference] are lost with the remote's copy
+        local_cfg = voice.migrate_config(transcribe.migrate_config(tomllib.load(f)))
     for section in _LOCAL_ONLY_SECTIONS:
         if section in local_cfg:
             remote_cfg[section] = local_cfg[section]
     with open(CONFIG_PATH, "wb") as f:
         f.write(tomli_w.dumps(remote_cfg).encode())
+    spk.apply_llm_settings(remote_cfg)
     return {"ok": True}
 
 
