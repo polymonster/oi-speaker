@@ -16,7 +16,7 @@ From this folder, one command builds an enclosure (here `og`) from its design to
 
 `uv` fetches the packages in [utils/requirements.txt](utils/requirements.txt) the first time. Add `--no-blender` to
 skip the Blender step, or `--sheet 2440x1220` for a different sheet size. It stops at the first step that fails,
-and ends with the checker's "all good". The package to send is `og/out/oi_og_cnc_v0.zip`, and `og/out/email.txt` has
+and ends with the checker's "all good". The package to send is the newest `og/out/oi_og_cnc_v<n>.zip`, and `og/out/email.txt` has
 the text for the email.
 
 [build.py](utils/build.py) runs these, which can also be run one at a time (`python` meaning the `uv run ...`
@@ -27,7 +27,7 @@ above):
 2. `blender --background --python utils/build_blend.py -- <folder> --render`: `out/<name>.blend` to look at it,
    plus front and back renders for the shop's PDF. Optional, but `drawings.pdf` has no renders without it.
 3. `python utils/export_cnc.py <folder>`: the package for the CNC shop. Every run rewrites `out/cnc/` and
-   `out/<name>_cnc_<revision>.zip`, and `out/email.txt`.
+   `out/email.txt`, and adds a new `out/<name>_cnc_<revision>.zip`, numbered on from the zips already there.
 4. `python utils/check_cnc.py <folder>`: reads the package back as the shop's software would and checks it.
    It must end with "all good".
 

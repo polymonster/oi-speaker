@@ -17,8 +17,8 @@ Reference sheet for the `og` design. The numbers come from `oi_og_enclosure.py`;
 | Inside (W × D × H) | 114 × 174 × 120 mm |
 | Volume | 2.380 L gross, **2.207 L net** (after the driver 0.12, PR 0.04 and conduit 0.014 L) |
 | Tuning | 69.5 Hz with no added mass on the PR, confirmed in the 00 Audio simulator (`project.00sim`) |
-| Driver | Dayton **RS100-8**: 98 mm OD, 77.7 mm cutout, 5 mm flange rebate. Centred at x=75, 164 mm off the floor |
-| Passive radiator | Dayton **ND90-PR**: 103.4 mm OD, 85.6 mm cutout, 104.4 mm × 5 mm recess, 60.7 mm deep. Fs 53.8 Hz, Qms 6.15, Mms 8.1 g, Vas 1.5 L, Sd 31.2 cm², Xmax 9 mm. Centred on the back panel, x=75 |
+| Driver | Dayton **RS100-8**: 82 mm cutout (card-tested; the listed 77.2 mm won't clear the frame's arches), 104 mm × 5 mm flange rebate (generous, so it's sure to fit). Centred at x=75, 164 mm off the floor |
+| Passive radiator | Dayton **ND90-PR**: 82 mm cutout (card-tested), 115.6 mm × 5 mm round rebate (generous, so it's sure to fit; same depth as the driver's, the thin flange sits deeper on foam; the flats leave gaps), 60.7 mm deep. Fs 53.8 Hz, Qms 6.15, Mms 8.1 g, Vas 1.5 L, Sd 31.2 cm², Xmax 9 mm. Centred on the back panel, x=75 |
 | Driver to PR gap inside | 72.3 mm |
 | Cable conduit | 12 mm OD tube (~9 mm bore, takes a USB-C plug) against the left wall, 38 mm in from the back (x=24, y=172), so it comes up into the cap clear of the corner pad. Sealed at both ends. Any wider and the PR has to move off centre |
 | Speaker wire hole | 8 mm through the shelf, rear-right corner |
@@ -55,8 +55,8 @@ excursion stays under 9 mm at full power.
 | cap_left_right | 2 | 9 | 201 × 25.5 | Arched bridge walls, left and right are the same part |
 | cap_grille | 1 | 9 | 150 × 210 | Slotted top, rabbeted for the walls |
 | cap_pad_fl_fr_rl_rr | 4 | 18 | 20 × 20 | Offcuts. Dowel on the diagonal, so any pad fits any corner, any way round |
-| tray_plate | 1 | 9 | 113 × 67 | Back connector panel |
-| tray_floor | 1 | 9 | 113 × 174.5 | The Pi sits on it. 113 × 169.5 is usable |
+| tray_plate | 1 | 9 | 112 × 67 | Back connector panel |
+| tray_floor | 1 | 9 | 112 × 174.5 | The Pi sits on it. 112 × 169.5 is usable |
 
 ## Mic cap
 - The legs sit flush on the body. The arched gaps are 9 mm tall (1 mm under the mic board, so its edge is hidden), 90 mm wide front and back, and 150 mm wide on
@@ -88,8 +88,8 @@ The jack is on the Amp4's side, so its lead runs straight down that wall to the 
 
 | Part | Product | Hole | Key dimensions |
 |---|---|---|---|
-| DC jack | Adafruit **5607** panel-mount 5.5/2.1 lead, 30 cm | 22.5 mm | M22 × 14 mm thread, 28 mm × 2.5 mm flange, 30 mm nut, 33.5 mm overall (22 mm behind the panel) |
-| USB | Adafruit panel-mount USB-A extension, 16 cm | 15 × 8 mm slot | Ears at 29 mm pitch, screwed from inside with No.4 × 6 mm wood screws (2 mm pilots, ~5 mm deep). Nothing shows outside |
+| DC jack | Adafruit **5607** panel-mount 5.5/2.1 lead, 30 cm | 23.5 mm | M22 × 14 mm thread, 28 mm × 2.5 mm flange, 30 mm nut, 33.5 mm overall (22 mm behind the panel) |
+| USB | Adafruit panel-mount USB-A extension, 16 cm | 16 × 9 mm slot | Ears at 29 mm pitch, screwed from inside with No.4 × 6 mm wood screws (2 mm pilots, ~5 mm deep). Nothing shows outside |
 | Button | Adafruit **1505** 16 mm momentary, black | 16.2 mm | 18 mm bezel, 15.6 mm × 18.5 mm thread, 29.5 mm overall, 2.8 mm quick-connect tags |
 
 ## Fixings
@@ -105,9 +105,6 @@ The jack is on the Amp4's side, so its lead runs straight down that wall to the 
 | Parameter | What to measure |
 |---|---|
 | `T`, `T9` | Real ply thickness |
-| `PR_FLANGE`, `PR_FLATS` | Flange thickness and shape on the ND90-PR |
-| `DRV_FLANGE` | Flange thickness on the RS100-8 |
-| `USB_CUT` | USB stub body |
 | `BARREL_NUT_T` | Barrel jack nut thickness; 5 mm or less fits |
 | `USB_PLUG`, `DC_PLUG`, `BARREL_BOOT` | Plug and boot sizes |
 | `BUTTON_CRIMPS` | Button crimp length; currently 8 mm clear of the Pi's plugs |
