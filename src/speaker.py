@@ -1063,7 +1063,8 @@ def _listen_for_wake(wake_model, stream, sample_rate: int,
             _levels.set_score(float(score))
             score_window.append(score > threshold)
             hits = sum(score_window)
-            if score > 0.0:
+            # the model idles at tiny non-zero scores that print as 0.000, so skip those
+            if score >= 0.01:
                 if "--verbose" in sys.argv:
                     log(f"[wakeword] score: {score:.3f} ({hits}/{num_triggers})")
             if hits >= num_triggers:
