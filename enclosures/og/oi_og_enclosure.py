@@ -40,10 +40,10 @@ import trimesh
 # ----------------------------------------------------------------------------
 P = dict(
     # stock
-    T=18.0,            # main ply, MEASURE your sheet (often 17.5-18.2)
-    T9=9.0,            # cap / Pi tray ply
+    T=18.5,            # main ply: the shop measured 18.2, +0.3 so the dados aren't tight
+    T9=9.5,            # cap / Pi tray ply: measured 9.3, +0.2 so the rabbets aren't tight
     DADO=6.0,          # dado/rabbet depth in 18mm stock
-    RAB9=4.5,          # rabbet depth in 9mm stock
+    RAB9=4.75,         # rabbet depth in 9mm stock: half of T9, so every 9mm rabbet is the same depth (one layer)
     BIT=6.0,           # router bit diameter the shop uses (dogbones)
     # outer box
     W=150.0,           # external width
@@ -55,13 +55,18 @@ P = dict(
     # Pi bay
     BAY_H=68.0,        # internal height of the Pi bay
     FIN_D=30.0,        # depth of the front cross fins
-    # driver: Dayton RS100-8
-    DRV_OD=98.0, DRV_CUT=77.2, DRV_FLANGE=5.0, DRV_Z_FRAC=0.5,
+    # driver: Dayton RS100-8. the listed 77.2mm cutout doesn't fit: the frame's arches foul a 77.7mm hole.
+    # an 82mm hole fits the real driver (card test). 104mm rebate: sized generously, a gap beats a part that
+    # won't fit. DRV_OD is the flange the rebate allows for
+    DRV_OD=103.0, DRV_CUT=81.5, DRV_FLANGE=5.0, DRV_Z_FRAC=0.5,
     # passive radiator: Dayton ND90-PR (4.07" overall, 3.35" cutout per Dayton, 2.39" deep).
-    # the flange is not round: its recess is a PR_OD circle cut down to PR_FLATS across, square on
-    # to the panel. None = plain round recess at PR_OD, which fits whatever the shape, with gaps.
-    # MEASURE: PR_OD across the corners, PR_FLATS across the flat sides, PR_FLANGE its thickness
-    PR_OD=103.4, PR_FLATS=None, PR_CUT=85.1, PR_FLANGE=5.0, PR_Z_FRAC=0.5, PR_BASKET=85.1,
+    # an 82mm hole fits the real part (card test), smaller than Dayton's cutout.
+    # the flange is thin sheet metal and not round, 12-15mm past that hole at its widest by hand. its rebate
+    # is a plain 115.6mm circle, PR_RIM wider than the hole all round, sized generously: a gap beats a part
+    # that won't fit, so the flats leave gaps. PR_REBATE deep, the same as the driver's: it sits deeper on foam.
+    # PR_OD is across the corners, PR_FLATS across the flat sides (about 95 by hand), PR_FLANGE its
+    # thickness (about 1, too thin to measure); those three only shape the model
+    PR_OD=103.4, PR_FLATS=95.0, PR_CUT=81.5, PR_FLANGE=1.0, PR_RIM=16.8, PR_REBATE=5.0, PR_Z_FRAC=0.5, PR_BASKET=81.0,
     PR_DEPTH=60.7,
     CUT_CLEAR=0.5,     # added to driver/PR cutouts
     # mic cap (9mm ply)
@@ -85,14 +90,14 @@ P = dict(
     # Pi tray connectors
     # Adafruit 5607 panel-mount barrel lead (drawing C17817): M22 thread 14 long, 28mm flange 2.5 thick,
     # 33.5 overall, 30mm nut. 22mm behind a 9mm panel, plus the cable's strain relief
-    BARREL_HOLE=22.5, BARREL_FLANGE=28.0, BARREL_FLANGE_T=2.5, BARREL_LEN=33.5, BARREL_THREAD=14.0,
+    BARREL_HOLE=23.5, BARREL_FLANGE=28.0, BARREL_FLANGE_T=2.5, BARREL_LEN=33.5, BARREL_THREAD=14.0,
     BARREL_NUT=30.0, BARREL_NUT_T=4.0,   # nut thickness not on the drawing — CHECK, <=5 fits a 9mm panel
-    USB_CUT=(15.0, 8.0),     # USB-A panel stub body — CHECK with calipers
+    USB_CUT=(16.0, 9.0),     # USB-A panel stub: card-tested at 15 x 8, opened 0.5mm a side for give
     USB_SCREW_PITCH=29.0,    # M3 ears ~29mm apart
     # screwed from inside: short wood screws through the ears into the plate, nothing shows outside.
     # if the ears are threaded, drill them out to 3.2mm first
     USB_PILOT=2.0,           # No.4 x 6mm pan-head wood screw pilot, ~5mm deep, hand-drilled through the ears
-    BUTTON_HOLE=16.2,        # Adafruit 1505 16mm momentary: 15.6mm thread 18.5 long, 18mm bezel, 29.5 overall
+    BUTTON_HOLE=16.2,        # card-tested; kept tight because the bezel only overlaps 0.9mm a side. Adafruit 1505 16mm momentary: 15.6mm thread 18.5 long, 18mm bezel, 29.5 overall
     BUTTON_HEAD=18.0,
     BUTTON_CRIMPS=15.0,      # 2.8mm quick-connect crimps on the tags, behind the switch
     # Pi 5 + HiFiBerry Amp4 stack on M2.5 standoffs. PI_ROT turns the board about its own corner:
@@ -106,18 +111,25 @@ P = dict(
     BARREL_CABLE_D=4.0,
 )
 
-NAME = 'oi_og'   # names the outputs: oi_og.glb, oi_og.blend, oi_og_cnc_<REVISION>.zip
-# bump whenever files go to the shop changed: it's on every page of drawings.pdf and in the zip's name
-REVISION = 'v0'
+NAME = 'oi_og'   # names the outputs: oi_og.glb, oi_og.blend, oi_og_cnc_<revision>.zip
+# colour of each layer on the sheets, DXFs and PDFs: (AutoCAD colour index, name). pinned, so adding a
+# layer never moves the others; a layer missing here gets a spare colour from export_cnc.py
+CNC_COLOURS = {
+    'POCKET_A_6mm': (3, 'green'),       # 18mm ply dados and rabbets
+    'POCKET_A_4.75mm': (1, 'red'),      # 9mm ply rabbets
+    'POCKET_B_6mm': (30, 'orange'),     # the shelf's underside dado, and the dowel holes in the top
+    'POCKET_A_8mm': (6, 'magenta'),     # dowel holes in the cap pads
+    'POCKET_A_5mm': (5, 'blue'),        # driver and passive radiator rebates
+}
 
 # for ../utils/export_cnc.py: the brief's own words. {flip} is the parts with face B pockets, {bit} the BIT
 CNC_BRIEF = dict(
     title='Oi Speaker enclosure - CNC brief',
     summary='One set of parts for a small speaker enclosure.',
-    material=['18 mm and 9 mm birch plywood, BB grade or better (the edges are on show).'],
+    material=['18 mm and 9 mm birch plywood, BB grade or better (the edges are on show).',
+              'Cut from your sheets measured at 18.2 mm and 9.3 mm. The files are drawn at 18.5 and 9.5 mm on purpose:',
+              'that sizes the dados and rabbets 0.3 / 0.2 mm wider than the ply, so they go together with glue.'],
     questions=[
-        "Measured thickness of the 18mm and 9mm sheets you'll cut from - the dados are sized to it, "
-        "so the files will be regenerated to match before the final cut.",
         'Bit diameter - the design assumes {bit:g}mm (inside corners have a radius of half that).',
         'Can you machine pockets on both faces (POCKET_B layers, on {flip})? If not, I can cut those by hand.',
         'Will you spot-drill the MARK_DRILL points, or leave them?',
@@ -168,8 +180,8 @@ DEPTH = CH_D + 2 * T
 CONDUIT_X = T + CONDUIT_OD / 2   # against the left wall
 # far enough forward to come up into the cap clear of the rear-left corner pad, so no pad needs a notch
 CONDUIT_Y = DEPTH - T9 - CAP_PAD - CONDUIT_OD / 2 - 2.5
-# the PR's widest extent across the panel — the flats if it has them, else its diameter
-PR_HALF = (PR_FLATS if PR_FLATS else PR_OD) / 2
+# the PR rebate's radius: the hole plus its rim
+PR_HALF = (PR_CUT + CUT_CLEAR) / 2 + PR_RIM
 Z_BOT1 = T
 Z_SH0 = T + BAY_H
 Z_SH1 = Z_SH0 + T
@@ -381,14 +393,10 @@ bu, bv = wcirc(baffle, W / 2, DRV_Z, 0, 'XZ')
 baffle.circles.append((bu, bv, (DRV_CUT + CUT_CLEAR) / 2))
 baffle.pockets.append((Point(bu, bv).buffer((DRV_OD + 1) / 2, 128), T - DRV_FLANGE, T))
 
-# passive radiator on back
+# passive radiator on back: through cut + shallow round rebate for the thin flange
 pu, pv = wcirc(back, PR_X, PR_Z, 0, 'XZ')
 back.circles.append((pu, pv, (PR_CUT + CUT_CLEAR) / 2))
-pr_recess = Point(pu, pv).buffer((PR_OD + 1) / 2, 128)
-if PR_FLATS:
-    f = (PR_FLATS + 1) / 2
-    pr_recess = pr_recess.intersection(sbox(pu - f, pv - f, pu + f, pv + f))
-back.pockets.append((pr_recess, T - PR_FLANGE, T))
+back.pockets.append((Point(pu, pv).buffer(PR_HALF, 128), T - PR_REBATE, T))
 
 # conduit + speaker wire holes
 for p in (top, shelf):
@@ -488,8 +496,9 @@ for tag, x0, y0 in pad_corners:
         pad.through.append(hole)
 
 # --- Pi tray, 9mm ------------------------------------------------------------
-TR_X0, TR_X1 = T + 0.5, W - T - 0.5
-plate = add(panel('tray_plate', ((TR_X0, DEPTH - T9, T), (TR_X1, DEPTH, Z_SH0 - 1)), '-Y', '+X', group='tray',
+TR_X0, TR_X1 = T + 1.0, W - T - 1.0     # 1mm a side, so it still slides into a hand-assembled carcass
+TR_TOP = Z_SH0 - 1
+plate = add(panel('tray_plate', ((TR_X0, DEPTH - T9, T), (TR_X1, DEPTH, TR_TOP)), '-Y', '+X', group='tray',
                   note='9mm, face A = inside. Connectors mount here'))
 floor_ = add(panel('tray_floor', ((TR_X0, FIN_D + 1, T), (TR_X1, DEPTH - RAB9, T + T9)), '+Z', '+X', group='tray',
                    note='9mm; slides on bottom, stops on fins'))
@@ -517,12 +526,12 @@ for s in (-1, 1):
     plate.marks.append((u_ + s * USB_SCREW_PITCH / 2, v_, USB_PILOT, 'pilot, inside, not through'))
 # finger notch, top right from behind
 NOTCH_X, NOTCH_R = TR_X0 + 18.0, 12.0
-u_, v_ = plate_uv(NOTCH_X, Z_SH0 - 1)
+u_, v_ = plate_uv(NOTCH_X, TR_TOP)
 notch = Point(u_, v_).buffer(NOTCH_R, 64)
 plate.through.append(notch)
 # vent grille across the top: upright slots on the cap grille's pitch, from above the barrel flange
 # (the tallest thing in the row) to the top edge, skipping any that would run into the notch
-VENT_Z0, VENT_Z1 = ROW_Z + 15.0 + 4.0, Z_SH0 - 1 - 4.0
+VENT_Z0, VENT_Z1 = ROW_Z + 15.0 + 4.0, TR_TOP - 4.0
 for i in range(20):
     xs = TR_X1 - 7.5 - i * SLOT_PITCH
     u_, v_ = plate_uv(xs, (VENT_Z0 + VENT_Z1) / 2)
@@ -640,20 +649,20 @@ drv_tag = mf.Manifold.cube((3.0, 7.0, 0.8)).translate((-1.5, 27.5, 26.5))   # so
 hw['hw_driver_terminals'] = mount(drv_tag.translate((-5.5, 0, 0)) + drv_tag.translate((5.5, 0, 0)), W / 2, DRV_Z, 0.0, 1)
 
 # Dayton ND90-PR: square flange with round corners, 4 screws, flat diaphragm on a deep roll, open frame
-# behind with the spider and the stud the mass discs go on
-pr_flats = PR_FLATS or 92.0   # visual only: the recess stays a PR_OD circle while PR_FLATS is None
-pr_flange = ((mf.Manifold.cylinder(PR_FLANGE - 1.0, PR_OD / 2, PR_OD / 2, 96).translate((0, 0, 1.0))
-              ^ mf.Manifold.cube((pr_flats, pr_flats, PR_FLANGE), center=True).translate((0, 0, PR_FLANGE / 2)))
-             + revolve([(41.5, 0.3), (48.0, 0.0), (PR_OD / 2 - 1.0, 1.0), (41.5, 1.0)])
-             - mf.Manifold.cylinder(PR_FLANGE + 2, 41.5, 41.5, 96).translate((0, 0, -1)))
-pr_basket = shell(PR_BASKET / 2 - 0.5, PR_FLANGE, 30.0, 32.0, 2.0) - windows(45, 9.0, 29.0, 4, 30.0)
+# behind with the spider and the stud the mass discs go on. the flange rests on the rebate floor, so
+# depth 0 here is its outer face (the foam gasket under it isn't modelled)
+PR_Y = DEPTH - PR_REBATE + PR_FLANGE
+pr_flange = ((mf.Manifold.cylinder(PR_FLANGE, PR_OD / 2, PR_OD / 2, 96)
+              ^ mf.Manifold.cube((PR_FLATS, PR_FLATS, PR_FLANGE), center=True).translate((0, 0, PR_FLANGE / 2)))
+             - mf.Manifold.cylinder(PR_FLANGE + 2, 40.5, 40.5, 96).translate((0, 0, -1)))
+pr_basket = shell(PR_BASKET / 2 - 0.5, PR_FLANGE + 0.7, 30.0, 32.0, 2.0) - windows(45, 9.0, 29.0, 4, 30.0)
 pr_hub = revolve([(26.0, 30.5), (30.0, 30.5), (30.0, 34.0), (3.5, 34.0), (3.5, 33.0), (26.0, 33.0)])   # spider ring
 pr_screws = ring_of(button_head(), (PR_OD / 2 - 4.5), 4, 45.0)
-hw['hw_pr'] = mount(pr_flange + pr_basket + pr_hub + pr_screws, PR_X, PR_Z, DEPTH, -1)
-hw['hw_pr_cone'] = mount(roll(31.5, 41.4, 1.6, 4.0) + revolve([(0, 4.2), (32.3, 1.6), (32.3, 2.6), (0, 5.2)]),
-                         PR_X, PR_Z, DEPTH, -1)
-hw['hw_pr_spider'] = mount(revolve([(6.0, 29.5), (25.5, 29.5), (25.5, 30.5), (6.0, 30.5)]), PR_X, PR_Z, DEPTH, -1)
-hw['hw_pr_stud'] = mount(revolve([(0, 5.2), (3.0, 5.2), (3.0, PR_DEPTH), (0, PR_DEPTH)]), PR_X, PR_Z, DEPTH, -1)
+hw['hw_pr'] = mount(pr_flange + pr_basket + pr_hub + pr_screws, PR_X, PR_Z, PR_Y, -1)
+hw['hw_pr_cone'] = mount(roll(31.5, 40.4, 1.6, 4.0) + revolve([(0, 4.2), (32.3, 1.6), (32.3, 2.6), (0, 5.2)]),
+                         PR_X, PR_Z, PR_Y, -1)
+hw['hw_pr_spider'] = mount(revolve([(6.0, 29.5), (25.5, 29.5), (25.5, 30.5), (6.0, 30.5)]), PR_X, PR_Z, PR_Y, -1)
+hw['hw_pr_stud'] = mount(revolve([(0, 5.2), (3.0, 5.2), (3.0, PR_DEPTH), (0, PR_DEPTH)]), PR_X, PR_Z, PR_Y, -1)
 hw['hw_conduit'] = mf.Manifold.cylinder(H - T - Z_SH0 + 0, CONDUIT_OD / 2, CONDUIT_OD / 2, 48).translate((CONDUIT_X, CONDUIT_Y, Z_SH1)) \
     - mf.Manifold.cylinder(H, 6.5, 6.5, 48).translate((CONDUIT_X, CONDUIT_Y, 0))
 hw['hw_conduit'] = mf.Manifold.cylinder(Z_CH1 - Z_CH0, CONDUIT_OD / 2, CONDUIT_OD / 2, 48).translate((CONDUIT_X, CONDUIT_Y, Z_CH0)) \
@@ -857,8 +866,8 @@ R()
 R('material left around cutouts:')
 R(f'  baffle: driver rebate edge -> panel edge {min(W/2 - (DRV_OD+1)/2 - XI0, 0+999):.1f} mm (sides), '
   f'top {Z_CH1 + DADO - (DRV_Z + (DRV_OD+1)/2):.1f} mm')
-R(f'  back  : PR rebate edge -> right edge {XI1 - (PR_X + PR_HALF + 0.5):.1f} mm, left {PR_X - PR_HALF - 0.5 - XI0:.1f} mm, '
-  f'bottom {PR_Z - PR_HALF - 0.5 - (Z_SH1 - DADO):.1f} mm')
+R(f'  back  : PR rebate edge -> right edge {XI1 - (PR_X + PR_HALF):.1f} mm, left {PR_X - PR_HALF - XI0:.1f} mm, '
+  f'bottom {PR_Z - PR_HALF - (Z_SH1 - DADO):.1f} mm')
 R(f'  driver/PR gap inside: {CH_D - (51.0 - DRV_FLANGE) - (PR_DEPTH - PR_FLANGE):.1f} mm front to back')
 # glue faces of the chamber: check the chamber is closed — build air volume and test leak
 air = mf.Manifold.cube((CH_W, CH_D, CH_H)).translate((T, T, Z_CH0))
@@ -944,7 +953,9 @@ def draw_part(msp, p, dx=0, dy=0, label=True, name=None, qty=None):
         face = 'A' if z1 >= p.t - 1e-6 else 'B'
         layer = f'POCKET_{face}_{d:g}mm'
         if poly.geom_type == 'Polygon' and len(poly.exterior.coords) > 60 and abs(poly.area - math.pi * (poly.length / (2 * math.pi)) ** 2) / poly.area < 0.01:
-            c = poly.centroid; r = poly.length / (2 * math.pi)
+            # the radius from the corners, which sit on the circle (the perimeter falls short of it), rounded
+            # to the micron so a 3mm radius is written as 3, not 2.99999
+            c = poly.centroid; r = round(max(math.dist((c.x, c.y), q) for q in poly.exterior.coords), 3)
             msp.add_circle((c.x + dx, c.y + dy), r, dxfattribs={'layer': layer})
         else:
             # clip to part outline so pockets never extend past the edge
@@ -972,8 +983,7 @@ def draw_part(msp, p, dx=0, dy=0, label=True, name=None, qty=None):
 def new_doc():
     doc = ezdxf.new('R2010', setup=True)
     doc.units = ezdxf.units.MM
-    cols = {'CUT_THROUGH': 7, 'POCKET_A_6mm': 1, 'POCKET_A_5mm': 3, 'POCKET_A_4.5mm': 1, 'POCKET_A_3mm': 6,
-            'POCKET_B_6mm': 5, 'POCKET_B_3mm': 4, 'POCKET_B_4.5mm': 5, 'POCKET_A_8mm': 6, 'MARK_DRILL': 2, 'INFO': 8}
+    cols = {'CUT_THROUGH': 7, 'MARK_DRILL': 2, 'INFO': 8, **{k: c for k, (c, _) in CNC_COLOURS.items()}}
     for k, c in cols.items():
         doc.layers.add(k, color=c)
     return doc
@@ -1030,9 +1040,9 @@ with open(os.path.join(OUT, 'parts.json'), 'w') as f:
     # face B (0) to face A (t). check_cnc.py puts the cut parts back with this to prove which way up they are
     placement = {p.name: dict(origin=p.origin.tolist(), u=p.u.tolist(), v=p.v.tolist(), n=p.n.tolist(), t=p.t,
                               bounds=list(p.outline.bounds)) for p in parts.values()}
-    json.dump({'name': NAME, 'revision': REVISION, 'groups': meta, 'cut_as': {name: members for name, _, _, members in cut_parts},
+    json.dump({'name': NAME, 'groups': meta, 'cut_as': {name: members for name, _, _, members in cut_parts},
                'placement': placement, 'origin': list(GLB_ORIGIN),
-               'cnc': dict(bit=BIT, brief=CNC_BRIEF), 'blend': BLEND,
+               'cnc': dict(bit=BIT, brief=CNC_BRIEF, colours=CNC_COLOURS), 'blend': BLEND,
                'params': P, 'derived': dict(H=H, CH_H=CH_H, CH_W=CH_W, CH_D=CH_D, DEPTH=DEPTH,
                                             TOTAL_H=TOTAL_H)}, f, indent=1)
 

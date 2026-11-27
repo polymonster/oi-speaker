@@ -5,7 +5,7 @@
 Runs, stopping at the first that fails:
   1. the design script, <folder>/*_enclosure.py      -> out/ (dxf, cutlist, glb, parts.json)
   2. build_blend.py in Blender, with renders           -> out/<name>.blend, out/preview_*.png
-  3. export_cnc.py                                     -> out/cnc/, out/<name>_cnc.zip, out/email.txt
+  3. export_cnc.py                                     -> out/cnc/, out/<name>_cnc_<revision>.zip, out/email.txt
   4. check_cnc.py, which must end "all good"
 
 Blender is found on the PATH or in Program Files; without it, or with --no-blender, step 2 is skipped and

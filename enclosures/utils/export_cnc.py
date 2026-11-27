@@ -1,4 +1,4 @@
-"""Package an enclosure's out/dxf for the CNC shop, in out/cnc/ plus out/<name>_cnc.zip (made every run),
+"""Package an enclosure's out/dxf for the CNC shop, in out/cnc/ plus out/<name>_cnc_<revision>.zip (a new revision every run),
 with the brief as plain text in out/email.txt to paste into the email, with the questions for the shop added:
 
     python utils/export_cnc.py <enclosure folder> [--sheet 1220x607]
@@ -176,6 +176,7 @@ def main():
     args = ap.parse_args()
     sheet_w, sheet_h = (float(v) for v in args.sheet.lower().split("x"))
     enc = Enclosure(args.enclosure)
+    enc.new_revision()
     use_oda()
     CNC = enc.cnc
     brief_in = enc.manifest["cnc"]["brief"]
@@ -189,8 +190,14 @@ def main():
 
     used = sorted({e.dxf.layer for _, cut, _ in parts.values() for e in cut} - set(FIXED_COLOURS),
                   key=lambda n: (n[:8], float(n.split("_")[-1][:-2])))
-    assert len(used) <= len(COLOURS), "more pocket layers than colours"
-    colours = {**FIXED_COLOURS, **dict(zip(used, COLOURS))}
+    # the design pins its colours; any layer it leaves out takes the next colour no other layer is using
+    pinned = {k: tuple(v) for k, v in enc.manifest["cnc"].get("colours", {}).items()}
+    spare = iter(c for c in COLOURS if c[0] not in {v[0] for v in pinned.values()})
+    colours = {**FIXED_COLOURS, **pinned}
+    for layer in used:
+        if layer not in colours:
+            colours[layer] = next(spare, None)
+            assert colours[layer], "more pocket layers than colours"
     for doc, _, _ in parts.values():  # the part pages in drawings.pdf match the sheets
         for layer in doc.layers:
             if layer.dxf.name in colours:
@@ -237,7 +244,7 @@ def main():
 
     # one plain-text brief: the PDF's cover page, and out/email.txt to paste into the email
     board = " (a quarter of a 2440 x 1220 board)" if (sheet_w, sheet_h) == (1220, 607) else ""
-    brief = [brief_in["title"], f"Revision {enc.revision or '-'}, built {date.today().isoformat()}. "
+    brief = [brief_in["title"], f"Revision {enc.revision}, built {date.today().isoformat()}. "
              f"Package: {enc.zip.name}.zip", "",
              f"{brief_in['summary']} All files are in mm, at 1:1.", "",
              "FILES",

@@ -7,12 +7,12 @@ Edit the `P = dict(...)` block at the top of [oi_og_enclosure.py](oi_og_enclosur
 
     uv run --no-project --with-requirements utils/requirements.txt python utils/build.py og
 
-That regenerates everything in `og/out/`, ending with "all good" and the package to send, `oi_og_cnc_v0.zip`.
-Before sending changed files to the shop, bump `REVISION` (`v0` → `v1`) near the top of the design script: it
-names the zip and is stamped on every page of `drawings.pdf`.
+That regenerates everything in `og/out/`, ending with "all good" and the package to send, the newest `oi_og_cnc_v<n>.zip`.
+Every build takes the next revision, so older zips are never overwritten. The revision names the zip and is
+stamped on every page of `drawings.pdf`.
 
 Key knobs: `T`/`T9` (measured ply thickness), `DADO`, `BIT`, `CHAMBER_NET_L` (from the box sim) and `CHAMBER_H`:
-the box depth is derived from the two. Also `BAY_H`, `W`, `PR_OD`/`PR_FLATS` (passive radiator flange), cap gap
+the box depth is derived from the two. Also `BAY_H`, `W`, `PR_RIM`/`PR_REBATE` (passive radiator rebate), cap gap
 and heights, connector cutout sizes. The CNC brief's wording and questions are `CNC_BRIEF`; Blender's
 collections, sliders and hardware colours are `BLEND`.
 
@@ -20,7 +20,7 @@ collections, sliders and hardware colours are `BLEND`.
 - `dxf/*.dxf`, one per part; `all_parts.dxf`, everything laid out (not nested)
 - `cutlist.csv`, `report.txt` (volumes, clearances, clash check)
 - `oi_og.glb`, the assembly (Y-up, mm, origin at the middle of the base), and `parts.json`, its manifest
-- from the shared tools: `oi_og.blend`, `preview_front.png`/`preview_back.png`, `cnc/`, `oi_og_cnc_v0.zip`,
+- from the shared tools: `oi_og.blend`, `preview_front.png`/`preview_back.png`, `cnc/`, `oi_og_cnc_v<n>.zip`,
   `email.txt`
 
 [og.00sim](og.00sim) is the box simulation (simulator.00aud.io): RS100-8 and ND90-PR in 2.2 L.
@@ -38,7 +38,4 @@ collections, sliders and hardware colours are `BLEND`.
    stops on the fins.
 
 ## Check before cutting
-- USB stub body size (`USB_CUT`): measure with calipers.
-- Driver/PR flange thickness (`DRV_FLANGE`/`PR_FLANGE`) for flush rebates, and the PR's width across its flats
-  (`PR_FLATS`).
 - The shop's measured sheet thickness (`T`/`T9`) and bit (`BIT`).
