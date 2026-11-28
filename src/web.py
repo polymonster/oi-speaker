@@ -25,6 +25,7 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 import alarms
 import backends
 import speaker as spk
+import sysinfo
 import transcribe
 import voice
 
@@ -191,7 +192,7 @@ async def audio_devices():
 # key added after a box was set up is unreachable from the web UI — the only place to add it is the
 # config file the UI exists to avoid editing. surface these whether or not they are on disk; saving
 # writes them back. keep in step with apply_audio_settings()
-_AUDIO_DEFAULTS = {"duck_volume": 0, "mono_output": False}
+_AUDIO_DEFAULTS = {"duck_volume": 0, "mono_output": False, "aec_reference": False, "aec_output_sink": ""}
 
 @app.get("/settings")
 async def get_settings():
@@ -353,6 +354,12 @@ async def status():
         "wake_threshold": spk.ctx.wake_threshold if spk.ctx else None,
         "vad_threshold": spk.ctx.vad.threshold if spk.ctx and spk.ctx.vad else None,
     }
+
+
+# a plain def, so fastapi runs it on a worker thread: the vcgencmd and nvidia-smi lookups block
+@app.get("/system")
+def system():
+    return sysinfo.snapshot()
 
 
 @app.get("/peers")

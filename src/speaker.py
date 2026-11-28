@@ -39,6 +39,7 @@ from openwakeword.model import Model
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+import aec_reference
 import alarms
 import backends
 import library
@@ -1978,6 +1979,8 @@ def apply_audio_settings(config: dict):
     _duck_volume = max(0, min(100, int(audio_cfg.get("duck_volume", _duck_volume))))
     _mono_output = bool(audio_cfg.get("mono_output", False))
     log(f"audio settings applied — duck_volume={_duck_volume} mono_output={_mono_output}")
+    # play what we output to the XVF3800 too, so its echo canceller can take it out of the mic
+    aec_reference.apply(bool(audio_cfg.get("aec_reference", False)), str(audio_cfg.get("aec_output_sink", "")), log=log)
 
 
 def llm_key_paths() -> list[str]:
@@ -2595,6 +2598,12 @@ def _speak_loop(ctx):
     wake_audio = None
     buffer_duration = 0.0
     record_dir = None
+    stash_dir = None  # --record-wakes: keep working as normal, but save every wake to sort through later
+    if "--record-wakes" in sys.argv:
+        log("recording wakes")
+        buffer_duration = 4.0
+        stash_dir = "training/training_data/recordings/wakes"
+        os.makedirs(stash_dir, exist_ok=True)
     if "--record-negatives" in sys.argv:
         log("recording negatives")
         buffer_duration = 4.0
@@ -2633,6 +2642,10 @@ def _speak_loop(ctx):
                     _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     ctx.speaker_state = SpeakerState.LISTEN_FOR_WAKE
                 else:
+                    if stash_dir:
+                        filepath = f"{stash_dir}/{int(time.time() * 1000)}.wav"
+                        log(f"caching {filepath}")
+                        _write_wav(wake_audio, TARGET_SAMPLE_RATE, filepath)
                     _alarms.hold()  # quiet while the user talks, so the request can be heard
                     ring_wake(ctx)
                     _play_oneshot_audio_file("sounds/wake.wav")
@@ -2890,6 +2903,10 @@ def start(peers=None):
     apply_audio_settings(config)
     input_dev_info = _get_audio_device_index(audio_cfg["input_device"])
     output_dev_info = _get_audio_device_index(audio_cfg["output_device"])
+    if audio_cfg.get("aec_reference") and not any(n in output_dev_info['name'].lower() for n in ("pulse", "pipewire", "default")):
+        # mpv follows the default sink, but sounddevice opens this device directly
+        log(f"aec reference: output_device '{output_dev_info['name']}' bypasses the combined sink, so speech "
+            "won't be cancelled — set output_device to \"pulse\" or \"default\"")
 
     ctx = SpeakerContext(
         system=system,

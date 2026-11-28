@@ -66,6 +66,13 @@ output_device = "your-output-device"
 duck_volume = 0
 # Downmix playback to mono, for a device with a single speaker. Default: false.
 mono_output = false
+# Play everything to the XVF3800 as well as the output above, so the array's echo canceller can
+# remove the speaker's own music, radio and speech from the mic (fewer self-triggered wakes). Linux
+# with pulseaudio or pipewire-pulse only; builds a combined "oi_aec" sink and makes it the default.
+# output_device must be "pulse" or "default" for speech to go through it. Default: false.
+aec_reference = false
+# Which sink people actually hear (part of its pactl name), when the default isn't it. Default: "".
+aec_output_sink = ""
 
 [library]
 # Folders of music to search and play, e.g. a usb drive: ["/media/usb"], or ["F:/"] on Windows.

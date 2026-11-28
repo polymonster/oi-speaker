@@ -198,6 +198,36 @@ if ring:
 The ring boots into rainbow and switches to DoA mode after ~2 seconds, so anything you set at
 startup should be set after that.
 
+## Echo Cancellation (XVF3800)
+
+The XVF3800 cancels echo using whatever the host plays to it over USB as its reference. When the
+speaker plays through another device (eg. a HiFiBerry amp), the array never sees that audio. It
+then hears its own music, radio and speech like a voice in the room, and wakes itself. Turn on
+`aec_reference` to play everything to the array as well:
+
+```toml
+[audio]
+output_device = "pulse"    # or "default", so speech goes through the combined sink too
+aec_reference = true
+# aec_output_sink = "hifiberry"   # only if the default sink isn't the one you hear
+```
+
+On start (and on each settings save) this loads a PulseAudio `module-combine-sink` named `oi_aec`
+over the real output and the XVF3800, and makes it the default sink. It works on pipewire-pulse
+too. The combine sink keeps the two clocks in step. The array's 3.5mm jack also gets the audio, so
+leave it unplugged. Turning the option off removes the sink and restores the previous default.
+Linux only.
+
+This only cancels what the speaker itself plays. A TV or another device in the room isn't part of
+the reference, so it still reaches the wake word model.
+
+To check it's working, play some music and run:
+
+```bash
+xvf3800 AEC_AECCONVERGED     # 1 once the canceller has locked on to the reference
+pactl list short sinks       # oi_aec should be there, and be the default
+```
+
 ## Downloading Models
 
 Some of the dependencies require additional downloads
@@ -368,6 +398,20 @@ pip install -e ".[training,cuda]"
 ```
 
 Use Piper-TTS to generate random positive samples + add custom user generated ones.
+
+### Recording from the speaker
+
+Each mode saves the 4 seconds before every wake to a wav under `training/training_data/recordings/`:
+
+| flag | saves to | speaker |
+|---|---|---|
+| `--record-wakes` | `wakes/` | works as normal. Leave it on for a while, then sort the clips into `positives/` and `false_positives/` by hand |
+| `--record-negatives` | `false_positives/` | doesn't answer, every wake is taken to be false. For leaving on with the TV or radio going |
+| `--record-positives` | `positives/` | records each utterance it hears, no wake word needed |
+
+On a service, add the flag to `OI_SPEAKER_ARGS` in `~/.config/oi-speaker/env` and restart. To pull
+the clips back, run `python3 -m http.server 8080` in the repo on the speaker, then
+`python training/sync.py <speaker-ip>` here.
 
 ### Generate Negative Samples
 

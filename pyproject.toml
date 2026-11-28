@@ -22,6 +22,7 @@ dependencies = [
     "httpx>=0.27.0",
     "silero-vad",
     "pyusb",
+    "psutil",  # cpu, memory and temperature for the web ui
     "libusb-package; sys_platform == 'win32'",
     "pycaw; sys_platform == 'win32'",
 ]
@@ -61,4 +62,4 @@ tts-record = "tts_record:main"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/tts_record.py", "src/backends.py", "src/transcribe.py", "src/voice.py", "src/alarms.py", "src/library.py", "src/offload.py", "src/static"]
+packages = ["src/speaker.py", "src/web.py", "src/xvf3800.py", "src/tts_record.py", "src/backends.py", "src/transcribe.py", "src/voice.py", "src/alarms.py", "src/aec_reference.py", "src/library.py", "src/offload.py", "src/sysinfo.py", "src/static"]

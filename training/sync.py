@@ -5,7 +5,8 @@ import re
 
 import requests
 
-DIRS = ["training/training_data/recordings/positives", "training/training_data/recordings/false_positives"]
+DIRS = ["training/training_data/recordings/positives", "training/training_data/recordings/false_positives",
+        "training/training_data/recordings/wakes"]
 
 
 def fetch(ip: str):
