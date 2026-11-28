@@ -868,6 +868,14 @@ def _get_audio_device_index(name: str):
         if device['name'].find(name) != -1:
             return dev.query_devices(index)
         index += 1
+    # alsa numbers cards in the order they turn up, so "(hw:3,0)" can be "(hw:2,0)" after a reboot or
+    # a replug. the settings dropdown saves the full name, so match on the rest of it before failing
+    stable = re.sub(r"\s*\(hw:\d+,\d+\)\s*$", "", name)
+    if stable != name and stable:
+        for index, device in enumerate(devices):
+            if device['name'].find(stable) != -1:
+                log(f"audio device '{name}' not found, using '{device['name']}' (alsa renumbered it)")
+                return dev.query_devices(index)
     return None
 
 
