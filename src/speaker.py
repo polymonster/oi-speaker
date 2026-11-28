@@ -2536,8 +2536,33 @@ def get_history(type: str, limit: int = 20) -> str:
     return json.dumps(entries)
 
 
-def update(target: str) -> str:
+def _installed_extras() -> list[str]:
+    """The extras this box was installed with ([whisper,piper,...]), so an update installs anything
+    new they need. pip doesn't record them, so an extra counts when everything it names is present."""
+    from importlib import metadata
     try:
+        requires = metadata.distribution("oi-speaker").requires or []
+    except metadata.PackageNotFoundError:
+        return []
+    by_extra: dict[str, list[str]] = {}
+    for req in requires:
+        match = re.search(r"""extra\s*==\s*['"]([^'"]+)['"]""", req)
+        if match:
+            name = re.match(r"[A-Za-z0-9._-]+", req).group(0)
+            by_extra.setdefault(match.group(1), []).append(name)
+    def _have(name: str) -> bool:
+        try:
+            metadata.version(name)
+            return True
+        except metadata.PackageNotFoundError:
+            return False
+    return sorted(extra for extra, names in by_extra.items() if all(_have(n) for n in names))
+
+
+def update(target: str) -> str:
+    previous = None
+    try:
+        previous = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
         log(f"update: fetching tags...")
         subprocess.run(["git", "fetch", "--tags"], check=True, capture_output=True)
 
@@ -2560,9 +2585,18 @@ def update(target: str) -> str:
         if is_branch:
             subprocess.run(["git", "pull"], check=True, capture_output=True)
 
-        log("update: installing dependencies...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-e", ".", "-q"],
-                       check=True, capture_output=True)
+        extras = _installed_extras()
+        spec = f".[{','.join(extras)}]" if extras else "."
+        log(f"update: installing dependencies ({spec})...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-e", spec, "-q"],
+                           check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            # the new code without its dependencies would fail on the next start, so go back to the
+            # code that runs with what is installed. the reason is logged and returned below
+            log(f"update: pip failed, rolling back to {previous[:7]}")
+            subprocess.run(["git", "checkout", previous], capture_output=True)
+            raise
 
         log(f"update: done, restarting...")
         if ctx is not None:
@@ -2903,6 +2937,12 @@ def start(peers=None):
     apply_audio_settings(config)
     input_dev_info = _get_audio_device_index(audio_cfg["input_device"])
     output_dev_info = _get_audio_device_index(audio_cfg["output_device"])
+    for kind, info in (("input", input_dev_info), ("output", output_dev_info)):
+        if info is None:
+            # a bare TypeError on startup says nothing; name what was asked for and what is there
+            available = enumerate_audio_devices()[f"{kind}s"]
+            raise RuntimeError(f"no {kind} device matching '{audio_cfg[f'{kind}_device']}' in config.toml [audio] "
+                               f"{kind}_device. available {kind}s: {available}")
     if audio_cfg.get("aec_reference") and not any(n in output_dev_info['name'].lower() for n in ("pulse", "pipewire", "default")):
         # mpv follows the default sink, but sounddevice opens this device directly
         log(f"aec reference: output_device '{output_dev_info['name']}' bypasses the combined sink, so speech "

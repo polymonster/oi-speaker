@@ -345,6 +345,7 @@ async def status():
         _cfg = tomllib.load(f)
     port = int(_cfg.get("network", {}).get("port", 8000))
     return {
+        "name": _cfg.get("network", {}).get("name", ""),
         "state": spk.ctx.speaker_state.value if spk.ctx else spk.SpeakerState.LISTEN_FOR_WAKE.value,
         "state_name": spk.ctx.speaker_state.name.lower() if spk.ctx else "starting",
         "playing": spk._player.active,
